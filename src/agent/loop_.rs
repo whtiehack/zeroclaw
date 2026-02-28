@@ -1121,10 +1121,17 @@ pub(crate) async fn run_tool_call_loop(
             return Ok(display_text);
         }
 
-        // Print any text the LLM produced alongside tool calls (unless silent)
-        if !silent && !display_text.is_empty() {
-            print!("{display_text}");
-            let _ = std::io::stdout().flush();
+        // Relay any text the LLM produced alongside tool calls.
+        // For streaming channels, send via on_delta so draft messages show intermediate content.
+        // For CLI, print to stdout.
+        if !display_text.is_empty() {
+            if let Some(ref tx) = on_delta {
+                let _ = tx.send(display_text.clone()).await;
+            }
+            if !silent {
+                print!("{display_text}");
+                let _ = std::io::stdout().flush();
+            }
         }
 
         // Execute tool calls and build results. `individual_results` tracks per-call output so
