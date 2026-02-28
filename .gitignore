@@ -37,3 +37,4 @@ credentials.json
 
 # Nix
 result
+.ace-tool/
