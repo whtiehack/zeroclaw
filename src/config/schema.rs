@@ -10817,6 +10817,53 @@ default_model = "legacy-model"
     }
 
     #[test]
+    async fn wecom_config_deserializes_with_defaults() {
+        let json =
+            r#"{"token":"token","encoding_aes_key":"abcdefghijklmnopqrstuvwxyz0123456789ABCDEFG"}"#;
+        let parsed: WeComConfig = serde_json::from_str(json).unwrap();
+        assert!(!parsed.group_shared_history_enabled);
+        assert!(parsed.group_shared_history_chat_ids.is_empty());
+        assert_eq!(parsed.file_retention_days, 3);
+        assert_eq!(parsed.max_file_size_mb, 20);
+        assert_eq!(parsed.response_url_cache_per_scope, 50);
+        assert_eq!(parsed.lock_timeout_secs, 900);
+        assert_eq!(parsed.history_max_turns, 30);
+        assert!(parsed.fallback_robot_webhook_url.is_none());
+    }
+
+    #[test]
+    async fn wecom_config_toml_roundtrip() {
+        let wc = WeComConfig {
+            token: "token".into(),
+            encoding_aes_key: "abcdefghijklmnopqrstuvwxyz0123456789ABCDEFG".into(),
+            group_shared_history_chat_ids: vec!["group_1".into()],
+            group_shared_history_enabled: true,
+            file_retention_days: 5,
+            max_file_size_mb: 30,
+            response_url_cache_per_scope: 80,
+            lock_timeout_secs: 1200,
+            history_max_turns: 40,
+            fallback_robot_webhook_url: Some(
+                "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=test".into(),
+            ),
+        };
+
+        let toml_str = toml::to_string(&wc).unwrap();
+        let parsed: WeComConfig = toml::from_str(&toml_str).unwrap();
+        assert_eq!(parsed.group_shared_history_chat_ids, vec!["group_1"]);
+        assert!(parsed.group_shared_history_enabled);
+        assert_eq!(parsed.file_retention_days, 5);
+        assert_eq!(parsed.max_file_size_mb, 30);
+        assert_eq!(parsed.response_url_cache_per_scope, 80);
+        assert_eq!(parsed.lock_timeout_secs, 1200);
+        assert_eq!(parsed.history_max_turns, 40);
+        assert_eq!(
+            parsed.fallback_robot_webhook_url.as_deref(),
+            Some("https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=test")
+        );
+    }
+
+    #[test]
     async fn nextcloud_talk_config_serde() {
         let nc = NextcloudTalkConfig {
             base_url: "https://cloud.example.com".into(),
