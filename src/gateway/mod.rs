@@ -12,6 +12,7 @@ mod openai_compat;
 mod openclaw_compat;
 pub mod sse;
 pub mod static_files;
+mod wecom;
 pub mod ws;
 
 use crate::channels::{
@@ -632,6 +633,10 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
     if qq_webhook_enabled {
         println!("  POST /qq        — QQ Bot webhook (validation + events)");
     }
+    if config.channels_config.wecom.is_some() {
+        println!("  GET  /wecombot/callback — WeCom callback URL verification");
+        println!("  POST /wecombot/callback — WeCom encrypted callback");
+    }
     if config.gateway.node_control.enabled {
         println!("  POST /api/node-control — experimental node-control RPC scaffold");
     }
@@ -735,6 +740,8 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         .route("/wati", post(handle_wati_webhook))
         .route("/nextcloud-talk", post(handle_nextcloud_talk_webhook))
         .route("/qq", post(handle_qq_webhook))
+        .route("/wecombot/callback", get(wecom::handle_wecom_verify))
+        .route("/wecombot/callback", post(wecom::handle_wecom_callback))
         // ── OpenClaw migration: tools-enabled chat endpoint ──
         .route("/api/chat", post(openclaw_compat::handle_api_chat))
         // ── OpenAI-compatible endpoints ──
