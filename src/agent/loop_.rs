@@ -1041,7 +1041,8 @@ pub(crate) async fn run_tool_call_loop(
                 && iteration + 1 < max_iterations
                 && !tool_specs.is_empty()
                 && (parse_issue_detected
-                    || (!use_native_tools && looks_like_deferred_action_without_tool_call(&display_text)));
+                    || (!use_native_tools
+                        && looks_like_deferred_action_without_tool_call(&display_text)));
             if missing_tool_call_followthrough {
                 missing_tool_call_retry_used = true;
                 missing_tool_call_retry_prompt = Some(MISSING_TOOL_CALL_RETRY_PROMPT.to_string());

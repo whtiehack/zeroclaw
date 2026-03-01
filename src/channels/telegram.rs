@@ -2936,7 +2936,9 @@ impl Channel for TelegramChannel {
         match Self::check_edit_response(resp).await {
             EditResult::Success | EditResult::NotModified => return Ok(()),
             EditResult::Failed(reason) => {
-                tracing::warn!("finalize_draft plain edit also failed: {reason}; falling back to sendMessage");
+                tracing::warn!(
+                    "finalize_draft plain edit also failed: {reason}; falling back to sendMessage"
+                );
             }
         }
 
