@@ -34,6 +34,7 @@ const SUPPORTED_PROXY_SERVICE_KEYS: &[&str] = &[
     "channel.signal",
     "channel.slack",
     "channel.telegram",
+    "channel.wecom",
     "channel.wati",
     "channel.whatsapp",
     "tool.browser",
@@ -405,6 +406,7 @@ impl std::fmt::Debug for Config {
             self.channels_config.feishu.is_some(),
             self.channels_config.dingtalk.is_some(),
             self.channels_config.qq.is_some(),
+            self.channels_config.wecom.is_some(),
             self.channels_config.nostr.is_some(),
             self.channels_config.clawdtalk.is_some(),
         ]
@@ -3513,6 +3515,8 @@ pub struct ChannelsConfig {
     pub dingtalk: Option<DingTalkConfig>,
     /// QQ Official Bot channel configuration.
     pub qq: Option<QQConfig>,
+    /// WeCom AI bot callback configuration.
+    pub wecom: Option<WeComConfig>,
     pub nostr: Option<NostrConfig>,
     /// ClawdTalk voice channel configuration.
     pub clawdtalk: Option<crate::channels::clawdtalk::ClawdTalkConfig>,
@@ -3601,6 +3605,10 @@ impl ChannelsConfig {
                     .is_some_and(|qq| qq.receive_mode == QQReceiveMode::Websocket)
             ),
             (
+                Box::new(ConfigWrapper::new(self.wecom.as_ref())),
+                self.wecom.is_some(),
+            ),
+            (
                 Box::new(ConfigWrapper::new(self.nostr.as_ref())),
                 self.nostr.is_some(),
             ),
@@ -3647,6 +3655,7 @@ impl Default for ChannelsConfig {
             feishu: None,
             dingtalk: None,
             qq: None,
+            wecom: None,
             nostr: None,
             clawdtalk: None,
             message_timeout_secs: default_channel_message_timeout_secs(),
@@ -5007,6 +5016,68 @@ impl ChannelConfig for QQConfig {
     }
 }
 
+fn default_wecom_file_retention_days() -> u32 {
+    3
+}
+
+fn default_wecom_max_file_size_mb() -> u64 {
+    20
+}
+
+fn default_wecom_response_url_cache_per_scope() -> usize {
+    50
+}
+
+fn default_wecom_lock_timeout_secs() -> u64 {
+    900
+}
+
+fn default_wecom_history_max_turns() -> usize {
+    30
+}
+
+/// WeCom AI Bot callback configuration.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct WeComConfig {
+    /// Signature token configured in WeCom callback settings.
+    pub token: String,
+    /// EncodingAESKey configured in WeCom callback settings (43 chars base64 body).
+    pub encoding_aes_key: String,
+    /// Chat IDs that should share one group-level conversation history.
+    #[serde(default)]
+    pub group_shared_history_chat_ids: Vec<String>,
+    /// Enable whitelist-based group shared history behavior.
+    #[serde(default)]
+    pub group_shared_history_enabled: bool,
+    /// File retention days for downloaded WeCom attachments under workspace cache.
+    #[serde(default = "default_wecom_file_retention_days")]
+    pub file_retention_days: u32,
+    /// Maximum accepted file size (MiB) for WeCom attachment download attempts.
+    #[serde(default = "default_wecom_max_file_size_mb")]
+    pub max_file_size_mb: u64,
+    /// Max retained response_url entries per conversation scope.
+    #[serde(default = "default_wecom_response_url_cache_per_scope")]
+    pub response_url_cache_per_scope: usize,
+    /// Lock TTL in seconds for in-flight execution scopes.
+    #[serde(default = "default_wecom_lock_timeout_secs")]
+    pub lock_timeout_secs: u64,
+    /// Maximum retained turns per WeCom conversation scope.
+    #[serde(default = "default_wecom_history_max_turns")]
+    pub history_max_turns: usize,
+    /// Optional fallback group-bot webhook URL when no valid response_url is available.
+    #[serde(default)]
+    pub fallback_robot_webhook_url: Option<String>,
+}
+
+impl ChannelConfig for WeComConfig {
+    fn name() -> &'static str {
+        "WeCom"
+    }
+    fn desc() -> &'static str {
+        "WeCom AI Bot callback"
+    }
+}
+
 /// Nostr channel configuration (NIP-04 + NIP-17 private messages)
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct NostrConfig {
@@ -5584,6 +5655,23 @@ fn decrypt_channel_secrets(
             "config.channels_config.qq.app_secret",
         )?;
     }
+    if let Some(ref mut wecom) = channels.wecom {
+        decrypt_secret(
+            store,
+            &mut wecom.token,
+            "config.channels_config.wecom.token",
+        )?;
+        decrypt_secret(
+            store,
+            &mut wecom.encoding_aes_key,
+            "config.channels_config.wecom.encoding_aes_key",
+        )?;
+        decrypt_optional_secret(
+            store,
+            &mut wecom.fallback_robot_webhook_url,
+            "config.channels_config.wecom.fallback_robot_webhook_url",
+        )?;
+    }
     if let Some(ref mut nostr) = channels.nostr {
         decrypt_secret(
             store,
@@ -5744,6 +5832,23 @@ fn encrypt_channel_secrets(
             store,
             &mut qq.app_secret,
             "config.channels_config.qq.app_secret",
+        )?;
+    }
+    if let Some(ref mut wecom) = channels.wecom {
+        encrypt_secret(
+            store,
+            &mut wecom.token,
+            "config.channels_config.wecom.token",
+        )?;
+        encrypt_secret(
+            store,
+            &mut wecom.encoding_aes_key,
+            "config.channels_config.wecom.encoding_aes_key",
+        )?;
+        encrypt_optional_secret(
+            store,
+            &mut wecom.fallback_robot_webhook_url,
+            "config.channels_config.wecom.fallback_robot_webhook_url",
         )?;
     }
     if let Some(ref mut nostr) = channels.nostr {
@@ -7698,6 +7803,7 @@ default_temperature = 0.7
                 feishu: None,
                 dingtalk: None,
                 qq: None,
+                wecom: None,
                 nostr: None,
                 clawdtalk: None,
                 message_timeout_secs: 300,
@@ -8605,6 +8711,7 @@ allowed_users = ["@ops:matrix.org"]
             feishu: None,
             dingtalk: None,
             qq: None,
+            wecom: None,
             nostr: None,
             clawdtalk: None,
             message_timeout_secs: 300,
@@ -8883,6 +8990,7 @@ channel_id = "C123"
             feishu: None,
             dingtalk: None,
             qq: None,
+            wecom: None,
             nostr: None,
             clawdtalk: None,
             message_timeout_secs: 300,

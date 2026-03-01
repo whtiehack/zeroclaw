@@ -483,6 +483,15 @@ fn channel_delivery_instructions(channel_name: &str) -> Option<&'static str> {
              - You can combine text and media in one response — text is sent first, then each attachment.\n\
              - Use tool results silently: answer the latest user message directly, and do not narrate delayed/internal tool execution bookkeeping.",
         ),
+        "wecom" => Some(
+            "When responding on WeCom:\n\
+             - Keep the response concise and structured for enterprise chat contexts.\n\
+             - Prefer short paragraphs and lists; avoid heavy markdown syntax.\n\
+             - Respect channel context fields injected by runtime (`chat_type`, `chat_id`, `conversation_scope`, `sender_userid` when present).\n\
+             - If asked to configure fallback proactive push, use memory_store with key `wecom_push_url::<conversation_scope>` and store a valid HTTPS WeCom robot webhook URL.\n\
+             - For oversized or unavailable attachments, explain limitations directly instead of pretending file access succeeded.\n\
+             - Use tool results silently: answer the latest user message directly, and do not narrate delayed/internal tool execution bookkeeping.",
+        ),
         _ => None,
     }
 }
