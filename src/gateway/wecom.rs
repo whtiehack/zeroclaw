@@ -11,7 +11,7 @@ use axum::{
 use base64::Engine as _;
 use cbc::cipher::{block_padding::NoPadding, BlockDecryptMut, BlockEncryptMut, KeyIvInit};
 use parking_lot::Mutex;
-use rand::Rng;
+use rand::RngExt;
 use serde::Deserialize;
 use serde_json::Value;
 use sha1::{Digest, Sha1};
@@ -257,14 +257,16 @@ fn extract_stop_signal_text(inbound: &ParsedInbound) -> Option<String> {
                     .get("msgtype")
                     .and_then(Value::as_str)
                     .is_some_and(|v| v == "text")
-                    && let Some(content) = item
+                {
+                    if let Some(content) = item
                         .get("text")
                         .and_then(|v| v.get("content"))
                         .and_then(Value::as_str)
-                {
-                    let trimmed = content.trim();
-                    if !trimmed.is_empty() {
-                        texts.push(trimmed.to_string());
+                    {
+                        let trimmed = content.trim();
+                        if !trimmed.is_empty() {
+                            texts.push(trimmed.to_string());
+                        }
                     }
                 }
             }
@@ -1109,10 +1111,10 @@ impl WeComRuntime {
             .collect();
 
         for scope in stale_scopes {
-            if let Some(task) = inflight.remove(&scope)
-                && !task.handle.is_finished()
-            {
-                task.handle.abort();
+            if let Some(task) = inflight.remove(&scope) {
+                if !task.handle.is_finished() {
+                    task.handle.abort();
+                }
             }
         }
     }
@@ -1487,23 +1489,24 @@ impl WeComRuntime {
                                     text_parts.push(trimmed.to_string());
                                 }
                             }
-                        } else if item_type == "image"
-                            && let Some(url) = item
+                        } else if item_type == "image" {
+                            if let Some(url) = item
                                 .get("image")
                                 .and_then(|v| v.get("url"))
                                 .and_then(Value::as_str)
-                        {
-                            match self
-                                .download_and_store_attachment(url, AttachmentKind::Image, inbound)
-                                .await
                             {
-                                Ok(marker) => text_parts.push(marker),
-                                Err(err) => {
-                                    tracing::warn!("WeCom mixed image processing failed: {err}");
-                                    text_parts.push(
-                                        "[Image attachment processing failed in mixed message.]"
-                                            .to_string(),
-                                    );
+                                match self
+                                    .download_and_store_attachment(url, AttachmentKind::Image, inbound)
+                                    .await
+                                {
+                                    Ok(marker) => text_parts.push(marker),
+                                    Err(err) => {
+                                        tracing::warn!("WeCom mixed image processing failed: {err}");
+                                        text_parts.push(
+                                            "[Image attachment processing failed in mixed message.]"
+                                                .to_string(),
+                                        );
+                                    }
                                 }
                             }
                         }
@@ -1542,13 +1545,13 @@ impl WeComRuntime {
             anyhow::bail!("WeCom attachment download failed: status={} body={body}", status);
         }
 
-        if let Some(len) = response.content_length()
-            && len > self.cfg.max_file_size_bytes
-        {
-            return Ok(format!(
-                "[AttachmentTooLarge kind={:?} size={}B limit={}B]",
-                kind, len, self.cfg.max_file_size_bytes
-            ));
+        if let Some(len) = response.content_length() {
+            if len > self.cfg.max_file_size_bytes {
+                return Ok(format!(
+                    "[AttachmentTooLarge kind={:?} size={}B limit={}B]",
+                    kind, len, self.cfg.max_file_size_bytes
+                ));
+            }
         }
 
         let bytes = response
@@ -1770,10 +1773,10 @@ fn resolve_runtime(state: &AppState) -> Result<Option<Arc<WeComRuntime>>> {
     let candidate = WeComRuntime::from_config(wecom_cfg, &cfg_guard.workspace_dir)?;
 
     let mut store = runtime_store().lock();
-    if let Some(existing) = store.get(&runtime_key)
-        && existing.fingerprint == candidate.fingerprint
-    {
-        return Ok(Some(existing.clone()));
+    if let Some(existing) = store.get(&runtime_key) {
+        if existing.fingerprint == candidate.fingerprint {
+            return Ok(Some(existing.clone()));
+        }
     }
 
     let runtime = Arc::new(candidate);
