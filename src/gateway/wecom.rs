@@ -10,6 +10,7 @@ use axum::{
 };
 use base64::Engine as _;
 use cbc::cipher::{block_padding::NoPadding, BlockDecryptMut, BlockEncryptMut, KeyIvInit};
+use md5 as md5_crate;
 use parking_lot::Mutex;
 use rand::RngExt;
 use serde::Deserialize;
@@ -31,6 +32,8 @@ const WECOM_STREAM_STATE_TTL_SECS: u64 = 7200;
 const WECOM_CONVERSATION_TTL_SECS: u64 = 172_800;
 const WECOM_HTTP_TIMEOUT_SECS: u64 = 60;
 const WECOM_STREAM_BOOTSTRAP_CONTENT: &str = "正在处理中，请稍候。";
+const WECOM_STREAM_MAX_IMAGES: usize = 10;
+const WECOM_IMAGE_MAX_BYTES: usize = 10 * 1024 * 1024;
 
 #[derive(Debug, Deserialize)]
 pub(super) struct WeComCallbackQuery {
@@ -126,7 +129,14 @@ struct StreamState {
     owner_msg_id: String,
     content: String,
     finish: bool,
+    images: Vec<StreamImageItem>,
     expires_at: Instant,
+}
+
+#[derive(Debug, Clone)]
+struct StreamImageItem {
+    base64: String,
+    md5: String,
 }
 
 #[derive(Debug, Clone)]
@@ -323,14 +333,107 @@ fn split_stream_content_and_overflow(input: &str) -> (String, Option<String>) {
     }
 }
 
-fn make_stream_payload(stream_id: &str, content: &str, finish: bool) -> Value {
+fn parse_image_markers(text: &str) -> (String, Vec<String>) {
+    let mut cleaned = String::new();
+    let mut paths = Vec::new();
+    let mut rest = text;
+    while let Some(start) = rest.find("[IMAGE:") {
+        cleaned.push_str(&rest[..start]);
+        let after_tag = &rest[start + 7..]; // skip "[IMAGE:"
+        if let Some(end) = after_tag.find(']') {
+            let path = after_tag[..end].trim();
+            if !path.is_empty() {
+                paths.push(path.to_string());
+            }
+            rest = &after_tag[end + 1..];
+        } else {
+            // No closing bracket — keep the text as-is
+            cleaned.push_str(&rest[start..start + 7]);
+            rest = after_tag;
+        }
+    }
+    cleaned.push_str(rest);
+    // Trim excessive blank lines left by removed markers
+    let cleaned = cleaned
+        .lines()
+        .collect::<Vec<_>>()
+        .join("\n")
+        .trim()
+        .to_string();
+    (cleaned, paths)
+}
+
+async fn prepare_stream_images(paths: &[String]) -> Vec<StreamImageItem> {
+    let mut items = Vec::new();
+    for path_str in paths.iter().take(WECOM_STREAM_MAX_IMAGES) {
+        let path = Path::new(path_str);
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        if !matches!(ext.as_str(), "jpg" | "jpeg" | "png") {
+            tracing::warn!(
+                "WeCom stream image skipped (unsupported extension): {}",
+                path_str
+            );
+            continue;
+        }
+        let data = match tokio::fs::read(path).await {
+            Ok(d) => d,
+            Err(err) => {
+                tracing::warn!("WeCom stream image read failed: {} — {err:#}", path_str);
+                continue;
+            }
+        };
+        if data.len() > WECOM_IMAGE_MAX_BYTES {
+            tracing::warn!(
+                "WeCom stream image skipped (too large: {} bytes): {}",
+                data.len(),
+                path_str
+            );
+            continue;
+        }
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&data);
+        let digest = md5_crate::compute(&data);
+        let md5_hex = format!("{:x}", digest);
+        items.push(StreamImageItem {
+            base64: b64,
+            md5: md5_hex,
+        });
+    }
+    items
+}
+
+fn make_stream_payload(
+    stream_id: &str,
+    content: &str,
+    finish: bool,
+    images: &[StreamImageItem],
+) -> Value {
+    let mut stream_obj = serde_json::json!({
+        "id": stream_id,
+        "finish": finish,
+        "content": normalize_stream_content(content),
+    });
+    if finish && !images.is_empty() {
+        let msg_items: Vec<Value> = images
+            .iter()
+            .map(|img| {
+                serde_json::json!({
+                    "msgtype": "image",
+                    "image": {
+                        "base64": img.base64,
+                        "md5": img.md5,
+                    }
+                })
+            })
+            .collect();
+        stream_obj["msg_item"] = Value::Array(msg_items);
+    }
     serde_json::json!({
         "msgtype": "stream",
-        "stream": {
-            "id": stream_id,
-            "finish": finish,
-            "content": normalize_stream_content(content),
-        }
+        "stream": stream_obj,
     })
 }
 
@@ -1145,6 +1248,7 @@ impl WeComRuntime {
         owner_msg_id: &str,
         content: &str,
         finish: bool,
+        images: Vec<StreamImageItem>,
     ) {
         let mut states = self.stream_states.lock();
         states.insert(
@@ -1155,6 +1259,7 @@ impl WeComRuntime {
                 owner_msg_id: owner_msg_id.to_string(),
                 content: normalize_stream_content(content),
                 finish,
+                images,
                 expires_at: Instant::now() + Duration::from_secs(WECOM_STREAM_STATE_TTL_SECS),
             },
         );
@@ -1165,6 +1270,23 @@ impl WeComRuntime {
         if let Some(state) = states.get_mut(stream_id) {
             state.content = normalize_stream_content(content);
             state.finish = finish;
+            state.images = Vec::new();
+            state.expires_at = Instant::now() + Duration::from_secs(WECOM_STREAM_STATE_TTL_SECS);
+        }
+    }
+
+    fn update_stream_state_with_images(
+        &self,
+        stream_id: &str,
+        content: &str,
+        finish: bool,
+        images: Vec<StreamImageItem>,
+    ) {
+        let mut states = self.stream_states.lock();
+        if let Some(state) = states.get_mut(stream_id) {
+            state.content = normalize_stream_content(content);
+            state.finish = finish;
+            state.images = images;
             state.expires_at = Instant::now() + Duration::from_secs(WECOM_STREAM_STATE_TTL_SECS);
         }
     }
@@ -1241,7 +1363,7 @@ impl WeComRuntime {
         }
 
         let retention = Duration::from_secs((self.cfg.file_retention_days as u64) * 86_400);
-        let root = self.cfg.workspace_dir.join(".wecom").join("inbox");
+        let root = self.cfg.workspace_dir.join("wecom_files");
         tokio::spawn(async move {
             cleanup_inbox_files(root, retention).await;
         });
@@ -1496,12 +1618,18 @@ impl WeComRuntime {
                                 .and_then(Value::as_str)
                             {
                                 match self
-                                    .download_and_store_attachment(url, AttachmentKind::Image, inbound)
+                                    .download_and_store_attachment(
+                                        url,
+                                        AttachmentKind::Image,
+                                        inbound,
+                                    )
                                     .await
                                 {
                                     Ok(marker) => text_parts.push(marker),
                                     Err(err) => {
-                                        tracing::warn!("WeCom mixed image processing failed: {err}");
+                                        tracing::warn!(
+                                            "WeCom mixed image processing failed: {err}"
+                                        );
                                         text_parts.push(
                                             "[Image attachment processing failed in mixed message.]"
                                                 .to_string(),
@@ -1542,7 +1670,10 @@ impl WeComRuntime {
         let status = response.status();
         if !status.is_success() {
             let body = response.text().await.unwrap_or_default();
-            anyhow::bail!("WeCom attachment download failed: status={} body={body}", status);
+            anyhow::bail!(
+                "WeCom attachment download failed: status={} body={body}",
+                status
+            );
         }
 
         if let Some(len) = response.content_length() {
@@ -1587,7 +1718,7 @@ impl WeComRuntime {
             ext
         );
 
-        let dir = self.cfg.workspace_dir.join(".wecom").join("inbox");
+        let dir = self.cfg.workspace_dir.join("wecom_files");
         tokio::fs::create_dir_all(&dir)
             .await
             .context("failed to create WeCom inbox directory")?;
@@ -1941,7 +2072,7 @@ pub(super) async fn handle_wecom_callback(
     if parsed.msg_type == "stream" {
         let stream_id = parse_stream_id(&parsed.raw_payload).unwrap_or_else(next_stream_id);
         let state_snapshot = runtime.get_stream_state(&stream_id);
-        let (content, finish) = if let Some(snapshot) = state_snapshot {
+        let (content, finish, images) = if let Some(snapshot) = state_snapshot {
             tracing::debug!(
                 "WeCom stream refresh hit: stream_id={} scope={} exec_scope={} finish={} owner={}",
                 stream_id,
@@ -1950,11 +2081,13 @@ pub(super) async fn handle_wecom_callback(
                 snapshot.finish,
                 snapshot.owner_msg_id
             );
-            (snapshot.content, snapshot.finish)
+            (snapshot.content, snapshot.finish, snapshot.images)
         } else {
-            ("任务已结束或不存在。".to_string(), true)
+            ("任务已结束或不存在。".to_string(), true, Vec::new())
         };
-        return match encrypt_passive_stream_reply(&runtime, &query, &stream_id, &content, finish) {
+        return match encrypt_passive_stream_reply(
+            &runtime, &query, &stream_id, &content, finish, &images,
+        ) {
             Ok(resp) => (StatusCode::OK, resp).into_response(),
             Err(err) => {
                 tracing::error!("WeCom stream refresh encrypt failed: {err:#}");
@@ -1977,8 +2110,8 @@ pub(super) async fn handle_wecom_callback(
             };
         }
         if event_type == "template_card_event" {
-            let event_key =
-                extract_template_card_event_key(&parsed.raw_payload).unwrap_or_else(|| "-".to_string());
+            let event_key = extract_template_card_event_key(&parsed.raw_payload)
+                .unwrap_or_else(|| "-".to_string());
             tracing::info!(
                 "WeCom template_card_event received: msg_id={} event_key={}",
                 parsed.msg_id,
@@ -2032,6 +2165,7 @@ pub(super) async fn handle_wecom_callback(
                 &parsed.msg_id,
                 stopped,
                 true,
+                Vec::new(),
             );
             return match encrypt_passive_stream_reply(
                 &runtime,
@@ -2039,6 +2173,7 @@ pub(super) async fn handle_wecom_callback(
                 &stop_reply_stream,
                 stopped,
                 true,
+                &[],
             ) {
                 Ok(resp) => (StatusCode::OK, resp).into_response(),
                 Err(err) => {
@@ -2060,8 +2195,10 @@ pub(super) async fn handle_wecom_callback(
             &parsed.msg_id,
             &busy,
             true,
+            Vec::new(),
         );
-        return match encrypt_passive_stream_reply(&runtime, &query, &busy_stream, &busy, true) {
+        return match encrypt_passive_stream_reply(&runtime, &query, &busy_stream, &busy, true, &[])
+        {
             Ok(resp) => (StatusCode::OK, resp).into_response(),
             Err(err) => {
                 tracing::error!("WeCom busy reply encrypt failed: {err:#}");
@@ -2080,8 +2217,9 @@ pub(super) async fn handle_wecom_callback(
             &parsed.msg_id,
             &msg,
             true,
+            Vec::new(),
         );
-        return match encrypt_passive_stream_reply(&runtime, &query, &stream_id, &msg, true) {
+        return match encrypt_passive_stream_reply(&runtime, &query, &stream_id, &msg, true, &[]) {
             Ok(resp) => (StatusCode::OK, resp).into_response(),
             Err(err) => {
                 tracing::error!("WeCom voice fallback encrypt failed: {err:#}");
@@ -2104,8 +2242,10 @@ pub(super) async fn handle_wecom_callback(
             &parsed.msg_id,
             &busy,
             true,
+            Vec::new(),
         );
-        return match encrypt_passive_stream_reply(&runtime, &query, &busy_stream, &busy, true) {
+        return match encrypt_passive_stream_reply(&runtime, &query, &busy_stream, &busy, true, &[])
+        {
             Ok(resp) => (StatusCode::OK, resp).into_response(),
             Err(err) => {
                 tracing::error!("WeCom race-busy reply encrypt failed: {err:#}");
@@ -2121,6 +2261,7 @@ pub(super) async fn handle_wecom_callback(
         &parsed.msg_id,
         WECOM_STREAM_BOOTSTRAP_CONTENT,
         false,
+        Vec::new(),
     );
 
     let state_clone = state.clone();
@@ -2146,6 +2287,7 @@ pub(super) async fn handle_wecom_callback(
         &stream_id,
         WECOM_STREAM_BOOTSTRAP_CONTENT,
         false,
+        &[],
     ) {
         Ok(resp) => (StatusCode::OK, resp).into_response(),
         Err(err) => {
@@ -2190,14 +2332,18 @@ async fn process_inbound_message(
                     }
                 };
 
-            let (stream_content, overflow) = split_stream_content_and_overflow(&llm_response);
-            runtime.update_stream_state_content(&stream_id, &stream_content, true);
+            let (text_without_images, image_paths) = parse_image_markers(&llm_response);
+            let images = prepare_stream_images(&image_paths).await;
+
+            let (stream_content, overflow) =
+                split_stream_content_and_overflow(&text_without_images);
+            runtime.update_stream_state_with_images(&stream_id, &stream_content, true, images);
 
             runtime.upsert_conversation(
                 &scopes.conversation_scope,
                 true,
                 &composed.user_turn_for_history,
-                &llm_response,
+                &text_without_images,
             );
 
             if let Some(extra) = overflow {
@@ -2237,10 +2383,11 @@ fn encrypt_passive_stream_reply(
     stream_id: &str,
     content: &str,
     finish: bool,
+    images: &[StreamImageItem],
 ) -> Result<String> {
     let timestamp = reply_timestamp(query);
     let nonce = reply_nonce(query);
-    let payload = make_stream_payload(stream_id, content, finish);
+    let payload = make_stream_payload(stream_id, content, finish, images);
     runtime
         .crypto
         .encrypt_json_ciphertext(&payload.to_string(), &nonce, &timestamp, "")
@@ -2495,5 +2642,77 @@ mod tests {
         assert!(summary.contains("feedback_id=fb_1"));
         assert!(summary.contains("feedback_type=2"));
         assert!(summary.contains("content=not accurate"));
+    }
+
+    #[test]
+    fn parse_image_markers_extracts_paths() {
+        let input = "分析结果:\n[IMAGE:/tmp/chart.png]\n请参考。";
+        let (cleaned, paths) = parse_image_markers(input);
+        assert_eq!(paths, vec!["/tmp/chart.png"]);
+        assert!(cleaned.contains("分析结果:"));
+        assert!(cleaned.contains("请参考。"));
+        assert!(!cleaned.contains("[IMAGE:"));
+    }
+
+    #[test]
+    fn parse_image_markers_preserves_non_image_tags() {
+        let input = "Hello [TOOL:abc] world [IMAGE:/a.jpg] end";
+        let (cleaned, paths) = parse_image_markers(input);
+        assert_eq!(paths, vec!["/a.jpg"]);
+        assert!(cleaned.contains("[TOOL:abc]"));
+        assert!(!cleaned.contains("[IMAGE:"));
+    }
+
+    #[test]
+    fn parse_image_markers_no_markers() {
+        let input = "No images here.";
+        let (cleaned, paths) = parse_image_markers(input);
+        assert_eq!(cleaned, "No images here.");
+        assert!(paths.is_empty());
+    }
+
+    #[test]
+    fn make_stream_payload_with_images_on_finish() {
+        let imgs = vec![StreamImageItem {
+            base64: "aGVsbG8=".to_string(),
+            md5: "5d41402abc4b2a76b9719d911017c592".to_string(),
+        }];
+        let payload = make_stream_payload("sid1", "done", true, &imgs);
+        let stream = payload.get("stream").expect("stream key");
+        assert_eq!(stream.get("finish").and_then(Value::as_bool), Some(true));
+        let msg_items = stream
+            .get("msg_item")
+            .and_then(Value::as_array)
+            .expect("msg_item");
+        assert_eq!(msg_items.len(), 1);
+        assert_eq!(
+            msg_items[0].get("msgtype").and_then(Value::as_str),
+            Some("image")
+        );
+        assert_eq!(
+            msg_items[0]
+                .get("image")
+                .and_then(|v| v.get("base64"))
+                .and_then(Value::as_str),
+            Some("aGVsbG8=")
+        );
+    }
+
+    #[test]
+    fn make_stream_payload_no_images() {
+        let payload = make_stream_payload("sid2", "hello", true, &[]);
+        let stream = payload.get("stream").expect("stream key");
+        assert!(stream.get("msg_item").is_none());
+    }
+
+    #[test]
+    fn make_stream_payload_ignores_images_when_not_finish() {
+        let imgs = vec![StreamImageItem {
+            base64: "aGVsbG8=".to_string(),
+            md5: "abc".to_string(),
+        }];
+        let payload = make_stream_payload("sid3", "partial", false, &imgs);
+        let stream = payload.get("stream").expect("stream key");
+        assert!(stream.get("msg_item").is_none());
     }
 }
