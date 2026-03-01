@@ -361,6 +361,44 @@ fn parse_event_type(payload: &Value) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
+fn extract_template_card_event_key(payload: &Value) -> Option<String> {
+    payload
+        .get("event")
+        .and_then(|v| v.get("template_card_event"))
+        .and_then(|v| {
+            v.get("event_key")
+                .or_else(|| v.get("eventkey"))
+                .and_then(Value::as_str)
+        })
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn extract_feedback_event_summary(payload: &Value) -> Option<String> {
+    let feedback = payload.get("event")?.get("feedback_event")?;
+    let feedback_id = feedback
+        .get("id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .unwrap_or("-");
+    let feedback_type = feedback
+        .get("type")
+        .and_then(Value::as_i64)
+        .map(|v| v.to_string())
+        .unwrap_or_else(|| "-".to_string());
+    let content = feedback
+        .get("content")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .unwrap_or("-");
+    Some(format!(
+        "feedback_id={feedback_id} feedback_type={feedback_type} content={content}"
+    ))
+}
+
 fn extract_quote_context(payload: &Value) -> Option<String> {
     let quote = payload.get("quote")?;
     let quote_type = quote
@@ -388,7 +426,7 @@ fn extract_quote_context(payload: &Value) -> Option<String> {
             .unwrap_or_else(|| "[引用语音无转写]".to_string()),
         "image" => quote
             .get("image")
-            .and_then(|v| v.get("url"))
+            .and_then(|v| v.get("local_path"))
             .and_then(Value::as_str)
             .map(str::trim)
             .filter(|v| !v.is_empty())
@@ -396,7 +434,7 @@ fn extract_quote_context(payload: &Value) -> Option<String> {
             .unwrap_or_else(|| "[引用图片]".to_string()),
         "file" => quote
             .get("file")
-            .and_then(|v| v.get("url"))
+            .and_then(|v| v.get("local_path"))
             .and_then(Value::as_str)
             .map(str::trim)
             .filter(|v| !v.is_empty())
@@ -425,14 +463,14 @@ fn extract_quote_context(payload: &Value) -> Option<String> {
                             parts.push(text.to_string());
                         }
                     } else if item_type == "image" {
-                        if let Some(url) = item
+                        if let Some(path) = item
                             .get("image")
-                            .and_then(|v| v.get("url"))
+                            .and_then(|v| v.get("local_path"))
                             .and_then(Value::as_str)
                             .map(str::trim)
                             .filter(|v| !v.is_empty())
                         {
-                            parts.push(format!("[引用图片] {url}"));
+                            parts.push(format!("[引用图片] {path}"));
                         } else {
                             parts.push("[引用图片]".to_string());
                         }
@@ -469,6 +507,42 @@ fn parse_wecom_business_response(body: &str) -> Result<()> {
         anyhow::bail!("errcode={errcode} errmsg={errmsg}");
     }
     Ok(())
+}
+
+async fn cleanup_inbox_files(root: PathBuf, retention: Duration) {
+    if !root.exists() {
+        return;
+    }
+
+    let mut stack = vec![root];
+    while let Some(dir) = stack.pop() {
+        let Ok(mut rd) = tokio::fs::read_dir(&dir).await else {
+            continue;
+        };
+
+        while let Ok(Some(entry)) = rd.next_entry().await {
+            let path = entry.path();
+            let Ok(meta) = entry.metadata().await else {
+                continue;
+            };
+
+            if meta.is_dir() {
+                stack.push(path);
+                continue;
+            }
+
+            let Ok(modified) = meta.modified() else {
+                continue;
+            };
+
+            let age = SystemTime::now()
+                .duration_since(modified)
+                .unwrap_or_else(|_| Duration::from_secs(0));
+            if age > retention {
+                let _ = tokio::fs::remove_file(&path).await;
+            }
+        }
+    }
 }
 
 fn is_valid_robot_webhook_url(url: &str) -> bool {
@@ -1149,6 +1223,12 @@ impl WeComRuntime {
     }
 
     async fn maybe_cleanup_files(&self) {
+        self.prune_response_urls();
+        self.prune_execution_locks();
+        self.prune_inflight_tasks();
+        self.prune_stream_states();
+        self.prune_conversations();
+
         let now = Instant::now();
         {
             let mut last = self.last_cleanup.lock();
@@ -1158,45 +1238,138 @@ impl WeComRuntime {
             *last = now;
         }
 
-        self.prune_response_urls();
-        self.prune_execution_locks();
-        self.prune_inflight_tasks();
-        self.prune_stream_states();
-        self.prune_conversations();
-
         let retention = Duration::from_secs((self.cfg.file_retention_days as u64) * 86_400);
         let root = self.cfg.workspace_dir.join(".wecom").join("inbox");
+        tokio::spawn(async move {
+            cleanup_inbox_files(root, retention).await;
+        });
+    }
 
-        if !root.exists() {
+    async fn materialize_quote_attachments(&self, inbound: &mut ParsedInbound) {
+        let quote_type = inbound
+            .raw_payload
+            .get("quote")
+            .and_then(|v| v.get("msgtype"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .unwrap_or("");
+
+        if quote_type == "image" {
+            let quote_url = inbound
+                .raw_payload
+                .get("quote")
+                .and_then(|v| v.get("image"))
+                .and_then(|v| v.get("url"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+                .map(ToOwned::to_owned);
+            if let Some(url) = quote_url {
+                let marker = match self
+                    .download_and_store_attachment(&url, AttachmentKind::Image, inbound)
+                    .await
+                {
+                    Ok(value) => value,
+                    Err(err) => {
+                        tracing::warn!("WeCom quote image processing failed: {err}");
+                        "[引用图片下载失败]".to_string()
+                    }
+                };
+                if let Some(quote) = inbound.raw_payload.get_mut("quote") {
+                    quote["image"] = serde_json::json!({ "local_path": marker });
+                }
+            }
             return;
         }
 
-        let mut stack = vec![root];
-        while let Some(dir) = stack.pop() {
-            let Ok(mut rd) = tokio::fs::read_dir(&dir).await else {
-                continue;
-            };
-
-            while let Ok(Some(entry)) = rd.next_entry().await {
-                let path = entry.path();
-                let Ok(meta) = entry.metadata().await else {
-                    continue;
+        if quote_type == "file" {
+            let quote_url = inbound
+                .raw_payload
+                .get("quote")
+                .and_then(|v| v.get("file"))
+                .and_then(|v| v.get("url"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+                .map(ToOwned::to_owned);
+            if let Some(url) = quote_url {
+                let marker = match self
+                    .download_and_store_attachment(&url, AttachmentKind::File, inbound)
+                    .await
+                {
+                    Ok(value) => value,
+                    Err(err) => {
+                        tracing::warn!("WeCom quote file processing failed: {err}");
+                        "[引用文件下载失败]".to_string()
+                    }
                 };
-
-                if meta.is_dir() {
-                    stack.push(path);
-                    continue;
+                if let Some(quote) = inbound.raw_payload.get_mut("quote") {
+                    quote["file"] = serde_json::json!({ "local_path": marker });
                 }
+            }
+            return;
+        }
 
-                let Ok(modified) = meta.modified() else {
-                    continue;
+        if quote_type == "mixed" {
+            let quote_images: Vec<(usize, String)> = inbound
+                .raw_payload
+                .get("quote")
+                .and_then(|v| v.get("mixed"))
+                .and_then(|v| v.get("msg_item"))
+                .and_then(Value::as_array)
+                .map(|items| {
+                    items
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(idx, item)| {
+                            let item_type = item
+                                .get("msgtype")
+                                .and_then(Value::as_str)
+                                .unwrap_or_default();
+                            if item_type != "image" {
+                                return None;
+                            }
+                            item.get("image")
+                                .and_then(|v| v.get("url"))
+                                .and_then(Value::as_str)
+                                .map(str::trim)
+                                .filter(|v| !v.is_empty())
+                                .map(|url| (idx, url.to_string()))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+
+            if quote_images.is_empty() {
+                return;
+            }
+
+            let mut results: Vec<(usize, String)> = Vec::with_capacity(quote_images.len());
+            for (idx, url) in quote_images {
+                let marker = match self
+                    .download_and_store_attachment(&url, AttachmentKind::Image, inbound)
+                    .await
+                {
+                    Ok(value) => value,
+                    Err(err) => {
+                        tracing::warn!("WeCom quote mixed image processing failed: {err}");
+                        "[引用图片下载失败]".to_string()
+                    }
                 };
+                results.push((idx, marker));
+            }
 
-                let age = SystemTime::now()
-                    .duration_since(modified)
-                    .unwrap_or_else(|_| Duration::from_secs(0));
-                if age > retention {
-                    let _ = tokio::fs::remove_file(&path).await;
+            if let Some(items) = inbound
+                .raw_payload
+                .get_mut("quote")
+                .and_then(|v| v.get_mut("mixed"))
+                .and_then(|v| v.get_mut("msg_item"))
+                .and_then(Value::as_array_mut)
+            {
+                for (idx, marker) in results {
+                    if let Some(item) = items.get_mut(idx) {
+                        item["image"] = serde_json::json!({ "local_path": marker });
+                    }
                 }
             }
         }
@@ -1363,6 +1536,11 @@ impl WeComRuntime {
             .send()
             .await
             .context("failed to download WeCom attachment")?;
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            anyhow::bail!("WeCom attachment download failed: status={} body={body}", status);
+        }
 
         if let Some(len) = response.content_length()
             && len > self.cfg.max_file_size_bytes
@@ -1399,7 +1577,12 @@ impl WeComRuntime {
             inbound.sender_userid
         ));
         let ts = bytes_timestamp_now();
-        let file_name = format!("{safe_scope}_{ts}_{}.{}", inbound.msg_id, ext);
+        let file_name = format!(
+            "{safe_scope}_{ts}_{}_{}.{}",
+            inbound.msg_id,
+            random_ascii_token(6),
+            ext
+        );
 
         let dir = self.cfg.workspace_dir.join(".wecom").join("inbox");
         tokio::fs::create_dir_all(&dir)
@@ -1790,6 +1973,26 @@ pub(super) async fn handle_wecom_callback(
                 }
             };
         }
+        if event_type == "template_card_event" {
+            let event_key =
+                extract_template_card_event_key(&parsed.raw_payload).unwrap_or_else(|| "-".to_string());
+            tracing::info!(
+                "WeCom template_card_event received: msg_id={} event_key={}",
+                parsed.msg_id,
+                event_key
+            );
+            return (StatusCode::OK, "success".to_string()).into_response();
+        }
+        if event_type == "feedback_event" {
+            let summary = extract_feedback_event_summary(&parsed.raw_payload)
+                .unwrap_or_else(|| "feedback=invalid-payload".to_string());
+            tracing::info!(
+                "WeCom feedback_event received: msg_id={} {}",
+                parsed.msg_id,
+                summary
+            );
+            return (StatusCode::OK, "success".to_string()).into_response();
+        }
 
         tracing::info!(
             "WeCom event ignored: event_type={} msg_id={}",
@@ -1956,6 +2159,8 @@ async fn process_inbound_message(
     scopes: ScopeDecision,
     stream_id: String,
 ) {
+    let mut inbound = inbound;
+    runtime.materialize_quote_attachments(&mut inbound).await;
     let normalized = runtime.normalize_message(&inbound).await;
 
     match normalized {
@@ -2237,5 +2442,55 @@ mod tests {
         assert!(parse_wecom_business_response(r#"{"errcode":0,"errmsg":"ok"}"#).is_ok());
         assert!(parse_wecom_business_response(r#"{"errcode":93000,"errmsg":"expired"}"#).is_err());
         assert!(parse_wecom_business_response(r#"{"errmsg":"ok"}"#).is_err());
+    }
+
+    #[test]
+    fn extract_quote_context_does_not_leak_remote_media_url() {
+        let payload = serde_json::json!({
+            "quote": {
+                "msgtype": "image",
+                "image": {
+                    "url": "https://example.com/tmp-sign-url"
+                }
+            }
+        });
+
+        let quote = extract_quote_context(&payload).expect("quote should be extracted");
+        assert!(quote.contains("[引用图片]"));
+        assert!(!quote.contains("example.com/tmp-sign-url"));
+    }
+
+    #[test]
+    fn extract_template_card_event_key_reads_event_key() {
+        let payload = serde_json::json!({
+            "event": {
+                "eventtype": "template_card_event",
+                "template_card_event": {
+                    "event_key": "button_confirm"
+                }
+            }
+        });
+        assert_eq!(
+            extract_template_card_event_key(&payload).as_deref(),
+            Some("button_confirm")
+        );
+    }
+
+    #[test]
+    fn extract_feedback_event_summary_reads_fields() {
+        let payload = serde_json::json!({
+            "event": {
+                "eventtype": "feedback_event",
+                "feedback_event": {
+                    "id": "fb_1",
+                    "type": 2,
+                    "content": "not accurate"
+                }
+            }
+        });
+        let summary = extract_feedback_event_summary(&payload).expect("summary should exist");
+        assert!(summary.contains("feedback_id=fb_1"));
+        assert!(summary.contains("feedback_type=2"));
+        assert!(summary.contains("content=not accurate"));
     }
 }
