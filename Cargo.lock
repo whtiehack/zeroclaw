@@ -9103,12 +9103,14 @@ dependencies = [
 name = "zeroclaw"
 version = "0.1.7"
 dependencies = [
+ "aes",
  "aho-corasick",
  "anyhow",
  "async-imap",
  "async-trait",
  "axum",
  "base64",
+ "cbc",
  "chacha20poly1305",
  "chrono",
  "chrono-tz",
@@ -9163,6 +9165,7 @@ dependencies = [
  "serde-big-array",
  "serde_ignored",
  "serde_json",
+ "sha1",
  "sha2",
  "shellexpand 3.1.1",
  "tempfile",

@@ -484,13 +484,14 @@ fn channel_delivery_instructions(channel_name: &str) -> Option<&'static str> {
              - Use tool results silently: answer the latest user message directly, and do not narrate delayed/internal tool execution bookkeeping.",
         ),
         "wecom" => Some(
-            "When responding on WeCom:\n\
-             - Keep the response concise and structured for enterprise chat contexts.\n\
-             - Prefer short paragraphs and lists; avoid heavy markdown syntax.\n\
-             - Respect channel context fields injected by runtime (`chat_type`, `chat_id`, `conversation_scope`, `sender_userid` when present).\n\
-             - If asked to configure fallback proactive push, use memory_store with key `wecom_push_url::<conversation_scope>` and store a valid HTTPS WeCom robot webhook URL.\n\
-             - For oversized or unavailable attachments, explain limitations directly instead of pretending file access succeeded.\n\
-             - Use tool results silently: answer the latest user message directly, and do not narrate delayed/internal tool execution bookkeeping.",
+            "When responding on WeCom (企业微信):\n\
+             - Use standard markdown for formatting: **bold**, *italic*, `code`, code blocks, lists, links.\n\
+             - Keep responses concise and well-structured for enterprise chat contexts.\n\
+             - Image/file attachments are automatically downloaded and provided as local paths like [IMAGE:/path/to/file.png] or [Document: /path/to/file.bin].\n\
+             - Quoted messages (when user replies to a specific message) are automatically injected into context as [引用xxx].\n\
+             - In shared group chats, each turn includes sender_userid to identify who is speaking.\n\
+             - If user asks to enable proactive push notifications, use memory_store tool with the key shown in push_url_memory_key field and store a valid WeCom robot webhook URL (https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=xxx).\n\
+             - Use tool results silently: answer the user's question directly without narrating internal execution steps.",
         ),
         _ => None,
     }
