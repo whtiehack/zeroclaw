@@ -33,13 +33,26 @@ This document records the implementation decisions for the WeCom MVP gateway int
 
 ## Streaming Strategy in MVP
 
-- Current MVP uses chunked markdown delivery (multi-send) to emulate progressive output.
-- It does not yet implement native WeCom `msgtype=stream` passive-refresh protocol.
-- This keeps implementation simple while preserving long-output delivery and retry fallbacks.
+- Current MVP now uses native WeCom passive stream replies:
+  - callback response returns encrypted `msgtype=stream` payload
+  - first reply uses `finish=false`
+  - subsequent `msgtype=stream` refresh callbacks return latest content with same `stream.id`
+  - final state returns `finish=true`
+- When model output exceeds stream content max length (20480 bytes), overflow part falls back to `response_url` / push-webhook delivery as supplemental message.
+- `response_url` cache is still retained for long-task fallback and proactive push.
+
+## Busy / Stop Behavior
+
+- If same `execution_scope` is already processing:
+  - normal message: immediate stream reply with busy text and random emoji
+  - busy text includes: `如果需要停止当前消息处理，请发送停止或者stop。`
+- If busy and incoming message contains `停止` or `stop` (case-insensitive):
+  - current in-flight task is aborted
+  - active stream state is marked `finish=true` with stop message
+  - current callback returns an immediate stop confirmation stream reply
 
 ## Known Gaps / Follow-up
 
-- Passive encrypted stream protocol (`msgtype=stream` + refresh callbacks) is not implemented yet.
 - Attachment type sniffing is minimal (fixed extension defaults for now).
 - Fallback push URL governance currently relies on URL validation + memory key convention.
 

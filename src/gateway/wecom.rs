@@ -9,7 +9,7 @@ use axum::{
     Json,
 };
 use base64::Engine as _;
-use cbc::cipher::{block_padding::NoPadding, BlockDecryptMut, KeyIvInit};
+use cbc::cipher::{block_padding::NoPadding, BlockDecryptMut, BlockEncryptMut, KeyIvInit};
 use parking_lot::Mutex;
 use rand::Rng;
 use serde::Deserialize;
@@ -19,6 +19,7 @@ use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use tokio::task::JoinHandle;
 
 const WECOM_RESPONSE_URL_TTL_SECS: u64 = 3600;
 const WECOM_MARKDOWN_MAX_BYTES: usize = 20_480;
@@ -26,6 +27,8 @@ const WECOM_MARKDOWN_CHUNK_BYTES: usize = 8_000;
 const WECOM_EMOJIS: &[&str] = &["🙂", "😄", "🤝", "🚀", "👌"];
 const WECOM_HISTORY_WINDOW_TURNS: usize = 12;
 const WECOM_FILE_CLEANUP_INTERVAL_SECS: u64 = 1800;
+const WECOM_STREAM_STATE_TTL_SECS: u64 = 7200;
+const WECOM_STREAM_BOOTSTRAP_CONTENT: &str = "正在处理中，请稍候。";
 
 #[derive(Debug, Deserialize)]
 pub(super) struct WeComCallbackQuery {
@@ -47,6 +50,8 @@ struct WeComRuntime {
     client: reqwest::Client,
     response_urls: Arc<Mutex<HashMap<String, VecDeque<ResponseUrlEntry>>>>,
     execution_locks: Arc<Mutex<HashMap<String, ExecutionLockEntry>>>,
+    inflight_tasks: Arc<Mutex<HashMap<String, InflightTaskEntry>>>,
+    stream_states: Arc<Mutex<HashMap<String, StreamState>>>,
     conversations: Arc<Mutex<HashMap<String, ConversationState>>>,
     last_cleanup: Arc<Mutex<Instant>>,
     fingerprint: String,
@@ -101,6 +106,24 @@ struct ResponseUrlEntry {
 #[derive(Debug, Clone)]
 struct ExecutionLockEntry {
     owner_msg_id: String,
+    stream_id: String,
+    expires_at: Instant,
+}
+
+struct InflightTaskEntry {
+    owner_msg_id: String,
+    stream_id: String,
+    expires_at: Instant,
+    handle: JoinHandle<()>,
+}
+
+#[derive(Debug, Clone)]
+struct StreamState {
+    execution_scope: String,
+    conversation_scope: String,
+    owner_msg_id: String,
+    content: String,
+    finish: bool,
     expires_at: Instant,
 }
 
@@ -170,6 +193,140 @@ fn normalize_scope_component(raw: &str) -> String {
 fn random_emoji() -> &'static str {
     let idx = rand::rng().random_range(0..WECOM_EMOJIS.len());
     WECOM_EMOJIS[idx]
+}
+
+fn random_ascii_token(len: usize) -> String {
+    const CHARSET: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+    let mut out = String::with_capacity(len);
+    let mut rng = rand::rng();
+    for _ in 0..len {
+        let idx = rng.random_range(0..CHARSET.len());
+        out.push(CHARSET[idx] as char);
+    }
+    out
+}
+
+fn next_stream_id() -> String {
+    format!("zs_{}", random_ascii_token(20))
+}
+
+fn contains_stop_command(text: &str) -> bool {
+    text.contains("停止") || text.to_ascii_lowercase().contains("stop")
+}
+
+fn extract_stop_signal_text(inbound: &ParsedInbound) -> Option<String> {
+    match inbound.msg_type.as_str() {
+        "text" => inbound
+            .raw_payload
+            .get("text")
+            .and_then(|v| v.get("content"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(ToOwned::to_owned),
+        "voice" => inbound
+            .raw_payload
+            .get("voice")
+            .and_then(|v| v.get("content"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(ToOwned::to_owned),
+        "mixed" => {
+            let mut texts = Vec::new();
+            let items = inbound
+                .raw_payload
+                .get("mixed")
+                .and_then(|v| v.get("msg_item"))
+                .and_then(Value::as_array)?;
+            for item in items {
+                if item
+                    .get("msgtype")
+                    .and_then(Value::as_str)
+                    .is_some_and(|v| v == "text")
+                    && let Some(content) = item
+                        .get("text")
+                        .and_then(|v| v.get("content"))
+                        .and_then(Value::as_str)
+                {
+                    let trimmed = content.trim();
+                    if !trimmed.is_empty() {
+                        texts.push(trimmed.to_string());
+                    }
+                }
+            }
+            if texts.is_empty() {
+                None
+            } else {
+                Some(texts.join("\n"))
+            }
+        }
+        _ => None,
+    }
+}
+
+fn trim_utf8_to_max_bytes(input: &str, max_bytes: usize) -> String {
+    if input.as_bytes().len() <= max_bytes {
+        return input.to_string();
+    }
+
+    let mut out = String::new();
+    for ch in input.chars() {
+        if out.len() + ch.len_utf8() > max_bytes {
+            break;
+        }
+        out.push(ch);
+    }
+    out
+}
+
+fn normalize_stream_content(input: &str) -> String {
+    trim_utf8_to_max_bytes(input, WECOM_MARKDOWN_MAX_BYTES)
+}
+
+fn split_stream_content_and_overflow(input: &str) -> (String, Option<String>) {
+    if input.as_bytes().len() <= WECOM_MARKDOWN_MAX_BYTES {
+        return (input.to_string(), None);
+    }
+
+    let mut head = String::new();
+    let mut tail = String::new();
+    let mut overflow = false;
+    for ch in input.chars() {
+        if !overflow && head.len() + ch.len_utf8() <= WECOM_MARKDOWN_MAX_BYTES {
+            head.push(ch);
+        } else {
+            overflow = true;
+            tail.push(ch);
+        }
+    }
+
+    if tail.is_empty() {
+        (head, None)
+    } else {
+        (head, Some(tail))
+    }
+}
+
+fn make_stream_payload(stream_id: &str, content: &str, finish: bool) -> Value {
+    serde_json::json!({
+        "msgtype": "stream",
+        "stream": {
+            "id": stream_id,
+            "finish": finish,
+            "content": normalize_stream_content(content),
+        }
+    })
+}
+
+fn parse_stream_id(payload: &Value) -> Option<String> {
+    payload
+        .get("stream")
+        .and_then(|v| v.get("id"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(ToOwned::to_owned)
 }
 
 fn is_valid_robot_webhook_url(url: &str) -> bool {
@@ -345,6 +502,50 @@ impl WeComCrypto {
         sha.update(parts.join(""));
         let expected = hex::encode(sha.finalize());
         expected.eq_ignore_ascii_case(msg_signature.trim())
+    }
+
+    fn encrypt_json_ciphertext(
+        &self,
+        plaintext: &str,
+        nonce: &str,
+        timestamp: &str,
+        receive_id: &str,
+    ) -> Result<String> {
+        let plaintext_bytes = plaintext.as_bytes();
+        if plaintext_bytes.len() > (u32::MAX as usize) {
+            anyhow::bail!("WeCom plaintext payload too large");
+        }
+
+        let mut raw = Vec::with_capacity(plaintext_bytes.len() + receive_id.len() + 64);
+        raw.extend_from_slice(random_ascii_token(16).as_bytes());
+        raw.extend_from_slice(&(plaintext_bytes.len() as u32).to_be_bytes());
+        raw.extend_from_slice(plaintext_bytes);
+        raw.extend_from_slice(receive_id.as_bytes());
+
+        let pad_len = 32 - (raw.len() % 32);
+        let actual_pad = if pad_len == 0 { 32 } else { pad_len };
+        raw.extend(vec![actual_pad as u8; actual_pad]);
+
+        let iv = &self.key[..16];
+        let mut buf = raw.clone();
+        let encrypted = cbc::Encryptor::<Aes256>::new((&self.key).into(), iv.into())
+            .encrypt_padded_mut::<NoPadding>(&mut buf, raw.len())
+            .context("failed to encrypt WeCom response payload")?;
+        let encrypted_b64 = base64::engine::general_purpose::STANDARD.encode(encrypted);
+
+        let mut parts = vec![self.token.as_str(), timestamp.trim(), nonce.trim(), &encrypted_b64];
+        parts.sort_unstable();
+        let mut sha = Sha1::new();
+        sha.update(parts.join(""));
+        let signature = hex::encode(sha.finalize());
+
+        let envelope = serde_json::json!({
+            "encrypt": encrypted_b64,
+            "msgsignature": signature,
+            "timestamp": timestamp.trim(),
+            "nonce": nonce.trim(),
+        });
+        Ok(envelope.to_string())
     }
 
     fn decrypt_json_ciphertext(&self, encrypt: &str, receive_id: &str) -> Result<String> {
@@ -537,6 +738,8 @@ impl WeComRuntime {
             client: reqwest::Client::new(),
             response_urls: Arc::new(Mutex::new(HashMap::new())),
             execution_locks: Arc::new(Mutex::new(HashMap::new())),
+            inflight_tasks: Arc::new(Mutex::new(HashMap::new())),
+            stream_states: Arc::new(Mutex::new(HashMap::new())),
             conversations: Arc::new(Mutex::new(HashMap::new())),
             last_cleanup: Arc::new(Mutex::new(Instant::now())),
             fingerprint,
@@ -585,10 +788,21 @@ impl WeComRuntime {
         queue.remove(idx)
     }
 
-    fn try_acquire_execution_lock(&self, execution_scope: &str, msg_id: &str) -> bool {
+    fn prune_execution_locks(&self) {
         let now = Instant::now();
         let mut locks = self.execution_locks.lock();
         locks.retain(|_, lock| lock.expires_at > now);
+    }
+
+    fn is_execution_locked(&self, execution_scope: &str) -> bool {
+        self.prune_execution_locks();
+        self.execution_locks.lock().contains_key(execution_scope)
+    }
+
+    fn try_acquire_execution_lock(&self, execution_scope: &str, msg_id: &str, stream_id: &str) -> bool {
+        self.prune_execution_locks();
+        let now = Instant::now();
+        let mut locks = self.execution_locks.lock();
 
         if locks.contains_key(execution_scope) {
             return false;
@@ -598,6 +812,7 @@ impl WeComRuntime {
             execution_scope.to_string(),
             ExecutionLockEntry {
                 owner_msg_id: msg_id.to_string(),
+                stream_id: stream_id.to_string(),
                 expires_at: now + Duration::from_secs(self.cfg.lock_timeout_secs),
             },
         );
@@ -612,6 +827,117 @@ impl WeComRuntime {
         {
             locks.remove(execution_scope);
         }
+    }
+
+    fn force_release_execution_lock(&self, execution_scope: &str) {
+        self.execution_locks.lock().remove(execution_scope);
+    }
+
+    fn current_stream_id_for_scope(&self, execution_scope: &str) -> Option<String> {
+        self.prune_execution_locks();
+        self.execution_locks
+            .lock()
+            .get(execution_scope)
+            .map(|entry| entry.stream_id.clone())
+    }
+
+    fn register_inflight_task(
+        &self,
+        execution_scope: &str,
+        owner_msg_id: &str,
+        stream_id: &str,
+        handle: JoinHandle<()>,
+    ) {
+        self.prune_inflight_tasks();
+        self.inflight_tasks.lock().insert(
+            execution_scope.to_string(),
+            InflightTaskEntry {
+                owner_msg_id: owner_msg_id.to_string(),
+                stream_id: stream_id.to_string(),
+                expires_at: Instant::now() + Duration::from_secs(self.cfg.lock_timeout_secs),
+                handle,
+            },
+        );
+    }
+
+    fn prune_inflight_tasks(&self) {
+        let now = Instant::now();
+        let mut inflight = self.inflight_tasks.lock();
+        let stale_scopes: Vec<String> = inflight
+            .iter()
+            .filter(|(_, task)| task.expires_at <= now || task.handle.is_finished())
+            .map(|(scope, _)| scope.clone())
+            .collect();
+
+        for scope in stale_scopes {
+            if let Some(task) = inflight.remove(&scope)
+                && !task.handle.is_finished()
+            {
+                task.handle.abort();
+            }
+        }
+    }
+
+    fn clear_inflight_task_if_owner(&self, execution_scope: &str, owner_msg_id: &str) {
+        let mut inflight = self.inflight_tasks.lock();
+        if inflight
+            .get(execution_scope)
+            .is_some_and(|entry| entry.owner_msg_id == owner_msg_id)
+        {
+            inflight.remove(execution_scope);
+        }
+    }
+
+    fn abort_inflight_task(&self, execution_scope: &str) -> Option<String> {
+        self.prune_inflight_tasks();
+        let task = self.inflight_tasks.lock().remove(execution_scope)?;
+        let stream_id = task.stream_id;
+        task.handle.abort();
+        Some(stream_id)
+    }
+
+    fn upsert_stream_state(
+        &self,
+        stream_id: &str,
+        execution_scope: &str,
+        conversation_scope: &str,
+        owner_msg_id: &str,
+        content: &str,
+        finish: bool,
+    ) {
+        let mut states = self.stream_states.lock();
+        states.insert(
+            stream_id.to_string(),
+            StreamState {
+                execution_scope: execution_scope.to_string(),
+                conversation_scope: conversation_scope.to_string(),
+                owner_msg_id: owner_msg_id.to_string(),
+                content: normalize_stream_content(content),
+                finish,
+                expires_at: Instant::now() + Duration::from_secs(WECOM_STREAM_STATE_TTL_SECS),
+            },
+        );
+    }
+
+    fn update_stream_state_content(&self, stream_id: &str, content: &str, finish: bool) {
+        let mut states = self.stream_states.lock();
+        if let Some(state) = states.get_mut(stream_id) {
+            state.content = normalize_stream_content(content);
+            state.finish = finish;
+            state.expires_at = Instant::now() + Duration::from_secs(WECOM_STREAM_STATE_TTL_SECS);
+        }
+    }
+
+    fn get_stream_state(&self, stream_id: &str) -> Option<StreamState> {
+        self.prune_stream_states();
+        self.stream_states.lock().get(stream_id).cloned()
+    }
+
+    fn prune_stream_states(&self) {
+        let now = Instant::now();
+        self.stream_states
+            .lock()
+            .retain(|_, state| state.expires_at > now);
     }
 
     fn snapshot_conversation(&self, scope: &str) -> ConversationState {
@@ -1221,95 +1547,304 @@ pub(super) async fn handle_wecom_callback(
         }
     };
 
-    if !parsed.msg_id.is_empty() {
+    if parsed.msg_type != "stream" && !parsed.msg_id.is_empty() {
         let key = format!("wecom_msg_{}", parsed.msg_id);
         if !state.idempotency_store.record_if_new(&key) {
             return (StatusCode::OK, "success".to_string()).into_response();
         }
     }
 
-    let state_clone = state.clone();
-    tokio::spawn(async move {
-        process_inbound_message(state_clone, runtime, parsed).await;
-    });
+    let scopes = compute_scopes(&runtime.cfg, &parsed);
+    runtime.cache_response_url(
+        &scopes.conversation_scope,
+        parsed.msg_id.as_str(),
+        parsed.response_url.as_deref(),
+    );
 
-    (StatusCode::OK, "success".to_string()).into_response()
+    if parsed.msg_type == "stream" {
+        let stream_id = parse_stream_id(&parsed.raw_payload).unwrap_or_else(next_stream_id);
+        let state_snapshot = runtime.get_stream_state(&stream_id);
+        let (content, finish) = if let Some(snapshot) = state_snapshot {
+            tracing::debug!(
+                "WeCom stream refresh hit: stream_id={} scope={} exec_scope={} finish={} owner={}",
+                stream_id,
+                snapshot.conversation_scope,
+                snapshot.execution_scope,
+                snapshot.finish,
+                snapshot.owner_msg_id
+            );
+            (snapshot.content, snapshot.finish)
+        } else {
+            ("任务已结束或不存在。".to_string(), true)
+        };
+        return match encrypt_passive_stream_reply(&runtime, &query, &stream_id, &content, finish) {
+            Ok(resp) => (StatusCode::OK, resp).into_response(),
+            Err(err) => {
+                tracing::error!("WeCom stream refresh encrypt failed: {err:#}");
+                (StatusCode::OK, "success".to_string()).into_response()
+            }
+        };
+    }
+
+    if !is_model_supported_msgtype(&parsed.msg_type) {
+        tracing::info!(
+            "WeCom unsupported message ignored: msg_type={} msg_id={}",
+            parsed.msg_type,
+            parsed.msg_id
+        );
+        return (StatusCode::OK, "success".to_string()).into_response();
+    }
+
+    let stop_text = extract_stop_signal_text(&parsed).unwrap_or_default();
+    if runtime.is_execution_locked(&scopes.execution_scope) {
+        if contains_stop_command(&stop_text) {
+            let stopped = "已停止当前消息处理。";
+            if let Some(stream_id) = runtime.current_stream_id_for_scope(&scopes.execution_scope) {
+                runtime.update_stream_state_content(&stream_id, stopped, true);
+            }
+            runtime.abort_inflight_task(&scopes.execution_scope);
+            runtime.force_release_execution_lock(&scopes.execution_scope);
+
+            let stop_reply_stream = next_stream_id();
+            runtime.upsert_stream_state(
+                &stop_reply_stream,
+                &scopes.execution_scope,
+                &scopes.conversation_scope,
+                &parsed.msg_id,
+                stopped,
+                true,
+            );
+            return match encrypt_passive_stream_reply(
+                &runtime,
+                &query,
+                &stop_reply_stream,
+                stopped,
+                true,
+            ) {
+                Ok(resp) => (StatusCode::OK, resp).into_response(),
+                Err(err) => {
+                    tracing::error!("WeCom stop reply encrypt failed: {err:#}");
+                    (StatusCode::OK, "success".to_string()).into_response()
+                }
+            };
+        }
+
+        let busy = format!(
+            "有消息正在处理中，但是多了一次回复机会！如果需要停止当前消息处理，请发送停止或者stop。{}",
+            random_emoji()
+        );
+        let busy_stream = next_stream_id();
+        runtime.upsert_stream_state(
+            &busy_stream,
+            &scopes.execution_scope,
+            &scopes.conversation_scope,
+            &parsed.msg_id,
+            &busy,
+            true,
+        );
+        return match encrypt_passive_stream_reply(&runtime, &query, &busy_stream, &busy, true) {
+            Ok(resp) => (StatusCode::OK, resp).into_response(),
+            Err(err) => {
+                tracing::error!("WeCom busy reply encrypt failed: {err:#}");
+                (StatusCode::OK, "success".to_string()).into_response()
+            }
+        };
+    }
+
+    if is_voice_without_transcript(&parsed) {
+        let msg = format!("我现在无法处理语音消息 {}", random_emoji());
+        let stream_id = next_stream_id();
+        runtime.upsert_stream_state(
+            &stream_id,
+            &scopes.execution_scope,
+            &scopes.conversation_scope,
+            &parsed.msg_id,
+            &msg,
+            true,
+        );
+        return match encrypt_passive_stream_reply(&runtime, &query, &stream_id, &msg, true) {
+            Ok(resp) => (StatusCode::OK, resp).into_response(),
+            Err(err) => {
+                tracing::error!("WeCom voice fallback encrypt failed: {err:#}");
+                (StatusCode::OK, "success".to_string()).into_response()
+            }
+        };
+    }
+
+    let stream_id = next_stream_id();
+    if !runtime.try_acquire_execution_lock(&scopes.execution_scope, &parsed.msg_id, &stream_id) {
+        let busy = format!(
+            "有消息正在处理中，但是多了一次回复机会！如果需要停止当前消息处理，请发送停止或者stop。{}",
+            random_emoji()
+        );
+        let busy_stream = next_stream_id();
+        runtime.upsert_stream_state(
+            &busy_stream,
+            &scopes.execution_scope,
+            &scopes.conversation_scope,
+            &parsed.msg_id,
+            &busy,
+            true,
+        );
+        return match encrypt_passive_stream_reply(&runtime, &query, &busy_stream, &busy, true) {
+            Ok(resp) => (StatusCode::OK, resp).into_response(),
+            Err(err) => {
+                tracing::error!("WeCom race-busy reply encrypt failed: {err:#}");
+                (StatusCode::OK, "success".to_string()).into_response()
+            }
+        };
+    }
+
+    runtime.upsert_stream_state(
+        &stream_id,
+        &scopes.execution_scope,
+        &scopes.conversation_scope,
+        &parsed.msg_id,
+        WECOM_STREAM_BOOTSTRAP_CONTENT,
+        false,
+    );
+
+    let state_clone = state.clone();
+    let runtime_clone = runtime.clone();
+    let parsed_clone = parsed.clone();
+    let scopes_clone = scopes.clone();
+    let stream_id_clone = stream_id.clone();
+    let handle = tokio::spawn(async move {
+        process_inbound_message(
+            state_clone,
+            runtime_clone,
+            parsed_clone,
+            scopes_clone,
+            stream_id_clone,
+        )
+        .await;
+    });
+    runtime.register_inflight_task(
+        &scopes.execution_scope,
+        &parsed.msg_id,
+        &stream_id,
+        handle,
+    );
+
+    match encrypt_passive_stream_reply(
+        &runtime,
+        &query,
+        &stream_id,
+        WECOM_STREAM_BOOTSTRAP_CONTENT,
+        false,
+    ) {
+        Ok(resp) => (StatusCode::OK, resp).into_response(),
+        Err(err) => {
+            tracing::error!("WeCom bootstrap stream encrypt failed: {err:#}");
+            (StatusCode::OK, "success".to_string()).into_response()
+        }
+    }
 }
 
 async fn process_inbound_message(
     state: AppState,
     runtime: Arc<WeComRuntime>,
     inbound: ParsedInbound,
+    scopes: ScopeDecision,
+    stream_id: String,
 ) {
-    let scopes = compute_scopes(&runtime.cfg, &inbound);
-
-    runtime.cache_response_url(
-        &scopes.conversation_scope,
-        inbound.msg_id.as_str(),
-        inbound.response_url.as_deref(),
-    );
-
     let normalized = runtime.normalize_message(&inbound).await;
 
     match normalized {
         NormalizedMessage::VoiceMissingTranscript => {
             let msg = format!("我现在无法处理语音消息 {}", random_emoji());
-            runtime
-                .send_text_with_fallbacks(&state, &scopes.conversation_scope, &msg)
-                .await;
-            return;
+            runtime.update_stream_state_content(&stream_id, &msg, true);
         }
         NormalizedMessage::Unsupported => {
-            tracing::info!(
-                "WeCom unsupported message ignored: msg_type={} msg_id={}",
-                inbound.msg_type,
-                inbound.msg_id
-            );
-            return;
+            let msg = "暂不支持该消息类型。".to_string();
+            runtime.update_stream_state_content(&stream_id, &msg, true);
         }
         NormalizedMessage::Ready(content) => {
-            if !runtime.try_acquire_execution_lock(&scopes.execution_scope, &inbound.msg_id) {
-                let busy = format!("有消息正在处理中，但是多了一次回复机会！{}", random_emoji());
+            runtime.update_stream_state_content(&stream_id, "正在调用模型生成回复...", false);
+
+            let prior = runtime.snapshot_conversation(&scopes.conversation_scope);
+            let composed = runtime.compose_input(&inbound, &scopes, &content, &prior);
+
+            let llm_response = match run_gateway_chat_with_tools(&state, &composed.user_message_for_model).await {
+                Ok(text) => text,
+                Err(err) => {
+                    tracing::error!("WeCom LLM execution failed: {err:#}");
+                    "抱歉，我暂时无法处理这条消息。".to_string()
+                }
+            };
+
+            let (stream_content, overflow) = split_stream_content_and_overflow(&llm_response);
+            runtime.update_stream_state_content(&stream_id, &stream_content, true);
+
+            runtime.upsert_conversation(
+                &scopes.conversation_scope,
+                true,
+                &composed.user_turn_for_history,
+                &llm_response,
+            );
+
+            if let Some(extra) = overflow {
+                let extra_msg = format!("[补充消息]\n{extra}");
                 runtime
-                    .send_text_with_fallbacks(&state, &scopes.conversation_scope, &busy)
+                    .send_text_with_fallbacks(&state, &scopes.conversation_scope, &extra_msg)
                     .await;
-                return;
             }
 
-            let task_result = async {
-                let prior = runtime.snapshot_conversation(&scopes.conversation_scope);
-                let composed = runtime.compose_input(&inbound, &scopes, &content, &prior);
-
-                let llm_response =
-                    match run_gateway_chat_with_tools(&state, &composed.user_message_for_model)
-                        .await
-                    {
-                        Ok(text) => text,
-                        Err(err) => {
-                            tracing::error!("WeCom LLM execution failed: {err:#}");
-                            "抱歉，我暂时无法处理这条消息。".to_string()
-                        }
-                    };
-
-                runtime
-                    .send_text_with_fallbacks(&state, &scopes.conversation_scope, &llm_response)
-                    .await;
-
-                runtime.upsert_conversation(
-                    &scopes.conversation_scope,
-                    true,
-                    &composed.user_turn_for_history,
-                    &llm_response,
-                );
-
-                runtime.maybe_cleanup_files().await;
-            }
-            .await;
-
-            runtime.release_execution_lock(&scopes.execution_scope, &inbound.msg_id);
-            task_result
+            runtime.maybe_cleanup_files().await;
         }
     }
+
+    runtime.release_execution_lock(&scopes.execution_scope, &inbound.msg_id);
+    runtime.clear_inflight_task_if_owner(&scopes.execution_scope, &inbound.msg_id);
+}
+
+fn reply_timestamp(query: &WeComCallbackQuery) -> String {
+    if query.timestamp.trim().is_empty() {
+        bytes_timestamp_now().to_string()
+    } else {
+        query.timestamp.trim().to_string()
+    }
+}
+
+fn reply_nonce(query: &WeComCallbackQuery) -> String {
+    if query.nonce.trim().is_empty() {
+        random_ascii_token(12)
+    } else {
+        query.nonce.trim().to_string()
+    }
+}
+
+fn encrypt_passive_stream_reply(
+    runtime: &WeComRuntime,
+    query: &WeComCallbackQuery,
+    stream_id: &str,
+    content: &str,
+    finish: bool,
+) -> Result<String> {
+    let timestamp = reply_timestamp(query);
+    let nonce = reply_nonce(query);
+    let payload = make_stream_payload(stream_id, content, finish);
+    runtime
+        .crypto
+        .encrypt_json_ciphertext(&payload.to_string(), &nonce, &timestamp, "")
+}
+
+fn is_model_supported_msgtype(msg_type: &str) -> bool {
+    matches!(msg_type, "text" | "voice" | "image" | "file" | "mixed")
+}
+
+fn is_voice_without_transcript(inbound: &ParsedInbound) -> bool {
+    if inbound.msg_type != "voice" {
+        return false;
+    }
+    inbound
+        .raw_payload
+        .get("voice")
+        .and_then(|v| v.get("content"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .unwrap_or("")
+        .is_empty()
 }
 
 #[cfg(test)]
@@ -1366,6 +1901,41 @@ mod tests {
         assert!(!is_valid_robot_webhook_url(
             "https://qyapi.weixin.qq.com/cgi-bin/message/send"
         ));
+    }
+
+    #[test]
+    fn stop_command_detection_supports_cn_and_en() {
+        assert!(contains_stop_command("停止"));
+        assert!(contains_stop_command("Please STOP now"));
+        assert!(!contains_stop_command("继续处理"));
+    }
+
+    #[test]
+    fn crypto_encrypt_and_decrypt_roundtrip() {
+        let crypto =
+            WeComCrypto::new("token123", "abcdefghijklmnopqrstuvwxyz0123456789ABCDEFG").unwrap();
+        let nonce = "nonce123";
+        let timestamp = "1700000000";
+        let plain = r#"{"msgtype":"stream","stream":{"id":"sid","finish":false,"content":"hi"}}"#;
+
+        let envelope = crypto
+            .encrypt_json_ciphertext(plain, nonce, timestamp, "")
+            .unwrap();
+        let parsed: Value = serde_json::from_str(&envelope).unwrap();
+        let encrypt = parsed
+            .get("encrypt")
+            .and_then(Value::as_str)
+            .unwrap()
+            .to_string();
+        let signature = parsed
+            .get("msgsignature")
+            .and_then(Value::as_str)
+            .unwrap()
+            .to_string();
+
+        assert!(crypto.verify_signature(&signature, timestamp, nonce, &encrypt));
+        let decrypted = crypto.decrypt_json_ciphertext(&encrypt, "").unwrap();
+        assert_eq!(decrypted, plain);
     }
 
     #[test]
