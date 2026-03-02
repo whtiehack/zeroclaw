@@ -683,6 +683,11 @@ fn mask_sensitive_fields(config: &crate::config::Config) -> crate::config::Confi
     if let Some(qq) = masked.channels_config.qq.as_mut() {
         mask_required_secret(&mut qq.app_secret);
     }
+    if let Some(wecom) = masked.channels_config.wecom.as_mut() {
+        mask_required_secret(&mut wecom.token);
+        mask_required_secret(&mut wecom.encoding_aes_key);
+        mask_optional_secret(&mut wecom.fallback_robot_webhook_url);
+    }
     if let Some(nostr) = masked.channels_config.nostr.as_mut() {
         mask_required_secret(&mut nostr.private_key);
     }
@@ -866,6 +871,20 @@ fn restore_masked_sensitive_fields(
         restore_required_secret(&mut incoming_ch.app_secret, &current_ch.app_secret);
     }
     if let (Some(incoming_ch), Some(current_ch)) = (
+        incoming.channels_config.wecom.as_mut(),
+        current.channels_config.wecom.as_ref(),
+    ) {
+        restore_required_secret(&mut incoming_ch.token, &current_ch.token);
+        restore_required_secret(
+            &mut incoming_ch.encoding_aes_key,
+            &current_ch.encoding_aes_key,
+        );
+        restore_optional_secret(
+            &mut incoming_ch.fallback_robot_webhook_url,
+            &current_ch.fallback_robot_webhook_url,
+        );
+    }
+    if let (Some(incoming_ch), Some(current_ch)) = (
         incoming.channels_config.nostr.as_mut(),
         current.channels_config.nostr.as_ref(),
     ) {
@@ -969,7 +988,7 @@ mod tests {
     }
 
     #[test]
-    fn mask_sensitive_fields_covers_wati_email_and_feishu_secrets() {
+    fn mask_sensitive_fields_covers_wati_email_feishu_and_wecom_secrets() {
         let mut cfg = crate::config::Config::default();
         cfg.proxy.http_proxy = Some("http://user:pass@proxy.internal:8080".to_string());
         cfg.proxy.https_proxy = Some("https://user:pass@proxy.internal:8443".to_string());
@@ -1003,6 +1022,20 @@ mod tests {
             draft_update_interval_ms: crate::config::schema::default_lark_draft_update_interval_ms(
             ),
             max_draft_edits: crate::config::schema::default_lark_max_draft_edits(),
+        });
+        cfg.channels_config.wecom = Some(crate::config::WeComConfig {
+            token: "wecom-token".to_string(),
+            encoding_aes_key: "abcdefghijklmnopqrstuvwxyz0123456789ABCDEFG".to_string(),
+            group_shared_history_chat_ids: vec![],
+            group_shared_history_enabled: false,
+            file_retention_days: 3,
+            max_file_size_mb: 20,
+            response_url_cache_per_scope: 50,
+            lock_timeout_secs: 900,
+            history_max_turns: 30,
+            fallback_robot_webhook_url: Some(
+                "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=test".to_string(),
+            ),
         });
 
         let masked = mask_sensitive_fields(&cfg);
@@ -1053,10 +1086,21 @@ mod tests {
             masked_feishu.verification_token.as_deref(),
             Some(MASKED_SECRET)
         );
+        let masked_wecom = masked
+            .channels_config
+            .wecom
+            .as_ref()
+            .expect("wecom config should exist");
+        assert_eq!(masked_wecom.token, MASKED_SECRET);
+        assert_eq!(masked_wecom.encoding_aes_key, MASKED_SECRET);
+        assert_eq!(
+            masked_wecom.fallback_robot_webhook_url.as_deref(),
+            Some(MASKED_SECRET)
+        );
     }
 
     #[test]
-    fn hydrate_config_for_save_restores_wati_email_and_feishu_secrets() {
+    fn hydrate_config_for_save_restores_wati_email_feishu_and_wecom_secrets() {
         let mut current = crate::config::Config::default();
         current.proxy.http_proxy = Some("http://user:pass@proxy.internal:8080".to_string());
         current.proxy.https_proxy = Some("https://user:pass@proxy.internal:8443".to_string());
@@ -1089,6 +1133,20 @@ mod tests {
             draft_update_interval_ms: crate::config::schema::default_lark_draft_update_interval_ms(
             ),
             max_draft_edits: crate::config::schema::default_lark_max_draft_edits(),
+        });
+        current.channels_config.wecom = Some(crate::config::WeComConfig {
+            token: "wecom-token".to_string(),
+            encoding_aes_key: "abcdefghijklmnopqrstuvwxyz0123456789ABCDEFG".to_string(),
+            group_shared_history_chat_ids: vec![],
+            group_shared_history_enabled: false,
+            file_retention_days: 3,
+            max_file_size_mb: 20,
+            response_url_cache_per_scope: 50,
+            lock_timeout_secs: 900,
+            history_max_turns: 30,
+            fallback_robot_webhook_url: Some(
+                "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=test".to_string(),
+            ),
         });
 
         let incoming = mask_sensitive_fields(&current);
@@ -1151,6 +1209,20 @@ mod tests {
         assert_eq!(
             restored_feishu.verification_token.as_deref(),
             Some("feishu-verify-token")
+        );
+        let restored_wecom = restored
+            .channels_config
+            .wecom
+            .as_ref()
+            .expect("wecom config should exist");
+        assert_eq!(restored_wecom.token, "wecom-token");
+        assert_eq!(
+            restored_wecom.encoding_aes_key,
+            "abcdefghijklmnopqrstuvwxyz0123456789ABCDEFG"
+        );
+        assert_eq!(
+            restored_wecom.fallback_robot_webhook_url.as_deref(),
+            Some("https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=test")
         );
     }
 }
