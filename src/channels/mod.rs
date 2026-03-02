@@ -36,6 +36,7 @@ pub mod telegram;
 pub mod traits;
 pub mod transcription;
 pub mod wati;
+pub mod wecom;
 pub mod whatsapp;
 #[cfg(feature = "whatsapp-web")]
 pub mod whatsapp_storage;
@@ -63,6 +64,7 @@ pub use slack::SlackChannel;
 pub use telegram::TelegramChannel;
 pub use traits::{Channel, SendMessage};
 pub use wati::WatiChannel;
+pub use wecom::WeComChannel;
 pub use whatsapp::WhatsAppChannel;
 #[cfg(feature = "whatsapp-web")]
 pub use whatsapp_web::WhatsAppWebChannel;
@@ -4712,6 +4714,27 @@ fn collect_configured_channels(
             display_name: "ClawdTalk",
             channel: Arc::new(ClawdTalkChannel::new(ct.clone())),
         });
+    }
+
+    // WeCom: requires memory instance for scope webhook lookup.
+    // Instantiated here with a lightweight markdown memory for health-check registration;
+    // the full memory-backed instance is wired in the gateway (run_gateway).
+    if config.channels_config.wecom.is_some() {
+        let mem_cfg = crate::config::MemoryConfig {
+            backend: "markdown".into(),
+            ..Default::default()
+        };
+        if let Ok(mem) = crate::memory::create_memory(&mem_cfg, &config.workspace_dir, None) {
+            let fallback = config
+                .channels_config
+                .wecom
+                .as_ref()
+                .and_then(|w| w.fallback_robot_webhook_url.clone());
+            channels.push(ConfiguredChannel {
+                display_name: "WeCom",
+                channel: Arc::new(WeComChannel::new(Arc::from(mem), fallback)),
+            });
+        }
     }
 
     channels

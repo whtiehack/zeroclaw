@@ -16,7 +16,7 @@ mod wecom;
 pub mod ws;
 
 use crate::channels::{
-    Channel, LinqChannel, NextcloudTalkChannel, QQChannel, SendMessage, WatiChannel,
+    Channel, LinqChannel, NextcloudTalkChannel, QQChannel, SendMessage, WatiChannel, WeComChannel,
     WhatsAppChannel,
 };
 use crate::config::Config;
@@ -314,6 +314,7 @@ pub struct AppState {
     pub qq: Option<Arc<QQChannel>>,
     pub qq_webhook_enabled: bool,
     pub wecom: Option<Arc<crate::gateway::wecom::WeComRuntime>>,
+    pub wecom_channel: Option<Arc<WeComChannel>>,
     /// Observability backend for metrics scraping
     pub observer: Arc<dyn crate::observability::Observer>,
     /// Registered tool specs (for web dashboard tools page)
@@ -584,6 +585,15 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
             }
         });
 
+    // WeCom channel (if configured) — uses the shared memory instance
+    let wecom_channel: Option<Arc<WeComChannel>> =
+        config.channels_config.wecom.as_ref().map(|wecom_cfg| {
+            Arc::new(WeComChannel::new(
+                mem.clone(),
+                wecom_cfg.fallback_robot_webhook_url.clone(),
+            ))
+        });
+
     // ── Pairing guard ──────────────────────────────────────
     let pairing = Arc::new(PairingGuard::new(
         config.gateway.require_pairing,
@@ -651,8 +661,8 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         println!("  POST /qq        — QQ Bot webhook (validation + events)");
     }
     if config.channels_config.wecom.is_some() {
-        println!("  GET  /wecombot/callback — WeCom callback URL verification");
-        println!("  POST /wecombot/callback — WeCom encrypted callback");
+        println!("  GET  /wecom     — WeCom callback URL verification");
+        println!("  POST /wecom     — WeCom encrypted callback");
     }
     if config.gateway.node_control.enabled {
         println!("  POST /api/node-control — experimental node-control RPC scaffold");
@@ -713,6 +723,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         qq: qq_channel,
         qq_webhook_enabled,
         wecom: wecom_runtime,
+        wecom_channel,
         observer: broadcast_observer,
         tools_registry,
         tools_registry_exec,
@@ -758,8 +769,8 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         .route("/wati", post(handle_wati_webhook))
         .route("/nextcloud-talk", post(handle_nextcloud_talk_webhook))
         .route("/qq", post(handle_qq_webhook))
-        .route("/wecombot/callback", get(wecom::handle_wecom_verify))
-        .route("/wecombot/callback", post(wecom::handle_wecom_callback))
+        .route("/wecom", get(wecom::handle_wecom_verify))
+        .route("/wecom", post(wecom::handle_wecom_callback))
         // ── OpenClaw migration: tools-enabled chat endpoint ──
         .route("/api/chat", post(openclaw_compat::handle_api_chat))
         // ── OpenAI-compatible endpoints ──
@@ -2388,6 +2399,7 @@ mod tests {
             qq: None,
             qq_webhook_enabled: false,
             wecom: None,
+            wecom_channel: None,
             observer: Arc::new(crate::observability::NoopObserver),
             tools_registry: Arc::new(Vec::new()),
             tools_registry_exec: Arc::new(Vec::new()),
@@ -2444,6 +2456,8 @@ mod tests {
             wati: None,
             qq: None,
             qq_webhook_enabled: false,
+            wecom: None,
+            wecom_channel: None,
             observer,
             tools_registry: Arc::new(Vec::new()),
             tools_registry_exec: Arc::new(Vec::new()),
@@ -2487,6 +2501,7 @@ mod tests {
             qq: None,
             qq_webhook_enabled: false,
             wecom: None,
+            wecom_channel: None,
             observer: Arc::new(crate::observability::NoopObserver),
             tools_registry: Arc::new(Vec::new()),
             tools_registry_exec: Arc::new(Vec::new()),
@@ -2531,6 +2546,7 @@ mod tests {
             qq: None,
             qq_webhook_enabled: false,
             wecom: None,
+            wecom_channel: None,
             observer: Arc::new(crate::observability::NoopObserver),
             tools_registry: Arc::new(Vec::new()),
             tools_registry_exec: Arc::new(Vec::new()),
@@ -3001,6 +3017,7 @@ Reminder set successfully."#;
             qq: None,
             qq_webhook_enabled: false,
             wecom: None,
+            wecom_channel: None,
             observer: Arc::new(crate::observability::NoopObserver),
             tools_registry: Arc::new(Vec::new()),
             tools_registry_exec: Arc::new(Vec::new()),
@@ -3071,6 +3088,7 @@ Reminder set successfully."#;
             qq: None,
             qq_webhook_enabled: false,
             wecom: None,
+            wecom_channel: None,
             observer: Arc::new(crate::observability::NoopObserver),
             tools_registry: Arc::new(Vec::new()),
             tools_registry_exec: Arc::new(Vec::new()),
@@ -3123,6 +3141,7 @@ Reminder set successfully."#;
             qq: None,
             qq_webhook_enabled: false,
             wecom: None,
+            wecom_channel: None,
             observer: Arc::new(crate::observability::NoopObserver),
             tools_registry: Arc::new(Vec::new()),
             tools_registry_exec: Arc::new(Vec::new()),
@@ -3176,6 +3195,7 @@ Reminder set successfully."#;
             qq: None,
             qq_webhook_enabled: false,
             wecom: None,
+            wecom_channel: None,
             observer: Arc::new(crate::observability::NoopObserver),
             tools_registry: Arc::new(Vec::new()),
             tools_registry_exec: Arc::new(Vec::new()),
@@ -3238,6 +3258,7 @@ Reminder set successfully."#;
             qq: None,
             qq_webhook_enabled: false,
             wecom: None,
+            wecom_channel: None,
             observer: Arc::new(crate::observability::NoopObserver),
             tools_registry: Arc::new(Vec::new()),
             tools_registry_exec: Arc::new(Vec::new()),
@@ -3293,6 +3314,7 @@ Reminder set successfully."#;
             qq: None,
             qq_webhook_enabled: false,
             wecom: None,
+            wecom_channel: None,
             observer: Arc::new(crate::observability::NoopObserver),
             tools_registry: Arc::new(Vec::new()),
             tools_registry_exec: Arc::new(Vec::new()),
@@ -3353,6 +3375,7 @@ Reminder set successfully."#;
             qq: None,
             qq_webhook_enabled: false,
             wecom: None,
+            wecom_channel: None,
             observer: Arc::new(crate::observability::NoopObserver),
             tools_registry: Arc::new(Vec::new()),
             tools_registry_exec: Arc::new(Vec::new()),
@@ -3437,6 +3460,7 @@ Reminder set successfully."#;
             qq: None,
             qq_webhook_enabled: false,
             wecom: None,
+            wecom_channel: None,
             observer: Arc::new(crate::observability::NoopObserver),
             tools_registry: Arc::new(Vec::new()),
             tools_registry_exec: Arc::new(Vec::new()),
@@ -3492,6 +3516,7 @@ Reminder set successfully."#;
             qq: None,
             qq_webhook_enabled: false,
             wecom: None,
+            wecom_channel: None,
             observer: Arc::new(crate::observability::NoopObserver),
             tools_registry: Arc::new(Vec::new()),
             tools_registry_exec: Arc::new(Vec::new()),
@@ -3552,6 +3577,7 @@ Reminder set successfully."#;
             qq: None,
             qq_webhook_enabled: false,
             wecom: None,
+            wecom_channel: None,
             observer: Arc::new(crate::observability::NoopObserver),
             tools_registry: Arc::new(Vec::new()),
             tools_registry_exec: Arc::new(Vec::new()),
@@ -3617,6 +3643,7 @@ Reminder set successfully."#;
             qq: None,
             qq_webhook_enabled: false,
             wecom: None,
+            wecom_channel: None,
             observer: Arc::new(crate::observability::NoopObserver),
             tools_registry: Arc::new(Vec::new()),
             tools_registry_exec: Arc::new(Vec::new()),
@@ -3677,6 +3704,7 @@ Reminder set successfully."#;
             qq: None,
             qq_webhook_enabled: false,
             wecom: None,
+            wecom_channel: None,
             observer: Arc::new(crate::observability::NoopObserver),
             tools_registry: Arc::new(Vec::new()),
             tools_registry_exec: Arc::new(Vec::new()),
@@ -3730,6 +3758,7 @@ Reminder set successfully."#;
             qq: None,
             qq_webhook_enabled: false,
             wecom: None,
+            wecom_channel: None,
             observer: Arc::new(crate::observability::NoopObserver),
             tools_registry: Arc::new(Vec::new()),
             tools_registry_exec: Arc::new(Vec::new()),
@@ -3781,6 +3810,8 @@ Reminder set successfully."#;
             wati: None,
             qq: Some(qq),
             qq_webhook_enabled: true,
+            wecom: None,
+            wecom_channel: None,
             observer: Arc::new(crate::observability::NoopObserver),
             tools_registry: Arc::new(Vec::new()),
             tools_registry_exec: Arc::new(Vec::new()),
