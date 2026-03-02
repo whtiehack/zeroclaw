@@ -313,6 +313,7 @@ pub struct AppState {
     pub wati: Option<Arc<WatiChannel>>,
     pub qq: Option<Arc<QQChannel>>,
     pub qq_webhook_enabled: bool,
+    pub wecom: Option<Arc<crate::gateway::wecom::WeComRuntime>>,
     /// Observability backend for metrics scraping
     pub observer: Arc<dyn crate::observability::Observer>,
     /// Registered tool specs (for web dashboard tools page)
@@ -567,6 +568,22 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
             })
             .map(Arc::from);
 
+    // WeCom runtime (if configured)
+    let wecom_runtime: Option<Arc<crate::gateway::wecom::WeComRuntime>> =
+        config.channels_config.wecom.as_ref().and_then(|wecom_cfg| {
+            match crate::gateway::wecom::WeComRuntime::from_config(wecom_cfg, &config.workspace_dir)
+            {
+                Ok(runtime) => {
+                    tracing::info!("WeCom runtime initialized successfully");
+                    Some(Arc::new(runtime))
+                }
+                Err(err) => {
+                    tracing::error!("Failed to initialize WeCom runtime: {err}");
+                    None
+                }
+            }
+        });
+
     // ── Pairing guard ──────────────────────────────────────
     let pairing = Arc::new(PairingGuard::new(
         config.gateway.require_pairing,
@@ -695,6 +712,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         wati: wati_channel,
         qq: qq_channel,
         qq_webhook_enabled,
+        wecom: wecom_runtime,
         observer: broadcast_observer,
         tools_registry,
         tools_registry_exec,
@@ -2369,6 +2387,7 @@ mod tests {
             wati: None,
             qq: None,
             qq_webhook_enabled: false,
+            wecom: None,
             observer: Arc::new(crate::observability::NoopObserver),
             tools_registry: Arc::new(Vec::new()),
             tools_registry_exec: Arc::new(Vec::new()),
@@ -2467,6 +2486,7 @@ mod tests {
             wati: None,
             qq: None,
             qq_webhook_enabled: false,
+            wecom: None,
             observer: Arc::new(crate::observability::NoopObserver),
             tools_registry: Arc::new(Vec::new()),
             tools_registry_exec: Arc::new(Vec::new()),
@@ -2510,6 +2530,7 @@ mod tests {
             wati: None,
             qq: None,
             qq_webhook_enabled: false,
+            wecom: None,
             observer: Arc::new(crate::observability::NoopObserver),
             tools_registry: Arc::new(Vec::new()),
             tools_registry_exec: Arc::new(Vec::new()),
@@ -2979,6 +3000,7 @@ Reminder set successfully."#;
             wati: None,
             qq: None,
             qq_webhook_enabled: false,
+            wecom: None,
             observer: Arc::new(crate::observability::NoopObserver),
             tools_registry: Arc::new(Vec::new()),
             tools_registry_exec: Arc::new(Vec::new()),
@@ -3048,6 +3070,7 @@ Reminder set successfully."#;
             wati: None,
             qq: None,
             qq_webhook_enabled: false,
+            wecom: None,
             observer: Arc::new(crate::observability::NoopObserver),
             tools_registry: Arc::new(Vec::new()),
             tools_registry_exec: Arc::new(Vec::new()),
@@ -3099,6 +3122,7 @@ Reminder set successfully."#;
             wati: None,
             qq: None,
             qq_webhook_enabled: false,
+            wecom: None,
             observer: Arc::new(crate::observability::NoopObserver),
             tools_registry: Arc::new(Vec::new()),
             tools_registry_exec: Arc::new(Vec::new()),
@@ -3151,6 +3175,7 @@ Reminder set successfully."#;
             wati: None,
             qq: None,
             qq_webhook_enabled: false,
+            wecom: None,
             observer: Arc::new(crate::observability::NoopObserver),
             tools_registry: Arc::new(Vec::new()),
             tools_registry_exec: Arc::new(Vec::new()),
@@ -3212,6 +3237,7 @@ Reminder set successfully."#;
             wati: None,
             qq: None,
             qq_webhook_enabled: false,
+            wecom: None,
             observer: Arc::new(crate::observability::NoopObserver),
             tools_registry: Arc::new(Vec::new()),
             tools_registry_exec: Arc::new(Vec::new()),
@@ -3266,6 +3292,7 @@ Reminder set successfully."#;
             wati: None,
             qq: None,
             qq_webhook_enabled: false,
+            wecom: None,
             observer: Arc::new(crate::observability::NoopObserver),
             tools_registry: Arc::new(Vec::new()),
             tools_registry_exec: Arc::new(Vec::new()),
@@ -3325,6 +3352,7 @@ Reminder set successfully."#;
             wati: None,
             qq: None,
             qq_webhook_enabled: false,
+            wecom: None,
             observer: Arc::new(crate::observability::NoopObserver),
             tools_registry: Arc::new(Vec::new()),
             tools_registry_exec: Arc::new(Vec::new()),
@@ -3408,6 +3436,7 @@ Reminder set successfully."#;
             wati: None,
             qq: None,
             qq_webhook_enabled: false,
+            wecom: None,
             observer: Arc::new(crate::observability::NoopObserver),
             tools_registry: Arc::new(Vec::new()),
             tools_registry_exec: Arc::new(Vec::new()),
@@ -3462,6 +3491,7 @@ Reminder set successfully."#;
             wati: None,
             qq: None,
             qq_webhook_enabled: false,
+            wecom: None,
             observer: Arc::new(crate::observability::NoopObserver),
             tools_registry: Arc::new(Vec::new()),
             tools_registry_exec: Arc::new(Vec::new()),
@@ -3521,6 +3551,7 @@ Reminder set successfully."#;
             wati: None,
             qq: None,
             qq_webhook_enabled: false,
+            wecom: None,
             observer: Arc::new(crate::observability::NoopObserver),
             tools_registry: Arc::new(Vec::new()),
             tools_registry_exec: Arc::new(Vec::new()),
@@ -3585,6 +3616,7 @@ Reminder set successfully."#;
             wati: None,
             qq: None,
             qq_webhook_enabled: false,
+            wecom: None,
             observer: Arc::new(crate::observability::NoopObserver),
             tools_registry: Arc::new(Vec::new()),
             tools_registry_exec: Arc::new(Vec::new()),
@@ -3644,6 +3676,7 @@ Reminder set successfully."#;
             wati: None,
             qq: None,
             qq_webhook_enabled: false,
+            wecom: None,
             observer: Arc::new(crate::observability::NoopObserver),
             tools_registry: Arc::new(Vec::new()),
             tools_registry_exec: Arc::new(Vec::new()),
@@ -3696,6 +3729,7 @@ Reminder set successfully."#;
             wati: None,
             qq: None,
             qq_webhook_enabled: false,
+            wecom: None,
             observer: Arc::new(crate::observability::NoopObserver),
             tools_registry: Arc::new(Vec::new()),
             tools_registry_exec: Arc::new(Vec::new()),

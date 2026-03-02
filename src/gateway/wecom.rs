@@ -18,7 +18,7 @@ use serde_json::Value;
 use sha1::{Digest, Sha1};
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::task::JoinHandle;
 
@@ -49,7 +49,7 @@ struct WeComEncryptedEnvelope {
 }
 
 #[derive(Clone)]
-struct WeComRuntime {
+pub(super) struct WeComRuntime {
     cfg: WeComRuntimeConfig,
     crypto: WeComCrypto,
     client: reqwest::Client,
@@ -185,15 +185,6 @@ impl Default for ConversationState {
             last_active_at: Instant::now(),
         }
     }
-}
-
-fn runtime_store() -> &'static Mutex<HashMap<String, Arc<WeComRuntime>>> {
-    static STORE: OnceLock<Mutex<HashMap<String, Arc<WeComRuntime>>>> = OnceLock::new();
-    STORE.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-fn runtime_key_from_path(config_path: &Path) -> String {
-    config_path.to_string_lossy().to_string()
 }
 
 fn normalize_scope_component(raw: &str) -> String {
@@ -1025,7 +1016,10 @@ fn compute_scopes(cfg: &WeComRuntimeConfig, inbound: &ParsedInbound) -> ScopeDec
 }
 
 impl WeComRuntime {
-    fn from_config(cfg: &crate::config::WeComConfig, workspace_dir: &Path) -> Result<Self> {
+    pub(super) fn from_config(
+        cfg: &crate::config::WeComConfig,
+        workspace_dir: &Path,
+    ) -> Result<Self> {
         let crypto = WeComCrypto::new(&cfg.token, &cfg.encoding_aes_key)?;
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(WECOM_HTTP_TIMEOUT_SECS))
@@ -1890,29 +1884,7 @@ impl WeComRuntime {
 }
 
 fn resolve_runtime(state: &AppState) -> Result<Option<Arc<WeComRuntime>>> {
-    let (wecom_cfg, workspace_dir, runtime_key) = {
-        let cfg_guard = state.config.lock();
-        let Some(wecom_cfg) = cfg_guard.channels_config.wecom.clone() else {
-            return Ok(None);
-        };
-
-        let workspace_dir = cfg_guard.workspace_dir.clone();
-        let runtime_key = runtime_key_from_path(&cfg_guard.config_path);
-        (wecom_cfg, workspace_dir, runtime_key)
-    };
-
-    let candidate = WeComRuntime::from_config(&wecom_cfg, &workspace_dir)?;
-
-    let mut store = runtime_store().lock();
-    if let Some(existing) = store.get(&runtime_key) {
-        if existing.fingerprint == candidate.fingerprint {
-            return Ok(Some(existing.clone()));
-        }
-    }
-
-    let runtime = Arc::new(candidate);
-    store.insert(runtime_key, runtime.clone());
-    Ok(Some(runtime))
+    Ok(state.wecom.clone())
 }
 
 pub(super) async fn handle_wecom_verify(
