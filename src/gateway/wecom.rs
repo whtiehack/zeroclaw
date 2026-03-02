@@ -192,13 +192,8 @@ fn runtime_store() -> &'static Mutex<HashMap<String, Arc<WeComRuntime>>> {
     STORE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-fn runtime_key(state: &AppState) -> String {
-    state
-        .config
-        .lock()
-        .config_path
-        .to_string_lossy()
-        .to_string()
+fn runtime_key_from_path(config_path: &Path) -> String {
+    config_path.to_string_lossy().to_string()
 }
 
 fn normalize_scope_component(raw: &str) -> String {
@@ -1895,13 +1890,18 @@ impl WeComRuntime {
 }
 
 fn resolve_runtime(state: &AppState) -> Result<Option<Arc<WeComRuntime>>> {
-    let cfg_guard = state.config.lock();
-    let Some(wecom_cfg) = cfg_guard.channels_config.wecom.as_ref() else {
-        return Ok(None);
+    let (wecom_cfg, workspace_dir, runtime_key) = {
+        let cfg_guard = state.config.lock();
+        let Some(wecom_cfg) = cfg_guard.channels_config.wecom.clone() else {
+            return Ok(None);
+        };
+
+        let workspace_dir = cfg_guard.workspace_dir.clone();
+        let runtime_key = runtime_key_from_path(&cfg_guard.config_path);
+        (wecom_cfg, workspace_dir, runtime_key)
     };
 
-    let runtime_key = runtime_key(state);
-    let candidate = WeComRuntime::from_config(wecom_cfg, &cfg_guard.workspace_dir)?;
+    let candidate = WeComRuntime::from_config(&wecom_cfg, &workspace_dir)?;
 
     let mut store = runtime_store().lock();
     if let Some(existing) = store.get(&runtime_key) {
