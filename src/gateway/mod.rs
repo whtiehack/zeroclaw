@@ -1045,6 +1045,26 @@ pub(super) async fn run_gateway_chat_with_tools_for_channel_with_reply_target(
     .await
 }
 
+/// Full-featured chat with structured prior history as `ChatMessage` entries.
+/// Used by WeCom to pass conversation history as proper user/assistant turns.
+pub(super) async fn run_gateway_chat_with_history(
+    state: &AppState,
+    message: &str,
+    channel_name: Option<&str>,
+    reply_target: Option<&str>,
+    prior_history: Vec<ChatMessage>,
+) -> anyhow::Result<String> {
+    let config = state.config.lock().clone();
+    crate::agent::process_message_for_channel_with_history(
+        config,
+        message,
+        channel_name,
+        reply_target,
+        prior_history,
+    )
+    .await
+}
+
 fn sanitize_gateway_response(response: &str, tools: &[Box<dyn Tool>]) -> String {
     let sanitized = crate::channels::sanitize_channel_response(response, tools);
     if sanitized.is_empty() && !response.trim().is_empty() {

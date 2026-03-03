@@ -2431,6 +2431,230 @@ pub async fn process_message_for_channel_with_reply_target(
     .await
 }
 
+/// Process a single message with prior conversation history passed as structured
+/// `ChatMessage` entries (user/assistant pairs), aligning WeCom with
+/// Telegram/Discord's multi-turn conversation model.
+pub async fn process_message_for_channel_with_history(
+    config: Config,
+    message: &str,
+    channel_name: Option<&str>,
+    reply_target: Option<&str>,
+    prior_history: Vec<ChatMessage>,
+) -> Result<String> {
+    let observer: Arc<dyn Observer> =
+        Arc::from(observability::create_observer(&config.observability));
+    let runtime: Arc<dyn runtime::RuntimeAdapter> =
+        Arc::from(runtime::create_runtime(&config.runtime)?);
+    let security = Arc::new(SecurityPolicy::from_config(
+        &config.autonomy,
+        &config.workspace_dir,
+    ));
+    let mem: Arc<dyn Memory> = Arc::from(memory::create_memory_with_storage(
+        &config.memory,
+        Some(&config.storage.provider.config),
+        &config.workspace_dir,
+        config.api_key.as_deref(),
+    )?);
+
+    let (composio_key, composio_entity_id) = if config.composio.enabled {
+        (
+            config.composio.api_key.as_deref(),
+            Some(config.composio.entity_id.as_str()),
+        )
+    } else {
+        (None, None)
+    };
+    let mut tools_registry = tools::all_tools_with_runtime(
+        Arc::new(config.clone()),
+        &security,
+        runtime,
+        mem.clone(),
+        composio_key,
+        composio_entity_id,
+        &config.browser,
+        &config.http_request,
+        &config.web_fetch,
+        &config.workspace_dir,
+        &config.agents,
+        config.api_key.as_deref(),
+        &config,
+    );
+    let peripheral_tools: Vec<Box<dyn Tool>> =
+        crate::peripherals::create_peripheral_tools(&config.peripherals).await?;
+    tools_registry.extend(peripheral_tools);
+
+    let provider_name = config.default_provider.as_deref().unwrap_or("openrouter");
+    let model_name = config
+        .default_model
+        .clone()
+        .unwrap_or_else(|| "anthropic/claude-sonnet-4-20250514".into());
+    let provider_runtime_options = providers::ProviderRuntimeOptions {
+        auth_profile_override: None,
+        provider_api_url: config.api_url.clone(),
+        provider_transport: config.effective_provider_transport(),
+        zeroclaw_dir: config.config_path.parent().map(std::path::PathBuf::from),
+        secrets_encrypt: config.secrets.encrypt,
+        reasoning_enabled: config.runtime.reasoning_enabled,
+        reasoning_level: config.effective_provider_reasoning_level(),
+        custom_provider_api_mode: config.provider_api.map(|mode| mode.as_compatible_mode()),
+        max_tokens_override: None,
+        model_support_vision: config.model_support_vision,
+    };
+    let provider: Box<dyn Provider> = providers::create_routed_provider_with_options(
+        provider_name,
+        config.api_key.as_deref(),
+        config.api_url.as_deref(),
+        &config.reliability,
+        &config.model_routes,
+        &model_name,
+        &provider_runtime_options,
+    )?;
+
+    let hardware_rag: Option<crate::rag::HardwareRag> = config
+        .peripherals
+        .datasheet_dir
+        .as_ref()
+        .filter(|d| !d.trim().is_empty())
+        .map(|dir| crate::rag::HardwareRag::load(&config.workspace_dir, dir.trim()))
+        .and_then(Result::ok)
+        .filter(|r: &crate::rag::HardwareRag| !r.is_empty());
+    let board_names: Vec<String> = config
+        .peripherals
+        .boards
+        .iter()
+        .map(|b| b.board.clone())
+        .collect();
+
+    let skills = crate::skills::load_skills_with_config(&config.workspace_dir, &config);
+    let mut tool_descs: Vec<(&str, &str)> = vec![
+        ("shell", "Execute terminal commands."),
+        ("file_read", "Read file contents."),
+        ("file_write", "Write file contents."),
+        ("memory_store", "Save to memory."),
+        ("memory_recall", "Search memory."),
+        ("memory_forget", "Delete a memory entry."),
+        (
+            "model_routing_config",
+            "Configure default model, scenario routing, and delegate agents.",
+        ),
+        ("screenshot", "Capture a screenshot."),
+        ("image_info", "Read image metadata."),
+    ];
+    if config.browser.enabled {
+        tool_descs.push(("browser_open", "Open approved URLs in browser."));
+        tool_descs.push(("browser", "Automate browser interactions."));
+    }
+    if config.composio.enabled {
+        tool_descs.push(("composio", "Execute actions on 1000+ apps via Composio."));
+    }
+    if config.peripherals.enabled && !config.peripherals.boards.is_empty() {
+        tool_descs.push(("gpio_read", "Read GPIO pin value on connected hardware."));
+        tool_descs.push((
+            "gpio_write",
+            "Set GPIO pin high or low on connected hardware.",
+        ));
+        tool_descs.push((
+            "arduino_upload",
+            "Upload Arduino sketch. Use for 'make a heart', custom patterns. You write full .ino code; ZeroClaw uploads it.",
+        ));
+        tool_descs.push((
+            "hardware_memory_map",
+            "Return flash and RAM address ranges. Use when user asks for memory addresses or memory map.",
+        ));
+        tool_descs.push((
+            "hardware_board_info",
+            "Return full board info (chip, architecture, memory map). Use when user asks for board info, what board, connected hardware, or chip info.",
+        ));
+        tool_descs.push((
+            "hardware_memory_read",
+            "Read actual memory/register values from Nucleo. Use when user asks to read registers, read memory, dump lower memory 0-126, or give address and value.",
+        ));
+        tool_descs.push((
+            "hardware_capabilities",
+            "Query connected hardware for reported GPIO pins and LED pin. Use when user asks what pins are available.",
+        ));
+    }
+    let bootstrap_max_chars = if config.agent.compact_context {
+        Some(6000)
+    } else {
+        None
+    };
+    let native_tools = provider.supports_native_tools();
+    let mut system_prompt = crate::channels::build_system_prompt_with_mode(
+        &config.workspace_dir,
+        &model_name,
+        &tool_descs,
+        &skills,
+        Some(&config.identity),
+        bootstrap_max_chars,
+        native_tools,
+        config.skills.prompt_injection_mode,
+    );
+    if !native_tools {
+        system_prompt.push_str(&build_tool_instructions(&tools_registry));
+    }
+    system_prompt.push_str(&build_shell_policy_instructions(&config.autonomy));
+    system_prompt = append_channel_delivery_system_instructions(system_prompt, channel_name);
+
+    // For WeCom: extract static context block from user message into system prompt
+    let message = if channel_name.map(str::trim) == Some("wecom") {
+        std::borrow::Cow::Owned(extract_wecom_static_context_to_system(
+            &mut system_prompt,
+            message,
+        ))
+    } else {
+        std::borrow::Cow::Borrowed(message)
+    };
+
+    let mem_context =
+        build_context(mem.as_ref(), &message, config.memory.min_relevance_score).await;
+    let rag_limit = if config.agent.compact_context { 2 } else { 5 };
+    let hw_context = hardware_rag
+        .as_ref()
+        .map(|r| build_hardware_context(r, &message, &board_names, rag_limit))
+        .unwrap_or_default();
+    let context = format!("{mem_context}{hw_context}");
+    let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S %Z");
+    let enriched = if context.is_empty() {
+        format!("[{now}] {message}")
+    } else {
+        format!("{context}[{now}] {message}")
+    };
+
+    let mut history = vec![ChatMessage::system(&system_prompt)];
+    history.extend(prior_history);
+    history.push(ChatMessage::user(&enriched));
+
+    let tool_loop_channel_name = channel_name
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("channel");
+    let tool_loop_reply_target = reply_target
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+
+    run_tool_call_loop_with_reply_target(
+        provider.as_ref(),
+        &mut history,
+        &tools_registry,
+        observer.as_ref(),
+        provider_name,
+        &model_name,
+        config.default_temperature,
+        true,
+        None,
+        tool_loop_channel_name,
+        tool_loop_reply_target,
+        &config.multimodal,
+        config.agent.max_tool_iterations,
+        None,
+        None,
+        None,
+        &[],
+    )
+    .await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

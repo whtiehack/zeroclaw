@@ -5037,7 +5037,7 @@ fn default_wecom_lock_timeout_secs() -> u64 {
 }
 
 fn default_wecom_history_max_turns() -> usize {
-    30
+    50
 }
 
 /// WeCom AI Bot callback configuration.
@@ -10826,7 +10826,7 @@ default_model = "legacy-model"
         assert_eq!(parsed.max_file_size_mb, 20);
         assert_eq!(parsed.response_url_cache_per_scope, 50);
         assert_eq!(parsed.lock_timeout_secs, 900);
-        assert_eq!(parsed.history_max_turns, 30);
+        assert_eq!(parsed.history_max_turns, 50);
         assert!(parsed.fallback_robot_webhook_url.is_none());
     }
 

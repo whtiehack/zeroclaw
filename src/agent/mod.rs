@@ -14,6 +14,6 @@ mod tests;
 pub use agent::{Agent, AgentBuilder};
 #[allow(unused_imports)]
 pub use loop_::{
-    process_message, process_message_for_channel, process_message_for_channel_with_reply_target,
-    run,
+    process_message, process_message_for_channel, process_message_for_channel_with_history,
+    process_message_for_channel_with_reply_target, run,
 };

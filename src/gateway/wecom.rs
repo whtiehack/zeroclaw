@@ -1,5 +1,6 @@
-use super::{run_gateway_chat_with_tools_for_channel_with_reply_target, AppState};
+use super::{run_gateway_chat_with_history, AppState};
 use crate::channels::traits::Channel;
+use crate::providers::ChatMessage;
 use aes::Aes256;
 use anyhow::{Context, Result};
 use axum::{
@@ -27,7 +28,7 @@ const WECOM_RESPONSE_URL_TTL_SECS: u64 = 3600;
 const WECOM_MARKDOWN_MAX_BYTES: usize = 20_480;
 const WECOM_MARKDOWN_CHUNK_BYTES: usize = 8_000;
 const WECOM_EMOJIS: &[&str] = &["🙂", "😄", "🤝", "🚀", "👌"];
-const WECOM_HISTORY_WINDOW_TURNS: usize = 12;
+const WECOM_HISTORY_WINDOW_TURNS: usize = 50;
 const WECOM_FILE_CLEANUP_INTERVAL_SECS: u64 = 1800;
 const WECOM_STREAM_STATE_TTL_SECS: u64 = 7200;
 const WECOM_CONVERSATION_TTL_SECS: u64 = 172_800;
@@ -209,6 +210,14 @@ fn next_stream_id() -> String {
 
 fn contains_stop_command(text: &str) -> bool {
     text.contains("停止") || text.to_ascii_lowercase().contains("stop")
+}
+
+fn is_clear_session_command(text: &str) -> bool {
+    let trimmed = text.trim();
+    trimmed == "新会话"
+        || trimmed == "清除历史"
+        || trimmed.eq_ignore_ascii_case("new session")
+        || trimmed.eq_ignore_ascii_case("clear history")
 }
 
 fn extract_stop_signal_text(inbound: &ParsedInbound) -> Option<String> {
@@ -1288,6 +1297,10 @@ impl WeComRuntime {
             .retain(|_, state| now.duration_since(state.last_active_at) <= retention);
     }
 
+    fn clear_conversation(&self, scope: &str) {
+        self.conversations.lock().remove(scope);
+    }
+
     async fn maybe_cleanup_files(&self) {
         self.prune_execution_locks();
         self.prune_inflight_tasks();
@@ -1697,21 +1710,6 @@ impl WeComRuntime {
             ));
         }
 
-        let history_slice: Vec<ConversationTurn> = prior
-            .turns
-            .iter()
-            .rev()
-            .take(WECOM_HISTORY_WINDOW_TURNS)
-            .cloned()
-            .collect::<Vec<_>>()
-            .into_iter()
-            .rev()
-            .collect();
-
-        if !history_slice.is_empty() {
-            blocks.push(format_turn_history(&history_slice));
-        }
-
         if scopes.shared_group_history {
             blocks.push(wecom_turn_context(inbound));
         }
@@ -2025,6 +2023,35 @@ pub(super) async fn handle_wecom_callback(
     }
 
     let stop_text = extract_stop_signal_text(&parsed).unwrap_or_default();
+
+    // Handle clear-session commands before any other processing
+    if is_clear_session_command(&stop_text) {
+        runtime.clear_conversation(&scopes.conversation_scope);
+        let msg = "会话已清除，开始新对话。";
+        let clear_stream = next_stream_id();
+        runtime.upsert_stream_state(
+            &clear_stream,
+            &scopes.execution_scope,
+            &scopes.conversation_scope,
+            &parsed.msg_id,
+            msg,
+            true,
+            Vec::new(),
+        );
+        tracing::info!(
+            "WeCom session cleared: scope={} msg_id={}",
+            scopes.conversation_scope,
+            parsed.msg_id
+        );
+        return match encrypt_passive_stream_reply(&runtime, &query, &clear_stream, msg, true, &[]) {
+            Ok(resp) => (StatusCode::OK, resp).into_response(),
+            Err(err) => {
+                tracing::error!("WeCom clear-session reply encrypt failed: {err:#}");
+                (StatusCode::OK, "success".to_string()).into_response()
+            }
+        };
+    }
+
     if runtime.is_execution_locked(&scopes.execution_scope) {
         if contains_stop_command(&stop_text) {
             let stopped = "已停止当前消息处理。";
@@ -2214,12 +2241,36 @@ async fn process_inbound_message(
             let prior = runtime.snapshot_conversation(&scopes.conversation_scope);
             let composed = runtime.compose_input(&inbound, &scopes, &content, &prior);
 
-            let llm_response = match run_gateway_chat_with_tools_for_channel_with_reply_target(
+            // Build structured prior history as Vec<ChatMessage> for LLM multi-turn context
+            let history_window: Vec<ConversationTurn> = prior
+                .turns
+                .iter()
+                .rev()
+                .take(WECOM_HISTORY_WINDOW_TURNS)
+                .cloned()
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect();
+            let mut prior_history: Vec<ChatMessage> = history_window
+                .iter()
+                .map(|t| match t.role {
+                    TurnRole::User => ChatMessage::user(&t.content),
+                    TurnRole::Assistant => ChatMessage::assistant(&t.content),
+                })
+                .collect();
+            // Guard: if first message is assistant (from odd trimming), drop it
+            if prior_history.first().is_some_and(|m| m.role == "assistant") {
+                prior_history.remove(0);
+            }
+
+            let llm_response = match Box::pin(run_gateway_chat_with_history(
                 &state,
                 &composed.user_message_for_model,
                 Some("wecom"),
                 Some(scopes.conversation_scope.as_str()),
-            )
+                prior_history,
+            ))
             .await
             {
                 Ok(text) => text,

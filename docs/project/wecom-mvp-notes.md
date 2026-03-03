@@ -27,12 +27,22 @@ This document records the implementation decisions for the WeCom MVP gateway int
 - Single chat: `user:<userid>`
 - Group chat (default): `group:<chatid>` (all members share one conversation history)
 - Group per-user split: not enabled in current behavior; planned to be controlled via memory state in future.
+- `history_max_turns` default: 50 (aligned with `MAX_CHANNEL_HISTORY` used by Telegram/Discord).
 
 `execution_scope` follows `conversation_scope` to prevent history corruption under concurrency.
+
+## Session Governance
+
+Clear-session commands allow users to reset conversation history without restarting the service:
+
+- Supported commands (exact match only): `新会话`, `清除历史`, `new session`, `clear history`
+- Behavior: clears the in-memory conversation state for the current `conversation_scope` and returns a confirmation message.
+- The check runs before stop-command and execution-lock handling.
 
 ## Context Injection Rules
 
 - Static context (first turn only): `WECOM_STATIC_CONTEXT_V1` — injected into **system prompt** (not user message) to reduce token usage and keep user messages clean.
+- Conversation history: passed as structured `Vec<ChatMessage>` (user/assistant pairs) directly into the LLM message list, aligning with Telegram/Discord's multi-turn model. History is **no longer** injected as a `[WECOM_HISTORY]` text block inside the user message.
 - Shared-group dynamic context (every turn): `WECOM_TURN_CONTEXT_V1` with `sender_userid`
 - Single chat does not repeat sender injection each turn.
 
@@ -41,14 +51,14 @@ This document records the implementation decisions for the WeCom MVP gateway int
 - Gateway passes channel identity (`wecom`) into the agent pipeline.
 - Agent injects WeCom delivery instructions into the **system prompt** (same layer as other channel system constraints).
 - Agent extracts `WECOM_STATIC_CONTEXT_V1` block from the composed user message and appends it to the system prompt as `## WeCom Context`.
-- User message payload after extraction contains only business context (history, quotes, current input).
+- User message payload after extraction contains only business context (quotes, current input). History is delivered as separate `ChatMessage` entries.
 - Push URL configuration guidance is provided solely via system prompt channel delivery instructions (`channel_delivery_instructions("wecom")`); no duplicate hint in static context.
 - `execution_scope` is used internally for concurrency control (locks, inflight tracking) but is not exposed to the LLM context.
 - WeCom composed payload includes:
-  - recent history block (`WECOM_HISTORY`)
   - shared-group turn context (`WECOM_TURN_CONTEXT_V1`, when enabled)
   - quote context (`WECOM_QUOTE`, when present)
   - normalized current user message / attachment markers.
+- Prior conversation history is passed as structured `ChatMessage` list via `process_message_for_channel_with_history()`, resulting in LLM seeing: `[system, user1, assistant1, ..., current_user]`.
 
 ## Streaming Strategy in MVP
 
