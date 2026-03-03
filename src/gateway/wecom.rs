@@ -286,6 +286,15 @@ fn inbound_content_preview(inbound: &ParsedInbound) -> String {
     }
 }
 
+fn outbound_content_preview(content: &str) -> String {
+    let trimmed = content.trim();
+    if trimmed.is_empty() {
+        "[Empty reply]".to_string()
+    } else {
+        crate::util::truncate_with_ellipsis(trimmed, 120)
+    }
+}
+
 fn trim_utf8_to_max_bytes(input: &str, max_bytes: usize) -> String {
     if input.as_bytes().len() <= max_bytes {
         return input.to_string();
@@ -2200,10 +2209,24 @@ async fn process_inbound_message(
         NormalizedMessage::VoiceMissingTranscript => {
             let msg = format!("我现在无法处理语音消息 {}", random_emoji());
             runtime.update_stream_state_content(&stream_id, &msg, true);
+            tracing::info!(
+                "🤖 [wecom] reply fallback in {}: {} (stream_id={}, msg_id={})",
+                scopes.conversation_scope,
+                outbound_content_preview(&msg),
+                stream_id,
+                inbound.msg_id
+            );
         }
         NormalizedMessage::Unsupported => {
             let msg = "暂不支持该消息类型。".to_string();
             runtime.update_stream_state_content(&stream_id, &msg, true);
+            tracing::info!(
+                "🤖 [wecom] reply fallback in {}: {} (stream_id={}, msg_id={})",
+                scopes.conversation_scope,
+                outbound_content_preview(&msg),
+                stream_id,
+                inbound.msg_id
+            );
         }
         NormalizedMessage::Ready(content) => {
             runtime.update_stream_state_content(&stream_id, "正在调用模型生成回复...", false);
@@ -2225,6 +2248,14 @@ async fn process_inbound_message(
                     "抱歉，我暂时无法处理这条消息。".to_string()
                 }
             };
+            tracing::info!(
+                "🤖 [wecom] model reply in {}: {} (len={}, stream_id={}, msg_id={})",
+                scopes.conversation_scope,
+                outbound_content_preview(&llm_response),
+                llm_response.chars().count(),
+                stream_id,
+                inbound.msg_id
+            );
 
             let (text_without_images, image_paths) = parse_image_markers(&llm_response);
             let images = prepare_stream_images(&image_paths).await;
@@ -2242,6 +2273,7 @@ async fn process_inbound_message(
 
             if let Some(extra) = overflow {
                 let extra_msg = format!("[补充消息]\n{extra}");
+                let extra_preview = outbound_content_preview(&extra_msg);
                 // Use WeComChannel::send instead of WeComRuntime::send_text_with_fallbacks
                 if let Some(wecom_channel) = &state.wecom_channel {
                     let send_msg = crate::channels::SendMessage {
@@ -2252,6 +2284,14 @@ async fn process_inbound_message(
                     };
                     if let Err(err) = wecom_channel.send(&send_msg).await {
                         tracing::error!("WeCom overflow message send failed: {err}");
+                    } else {
+                        tracing::info!(
+                            "🤖 [wecom] overflow sent in {}: {} (stream_id={}, msg_id={})",
+                            scopes.conversation_scope,
+                            extra_preview,
+                            stream_id,
+                            inbound.msg_id
+                        );
                     }
                 }
             }
