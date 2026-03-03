@@ -764,12 +764,30 @@ fn split_markdown_chunks(input: &str) -> Vec<String> {
 
 impl WeComCrypto {
     fn new(token: &str, encoding_aes_key: &str) -> Result<Self> {
-        let padded = format!("{}=", encoding_aes_key.trim());
+        use base64::Engine;
+
+        // Try multiple decoding strategies to handle various base64 formats
         let raw = base64::engine::general_purpose::STANDARD
-            .decode(padded)
-            .context("failed to decode WeCom EncodingAESKey")?;
+            .decode(format!("{}=", encoding_aes_key.trim()))
+            .or_else(|_| {
+                // Fallback 1: decode without padding
+                base64::engine::general_purpose::STANDARD_NO_PAD
+                    .decode(encoding_aes_key.trim())
+            })
+            .or_else(|_| {
+                // Fallback 2: use URL_SAFE variant (some systems use this)
+                base64::engine::general_purpose::URL_SAFE
+                    .decode(format!("{}=", encoding_aes_key.trim()))
+            })
+            .or_else(|_| {
+                // Fallback 3: URL_SAFE without padding
+                base64::engine::general_purpose::URL_SAFE_NO_PAD
+                    .decode(encoding_aes_key.trim())
+            })
+            .context("failed to decode WeCom EncodingAESKey - tried STANDARD, STANDARD_NO_PAD, URL_SAFE variants")?;
+
         if raw.len() != 32 {
-            anyhow::bail!("invalid WeCom EncodingAESKey length: expected 32 bytes");
+            anyhow::bail!("invalid WeCom EncodingAESKey length: expected 32 bytes, got {}", raw.len());
         }
         let mut key = [0u8; 32];
         key.copy_from_slice(&raw);
