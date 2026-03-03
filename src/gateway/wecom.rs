@@ -676,7 +676,7 @@ fn wecom_static_context(
             "push_url_memory_key=wecom_push_url::{}",
             scopes.conversation_scope
         ),
-        "push_url_set_hint=When user asks to configure proactive push, call memory_store with push_url_memory_key and store a valid WeCom robot webhook URL."
+        "push_url_set_hint=When user asks to configure proactive push, call memory_store with key=push_url_memory_key, content=<raw webhook URL>, category=wecom_push."
             .to_string(),
     ];
 

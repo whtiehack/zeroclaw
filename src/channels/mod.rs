@@ -496,7 +496,7 @@ fn channel_delivery_instructions(channel_name: &str) -> Option<&'static str> {
              - Image/file attachments are automatically downloaded and provided as local paths like [IMAGE:/path/to/file.png] or [Document: /path/to/file.bin].\n\
              - Quoted messages (when user replies to a specific message) are automatically injected into context as [引用xxx].\n\
              - In shared group chats, each turn includes sender_userid to identify who is speaking.\n\
-             - If user asks to enable proactive push notifications, use memory_store tool with the key shown in push_url_memory_key field and store a valid WeCom robot webhook URL (https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=xxx).\n\
+             - If user asks to enable proactive push notifications, call memory_store with key=push_url_memory_key, content=<raw webhook URL>, and category='wecom_push'.\n\
              - Use tool results silently: answer the user's question directly without narrating internal execution steps.",
         ),
         _ => None,
@@ -1717,6 +1717,14 @@ fn rollback_orphan_user_turn(
 
 fn should_skip_memory_context_entry(key: &str, content: &str) -> bool {
     if memory::is_assistant_autosave_key(key) {
+        return true;
+    }
+
+    if key
+        .trim()
+        .to_ascii_lowercase()
+        .starts_with("wecom_push_url::")
+    {
         return true;
     }
 
@@ -5433,6 +5441,10 @@ mod tests {
         assert!(should_skip_memory_context_entry(
             "telegram_123_history",
             r#"[{"role":"user"}]"#
+        ));
+        assert!(should_skip_memory_context_entry(
+            "wecom_push_url::group:g1",
+            "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=test"
         ));
         assert!(should_skip_memory_context_entry(
             "assistant_resp_legacy",
