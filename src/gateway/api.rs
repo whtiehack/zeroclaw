@@ -1026,8 +1026,6 @@ mod tests {
         cfg.channels_config.wecom = Some(crate::config::WeComConfig {
             token: "wecom-token".to_string(),
             encoding_aes_key: "abcdefghijklmnopqrstuvwxyz0123456789ABCDEFG".to_string(),
-            group_shared_history_chat_ids: vec![],
-            group_shared_history_enabled: false,
             file_retention_days: 3,
             max_file_size_mb: 20,
             response_url_cache_per_scope: 50,
@@ -1138,8 +1136,6 @@ mod tests {
         current.channels_config.wecom = Some(crate::config::WeComConfig {
             token: "wecom-token".to_string(),
             encoding_aes_key: "abcdefghijklmnopqrstuvwxyz0123456789ABCDEFG".to_string(),
-            group_shared_history_chat_ids: vec![],
-            group_shared_history_enabled: false,
             file_retention_days: 3,
             max_file_size_mb: 20,
             response_url_cache_per_scope: 50,

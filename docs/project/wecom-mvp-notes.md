@@ -25,8 +25,8 @@ This document records the implementation decisions for the WeCom MVP gateway int
 ## Conversation Scope Rules
 
 - Single chat: `user:<userid>`
-- Group shared-history chat (whitelist): `group:<chatid>`
-- Group non-shared chat: `group:<chatid>:user:<userid>`
+- Group chat (default): `group:<chatid>` (all members share one conversation history)
+- Group per-user split: not enabled in current behavior; planned to be controlled via memory state in future.
 
 `execution_scope` follows `conversation_scope` to prevent history corruption under concurrency.
 
@@ -34,7 +34,7 @@ This document records the implementation decisions for the WeCom MVP gateway int
 
 - Static context (first turn only): `WECOM_STATIC_CONTEXT_V1` — injected into **system prompt** (not user message) to reduce token usage and keep user messages clean.
 - Shared-group dynamic context (every turn): `WECOM_TURN_CONTEXT_V1` with `sender_userid`
-- Single / non-shared group do not repeat sender injection each turn.
+- Single chat does not repeat sender injection each turn.
 
 ## Prompt / Delivery Instruction Handling (Current)
 
@@ -79,8 +79,6 @@ This document records the implementation decisions for the WeCom MVP gateway int
 
 - `[channels_config.wecom] token`
 - `[channels_config.wecom] encoding_aes_key`
-- `[channels_config.wecom] group_shared_history_enabled`
-- `[channels_config.wecom] group_shared_history_chat_ids`
 - `[channels_config.wecom] file_retention_days`
 - `[channels_config.wecom] max_file_size_mb`
 - `[channels_config.wecom] response_url_cache_per_scope`

@@ -65,8 +65,6 @@ pub(super) struct WeComRuntime {
 #[derive(Clone)]
 struct WeComRuntimeConfig {
     workspace_dir: PathBuf,
-    group_shared_history_enabled: bool,
-    group_shared_history_chat_ids: Vec<String>,
     file_retention_days: u32,
     max_file_size_bytes: u64,
     lock_timeout_secs: u64,
@@ -1014,33 +1012,20 @@ fn parse_inbound_payload(payload: Value) -> Result<ParsedInbound> {
     })
 }
 
-fn compute_scopes(cfg: &WeComRuntimeConfig, inbound: &ParsedInbound) -> ScopeDecision {
+fn compute_scopes(_cfg: &WeComRuntimeConfig, inbound: &ParsedInbound) -> ScopeDecision {
     let chat_type = inbound.chat_type.to_ascii_lowercase();
     if chat_type == "group" {
         let chat_id = inbound
             .chat_id
             .clone()
             .unwrap_or_else(|| "unknown".to_string());
-        let is_shared = cfg.group_shared_history_enabled
-            && cfg
-                .group_shared_history_chat_ids
-                .iter()
-                .any(|value| value == &chat_id);
-
-        if is_shared {
-            let scope = format!("group--{chat_id}");
-            return ScopeDecision {
-                conversation_scope: scope.clone(),
-                execution_scope: scope,
-                shared_group_history: true,
-            };
-        }
-
-        let scope = format!("group--{chat_id}--user--{}", inbound.sender_userid);
+        // Group chats use one shared scope by default.
+        // Per-user split mode can be introduced later via runtime memory state.
+        let scope = format!("group--{chat_id}");
         return ScopeDecision {
             conversation_scope: scope.clone(),
             execution_scope: scope,
-            shared_group_history: false,
+            shared_group_history: true,
         };
     }
 
@@ -1063,16 +1048,11 @@ impl WeComRuntime {
             .build()
             .context("failed to initialize WeCom HTTP client")?;
 
-        let fingerprint = format!(
-            "{}|{}|{}",
-            cfg.token, cfg.encoding_aes_key, cfg.group_shared_history_enabled
-        );
+        let fingerprint = format!("{}|{}", cfg.token, cfg.encoding_aes_key);
 
         Ok(Self {
             cfg: WeComRuntimeConfig {
                 workspace_dir: workspace_dir.to_path_buf(),
-                group_shared_history_enabled: cfg.group_shared_history_enabled,
-                group_shared_history_chat_ids: cfg.group_shared_history_chat_ids.clone(),
                 file_retention_days: cfg.file_retention_days,
                 max_file_size_bytes: cfg.max_file_size_mb.saturating_mul(1024 * 1024),
                 lock_timeout_secs: cfg.lock_timeout_secs.max(30),
@@ -2372,11 +2352,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn scope_uses_group_shared_mode_when_whitelisted() {
+    fn scope_uses_group_shared_mode_by_default_for_group_chat() {
         let cfg = WeComRuntimeConfig {
             workspace_dir: PathBuf::from("."),
-            group_shared_history_enabled: true,
-            group_shared_history_chat_ids: vec!["g1".to_string()],
             file_retention_days: 3,
             max_file_size_bytes: 20 * 1024 * 1024,
             lock_timeout_secs: 900,

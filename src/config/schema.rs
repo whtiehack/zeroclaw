@@ -5047,12 +5047,6 @@ pub struct WeComConfig {
     pub token: String,
     /// EncodingAESKey configured in WeCom callback settings (43 chars base64 body).
     pub encoding_aes_key: String,
-    /// Chat IDs that should share one group-level conversation history.
-    #[serde(default)]
-    pub group_shared_history_chat_ids: Vec<String>,
-    /// Enable whitelist-based group shared history behavior.
-    #[serde(default)]
-    pub group_shared_history_enabled: bool,
     /// File retention days for downloaded WeCom attachments under workspace cache.
     #[serde(default = "default_wecom_file_retention_days")]
     pub file_retention_days: u32,
@@ -10828,8 +10822,6 @@ default_model = "legacy-model"
         let json =
             r#"{"token":"token","encoding_aes_key":"abcdefghijklmnopqrstuvwxyz0123456789ABCDEFG"}"#;
         let parsed: WeComConfig = serde_json::from_str(json).unwrap();
-        assert!(!parsed.group_shared_history_enabled);
-        assert!(parsed.group_shared_history_chat_ids.is_empty());
         assert_eq!(parsed.file_retention_days, 3);
         assert_eq!(parsed.max_file_size_mb, 20);
         assert_eq!(parsed.response_url_cache_per_scope, 50);
@@ -10843,8 +10835,6 @@ default_model = "legacy-model"
         let wc = WeComConfig {
             token: "token".into(),
             encoding_aes_key: "abcdefghijklmnopqrstuvwxyz0123456789ABCDEFG".into(),
-            group_shared_history_chat_ids: vec!["group_1".into()],
-            group_shared_history_enabled: true,
             file_retention_days: 5,
             max_file_size_mb: 30,
             response_url_cache_per_scope: 80,
@@ -10858,8 +10848,6 @@ default_model = "legacy-model"
 
         let toml_str = toml::to_string(&wc).unwrap();
         let parsed: WeComConfig = toml::from_str(&toml_str).unwrap();
-        assert_eq!(parsed.group_shared_history_chat_ids, vec!["group_1"]);
-        assert!(parsed.group_shared_history_enabled);
         assert_eq!(parsed.file_retention_days, 5);
         assert_eq!(parsed.max_file_size_mb, 30);
         assert_eq!(parsed.response_url_cache_per_scope, 80);

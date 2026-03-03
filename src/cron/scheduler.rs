@@ -1164,8 +1164,6 @@ mod tests {
         config.channels_config.wecom = Some(crate::config::schema::WeComConfig {
             token: "test-token".to_string(),
             encoding_aes_key: "abcdefghijklmnopqrstuvwxyz0123456789ABCDE".to_string(),
-            group_shared_history_chat_ids: vec![],
-            group_shared_history_enabled: false,
             file_retention_days: 3,
             max_file_size_mb: 20,
             response_url_cache_per_scope: 50,
