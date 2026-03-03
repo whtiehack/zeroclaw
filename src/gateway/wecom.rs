@@ -718,30 +718,6 @@ fn bytes_timestamp_now() -> u64 {
         .as_secs()
 }
 
-fn format_turn_history(turns: &[ConversationTurn]) -> String {
-    if turns.is_empty() {
-        return String::new();
-    }
-
-    let mut out = String::from("[WECOM_HISTORY]\n");
-    for turn in turns {
-        match turn.role {
-            TurnRole::User => {
-                out.push_str("User: ");
-                out.push_str(&turn.content);
-                out.push_str("\n\n");
-            }
-            TurnRole::Assistant => {
-                out.push_str("Assistant: ");
-                out.push_str(&turn.content);
-                out.push_str("\n\n");
-            }
-        }
-    }
-    out.push_str("[/WECOM_HISTORY]\n");
-    out
-}
-
 fn split_markdown_chunks(input: &str) -> Vec<String> {
     if input.is_empty() {
         return vec![String::new()];
@@ -2026,6 +2002,15 @@ pub(super) async fn handle_wecom_callback(
 
     // Handle clear-session commands before any other processing
     if is_clear_session_command(&stop_text) {
+        // Abort any in-flight task first to prevent upsert_conversation() from
+        // restoring the old history after we clear it.
+        if runtime.is_execution_locked(&scopes.execution_scope) {
+            if let Some(stream_id) = runtime.current_stream_id_for_scope(&scopes.execution_scope) {
+                runtime.update_stream_state_content(&stream_id, "会话已清除", true);
+            }
+            runtime.abort_inflight_task(&scopes.execution_scope);
+            runtime.force_release_execution_lock(&scopes.execution_scope);
+        }
         runtime.clear_conversation(&scopes.conversation_scope);
         let msg = "会话已清除，开始新对话。";
         let clear_stream = next_stream_id();
