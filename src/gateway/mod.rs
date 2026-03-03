@@ -1017,8 +1017,28 @@ pub(super) async fn run_gateway_chat_with_tools(
     state: &AppState,
     message: &str,
 ) -> anyhow::Result<String> {
+    run_gateway_chat_with_tools_for_channel(state, message, None).await
+}
+
+pub(super) async fn run_gateway_chat_with_tools_for_channel(
+    state: &AppState,
+    message: &str,
+    channel_name: Option<&str>,
+) -> anyhow::Result<String> {
     let config = state.config.lock().clone();
-    crate::agent::process_message(config, message).await
+
+    // Prepend channel delivery instructions to the user message if channel is specified
+    let enhanced_message = if let Some(channel) = channel_name {
+        if let Some(instructions) = crate::channels::get_channel_delivery_instructions(channel) {
+            format!("<channel_context>\n{}\n</channel_context>\n\n{}", instructions, message)
+        } else {
+            message.to_string()
+        }
+    } else {
+        message.to_string()
+    };
+
+    crate::agent::process_message(config, &enhanced_message).await
 }
 
 fn sanitize_gateway_response(response: &str, tools: &[Box<dyn Tool>]) -> String {

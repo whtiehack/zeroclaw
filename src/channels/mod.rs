@@ -458,6 +458,10 @@ fn strip_tool_call_tags(message: &str) -> String {
     result.trim().to_string()
 }
 
+pub fn get_channel_delivery_instructions(channel_name: &str) -> Option<&'static str> {
+    channel_delivery_instructions(channel_name)
+}
+
 fn channel_delivery_instructions(channel_name: &str) -> Option<&'static str> {
     match channel_name {
         "telegram" => Some(

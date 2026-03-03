@@ -1,4 +1,4 @@
-use super::{run_gateway_chat_with_tools, AppState};
+use super::{run_gateway_chat_with_tools_for_channel, AppState};
 use crate::channels::traits::Channel;
 use aes::Aes256;
 use anyhow::{Context, Result};
@@ -2175,7 +2175,7 @@ async fn process_inbound_message(
             let composed = runtime.compose_input(&inbound, &scopes, &content, &prior);
 
             let llm_response =
-                match run_gateway_chat_with_tools(&state, &composed.user_message_for_model).await {
+                match run_gateway_chat_with_tools_for_channel(&state, &composed.user_message_for_model, Some("wecom")).await {
                     Ok(text) => text,
                     Err(err) => {
                         tracing::error!("WeCom LLM execution failed: {err:#}");
