@@ -262,6 +262,7 @@ const AUTO_CRON_DELIVERY_CHANNELS: &[&str] = &[
     "discord",
     "slack",
     "mattermost",
+    "wecom",
     "lark",
     "feishu",
 ];
@@ -2173,6 +2174,17 @@ pub async fn process_message_for_channel(
     message: &str,
     channel_name: Option<&str>,
 ) -> Result<String> {
+    process_message_for_channel_with_reply_target(config, message, channel_name, None).await
+}
+
+/// Process a single message with optional channel-scoped delivery instructions
+/// and optional channel reply target for auto-populating scheduled delivery routes.
+pub async fn process_message_for_channel_with_reply_target(
+    config: Config,
+    message: &str,
+    channel_name: Option<&str>,
+    reply_target: Option<&str>,
+) -> Result<String> {
     let observer: Arc<dyn Observer> =
         Arc::from(observability::create_observer(&config.observability));
     let runtime: Arc<dyn runtime::RuntimeAdapter> =
@@ -2347,7 +2359,15 @@ pub async fn process_message_for_channel(
         ChatMessage::user(&enriched),
     ];
 
-    agent_turn(
+    let tool_loop_channel_name = channel_name
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("channel");
+    let tool_loop_reply_target = reply_target
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+
+    run_tool_call_loop_with_reply_target(
         provider.as_ref(),
         &mut history,
         &tools_registry,
@@ -2356,8 +2376,15 @@ pub async fn process_message_for_channel(
         &model_name,
         config.default_temperature,
         true,
+        None,
+        tool_loop_channel_name,
+        tool_loop_reply_target,
         &config.multimodal,
         config.agent.max_tool_iterations,
+        None,
+        None,
+        None,
+        &[],
     )
     .await
 }
@@ -2462,7 +2489,15 @@ mod tests {
     }
 
     #[test]
-    fn maybe_inject_cron_add_delivery_supports_lark_and_feishu_channels() {
+    fn maybe_inject_cron_add_delivery_supports_wecom_lark_and_feishu_channels() {
+        let mut wecom_args = serde_json::json!({
+            "job_type": "agent",
+            "prompt": "daily summary"
+        });
+        maybe_inject_cron_add_delivery("cron_add", &mut wecom_args, "wecom", Some("group:chatid"));
+        assert_eq!(wecom_args["delivery"]["channel"], "wecom");
+        assert_eq!(wecom_args["delivery"]["to"], "group:chatid");
+
         let mut lark_args = serde_json::json!({
             "job_type": "agent",
             "prompt": "daily summary"

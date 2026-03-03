@@ -1025,8 +1025,24 @@ pub(super) async fn run_gateway_chat_with_tools_for_channel(
     message: &str,
     channel_name: Option<&str>,
 ) -> anyhow::Result<String> {
+    run_gateway_chat_with_tools_for_channel_with_reply_target(state, message, channel_name, None)
+        .await
+}
+
+pub(super) async fn run_gateway_chat_with_tools_for_channel_with_reply_target(
+    state: &AppState,
+    message: &str,
+    channel_name: Option<&str>,
+    reply_target: Option<&str>,
+) -> anyhow::Result<String> {
     let config = state.config.lock().clone();
-    crate::agent::process_message_for_channel(config, message, channel_name).await
+    crate::agent::process_message_for_channel_with_reply_target(
+        config,
+        message,
+        channel_name,
+        reply_target,
+    )
+    .await
 }
 
 fn sanitize_gateway_response(response: &str, tools: &[Box<dyn Tool>]) -> String {

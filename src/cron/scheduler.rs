@@ -2,7 +2,7 @@
 use crate::channels::LarkChannel;
 use crate::channels::{
     Channel, DiscordChannel, EmailChannel, MattermostChannel, QQChannel, SendMessage, SlackChannel,
-    TelegramChannel, WhatsAppChannel,
+    TelegramChannel, WeComChannel, WhatsAppChannel,
 };
 use crate::config::Config;
 use crate::cron::{
@@ -383,6 +383,30 @@ pub(crate) async fn deliver_announcement(
                 qq.environment.clone(),
             );
             channel.send(&SendMessage::new(output, target)).await?;
+        }
+        "wecom" => {
+            if let Some(live_channel) = crate::channels::get_live_channel("wecom") {
+                live_channel.send(&SendMessage::new(output, target)).await?;
+            } else {
+                let wecom = config
+                    .channels_config
+                    .wecom
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("wecom channel not configured"))?;
+                let memory = Arc::from(crate::memory::create_memory_with_storage(
+                    &config.memory,
+                    Some(&config.storage.provider.config),
+                    &config.workspace_dir,
+                    config.api_key.as_deref(),
+                )?);
+                let channel = WeComChannel::new(
+                    memory,
+                    wecom.fallback_robot_webhook_url.clone(),
+                    wecom.response_url_ttl_secs,
+                    wecom.response_url_cache_per_scope,
+                );
+                channel.send(&SendMessage::new(output, target)).await?;
+            }
         }
         "whatsapp_web" | "whatsapp" => {
             let wa = config
@@ -1131,6 +1155,39 @@ mod tests {
         };
         let err = deliver_if_configured(&config, &job, "x").await.unwrap_err();
         assert!(err.to_string().contains("unsupported delivery channel"));
+    }
+
+    #[tokio::test]
+    async fn deliver_if_configured_supports_wecom_scope_target() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp).await;
+        config.channels_config.wecom = Some(crate::config::schema::WeComConfig {
+            token: "test-token".to_string(),
+            encoding_aes_key: "abcdefghijklmnopqrstuvwxyz0123456789ABCDE".to_string(),
+            group_shared_history_chat_ids: vec![],
+            group_shared_history_enabled: false,
+            file_retention_days: 3,
+            max_file_size_mb: 20,
+            response_url_cache_per_scope: 50,
+            response_url_ttl_secs: 3600,
+            lock_timeout_secs: 900,
+            history_max_turns: 30,
+            fallback_robot_webhook_url: None,
+        });
+
+        let mut job = test_job("echo ok");
+        job.job_type = JobType::Agent;
+        job.prompt = Some("send update".to_string());
+        job.delivery = DeliveryConfig {
+            mode: "announce".into(),
+            channel: Some("wecom".into()),
+            to: Some("group:test_group".into()),
+            best_effort: true,
+        };
+
+        // No response_url/scope webhook/fallback in this test environment.
+        // WeCom channel should degrade to a dropped outbound warning and still return Ok.
+        assert!(deliver_if_configured(&config, &job, "x").await.is_ok());
     }
 
     #[tokio::test]

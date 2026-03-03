@@ -17,6 +17,10 @@ This document records the implementation decisions for the WeCom MVP gateway int
 - Added fallback outbound chain when no valid `response_url` remains:
   1. scope-level push webhook URL from memory key `wecom_push_url::<conversation_scope>`
   2. global fallback robot webhook URL in config
+- Added scheduled-delivery integration:
+  - WeCom gateway now forwards `conversation_scope` as channel reply target into tool loop context.
+  - `cron_add` agent jobs can auto-fill `delivery={"mode":"announce","channel":"wecom","to":"<conversation_scope>"}`.
+  - Scheduler delivery supports `channel="wecom"` and uses scope target for push.
 
 ## Conversation Scope Rules
 

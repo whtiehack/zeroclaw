@@ -1,4 +1,4 @@
-use super::{run_gateway_chat_with_tools_for_channel, AppState};
+use super::{run_gateway_chat_with_tools_for_channel_with_reply_target, AppState};
 use crate::channels::traits::Channel;
 use aes::Aes256;
 use anyhow::{Context, Result};
@@ -2177,10 +2177,11 @@ async fn process_inbound_message(
             let prior = runtime.snapshot_conversation(&scopes.conversation_scope);
             let composed = runtime.compose_input(&inbound, &scopes, &content, &prior);
 
-            let llm_response = match run_gateway_chat_with_tools_for_channel(
+            let llm_response = match run_gateway_chat_with_tools_for_channel_with_reply_target(
                 &state,
                 &composed.user_message_for_model,
                 Some("wecom"),
+                Some(scopes.conversation_scope.as_str()),
             )
             .await
             {
