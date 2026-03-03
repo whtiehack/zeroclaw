@@ -4,11 +4,12 @@ This document records the implementation decisions for the WeCom MVP gateway int
 
 ## Scope
 
-- Added encrypted callback verification and message decrypt flow for `GET/POST /wecombot/callback`.
+- Added encrypted callback verification and message decrypt flow for `GET/POST /wecom`.
 - Added WeCom-specific runtime state in gateway layer (in-memory):
   - `conversation_scope` history
   - `execution_scope` in-flight lock
-  - `response_url` cache and expiry cleanup
+  - stream state / inflight task tracking / expiry cleanup
+- Added `response_url` cache and expiry cleanup in WeCom channel layer (`WeComChannel`).
 - Added attachment download/decrypt/save flow for `image` and `file` message types.
 - Added voice behavior:
   - with transcript: enters model chain
@@ -30,6 +31,19 @@ This document records the implementation decisions for the WeCom MVP gateway int
 - Static context (first turn only): `WECOM_STATIC_CONTEXT_V1`
 - Shared-group dynamic context (every turn): `WECOM_TURN_CONTEXT_V1` with `sender_userid`
 - Single / non-shared group do not repeat sender injection each turn.
+
+## Prompt / Delivery Instruction Handling (Current)
+
+- Gateway injects WeCom delivery instructions by prepending:
+  - `<channel_context> ... </channel_context>`
+  - then the composed WeCom message payload.
+- WeCom composed payload includes:
+  - static context (`WECOM_STATIC_CONTEXT_V1`, first turn only)
+  - recent history block (`WECOM_HISTORY`)
+  - shared-group turn context (`WECOM_TURN_CONTEXT_V1`, when enabled)
+  - quote context (`WECOM_QUOTE`, when present)
+  - normalized current user message / attachment markers.
+- A dedicated `PromptGuard` blocking/sanitizing stage is currently **not** wired in the WeCom callback ingress path.
 
 ## Streaming Strategy in MVP
 
@@ -55,6 +69,7 @@ This document records the implementation decisions for the WeCom MVP gateway int
 
 - Attachment type sniffing is minimal (fixed extension defaults for now).
 - Fallback push URL governance currently relies on URL validation + memory key convention.
+- PromptGuard module exists globally but is not currently enforced in the WeCom callback ingestion path.
 
 ## Config Keys Added
 
@@ -65,6 +80,7 @@ This document records the implementation decisions for the WeCom MVP gateway int
 - `[channels_config.wecom] file_retention_days`
 - `[channels_config.wecom] max_file_size_mb`
 - `[channels_config.wecom] response_url_cache_per_scope`
+- `[channels_config.wecom] response_url_ttl_secs`
 - `[channels_config.wecom] lock_timeout_secs`
 - `[channels_config.wecom] history_max_turns`
 - `[channels_config.wecom] fallback_robot_webhook_url`
