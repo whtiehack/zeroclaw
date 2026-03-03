@@ -1181,7 +1181,7 @@ mod tests {
         job.delivery = DeliveryConfig {
             mode: "announce".into(),
             channel: Some("wecom".into()),
-            to: Some("group:test_group".into()),
+            to: Some("group--test_group".into()),
             best_effort: true,
         };
 

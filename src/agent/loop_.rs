@@ -2470,13 +2470,13 @@ mod tests {
     #[test]
     fn extract_wecom_static_context_moves_block_to_system_prompt() {
         let mut system_prompt = "base system".to_string();
-        let message = "[WECOM_STATIC_CONTEXT_V1]\nchat_type=group\nchat_id=g1\nconversation_scope=group:g1\n[/WECOM_STATIC_CONTEXT_V1]\n\n[WECOM_HISTORY]\nUser: hello\n[/WECOM_HISTORY]\n\nWhat is up?";
+        let message = "[WECOM_STATIC_CONTEXT_V1]\nchat_type=group\nchat_id=g1\nconversation_scope=group--g1\n[/WECOM_STATIC_CONTEXT_V1]\n\n[WECOM_HISTORY]\nUser: hello\n[/WECOM_HISTORY]\n\nWhat is up?";
 
         let cleaned = extract_wecom_static_context_to_system(&mut system_prompt, message);
 
         assert!(system_prompt.contains("## WeCom Context"));
         assert!(system_prompt.contains("chat_type=group"));
-        assert!(system_prompt.contains("conversation_scope=group:g1"));
+        assert!(system_prompt.contains("conversation_scope=group--g1"));
         assert!(!cleaned.contains("WECOM_STATIC_CONTEXT_V1"));
         assert!(cleaned.contains("WECOM_HISTORY"));
         assert!(cleaned.contains("What is up?"));
@@ -2562,9 +2562,9 @@ mod tests {
             "job_type": "agent",
             "prompt": "daily summary"
         });
-        maybe_inject_cron_add_delivery("cron_add", &mut wecom_args, "wecom", Some("group:chatid"));
+        maybe_inject_cron_add_delivery("cron_add", &mut wecom_args, "wecom", Some("group--chatid"));
         assert_eq!(wecom_args["delivery"]["channel"], "wecom");
-        assert_eq!(wecom_args["delivery"]["to"], "group:chatid");
+        assert_eq!(wecom_args["delivery"]["to"], "group--chatid");
 
         let mut lark_args = serde_json::json!({
             "job_type": "agent",

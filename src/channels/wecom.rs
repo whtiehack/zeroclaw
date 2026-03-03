@@ -174,12 +174,12 @@ impl WeComChannel {
 
         let conversation_scope = if chat_type == "group" {
             if let Some(chat_id) = payload.get("chatid").and_then(|v| v.as_str()) {
-                format!("group:{chat_id}")
+                format!("group--{chat_id}")
             } else {
-                format!("user:{sender_userid}")
+                format!("user--{sender_userid}")
             }
         } else {
-            format!("user:{sender_userid}")
+            format!("user--{sender_userid}")
         };
 
         let content_preview: String = content.chars().take(80).collect();
@@ -550,7 +550,7 @@ mod tests {
         assert_eq!(msgs[0].sender, "test_user");
         assert_eq!(msgs[0].content, "Hello WeCom!");
         assert_eq!(msgs[0].channel, "wecom");
-        assert_eq!(msgs[0].reply_target, "user:test_user");
+        assert_eq!(msgs[0].reply_target, "user--test_user");
         assert_eq!(msgs[0].id, "msg_001");
     }
 
@@ -569,7 +569,7 @@ mod tests {
 
         let msgs = ch.parse_webhook_payload(&payload);
         assert_eq!(msgs.len(), 1);
-        assert_eq!(msgs[0].reply_target, "group:chat_group_1");
+        assert_eq!(msgs[0].reply_target, "group--chat_group_1");
     }
 
     #[test]
@@ -753,32 +753,32 @@ mod tests {
     #[test]
     fn wecom_cache_response_url_basic() {
         let ch = make_channel();
-        ch.cache_response_url("user:alice", "msg_001", Some("https://example.com/url1"));
-        ch.cache_response_url("user:alice", "msg_002", Some("https://example.com/url2"));
+        ch.cache_response_url("user--alice", "msg_001", Some("https://example.com/url1"));
+        ch.cache_response_url("user--alice", "msg_002", Some("https://example.com/url2"));
 
         // Should retrieve in FIFO order
-        let entry1 = ch.take_response_url("user:alice");
+        let entry1 = ch.take_response_url("user--alice");
         assert!(entry1.is_some());
         assert_eq!(entry1.unwrap().url, "https://example.com/url1");
 
-        let entry2 = ch.take_response_url("user:alice");
+        let entry2 = ch.take_response_url("user--alice");
         assert!(entry2.is_some());
         assert_eq!(entry2.unwrap().url, "https://example.com/url2");
 
         // Queue should be empty now
-        let entry3 = ch.take_response_url("user:alice");
+        let entry3 = ch.take_response_url("user--alice");
         assert!(entry3.is_none());
     }
 
     #[test]
     fn wecom_cache_response_url_ignores_empty() {
         let ch = make_channel();
-        ch.cache_response_url("user:bob", "msg_001", Some(""));
-        ch.cache_response_url("user:bob", "msg_002", Some("   "));
-        ch.cache_response_url("user:bob", "msg_003", None);
+        ch.cache_response_url("user--bob", "msg_001", Some(""));
+        ch.cache_response_url("user--bob", "msg_002", Some("   "));
+        ch.cache_response_url("user--bob", "msg_003", None);
 
         // All should be ignored
-        let entry = ch.take_response_url("user:bob");
+        let entry = ch.take_response_url("user--bob");
         assert!(entry.is_none());
     }
 
@@ -788,23 +788,23 @@ mod tests {
 
         for i in 1..=5 {
             ch.cache_response_url(
-                "user:charlie",
+                "user--charlie",
                 &format!("msg_{:03}", i),
                 Some(&format!("https://example.com/url{}", i)),
             );
         }
 
         // Should only have the last 3 (FIFO eviction)
-        let entry1 = ch.take_response_url("user:charlie");
+        let entry1 = ch.take_response_url("user--charlie");
         assert_eq!(entry1.unwrap().url, "https://example.com/url3");
 
-        let entry2 = ch.take_response_url("user:charlie");
+        let entry2 = ch.take_response_url("user--charlie");
         assert_eq!(entry2.unwrap().url, "https://example.com/url4");
 
-        let entry3 = ch.take_response_url("user:charlie");
+        let entry3 = ch.take_response_url("user--charlie");
         assert_eq!(entry3.unwrap().url, "https://example.com/url5");
 
-        let entry4 = ch.take_response_url("user:charlie");
+        let entry4 = ch.take_response_url("user--charlie");
         assert!(entry4.is_none());
     }
 
@@ -812,11 +812,11 @@ mod tests {
     fn wecom_cache_response_url_ttl_expiration() {
         let ch = WeComChannel::new(test_memory(), None, 0, 20); // TTL = 0 seconds (immediate expiration)
 
-        ch.cache_response_url("user:dave", "msg_001", Some("https://example.com/url1"));
+        ch.cache_response_url("user--dave", "msg_001", Some("https://example.com/url1"));
 
         // Should be expired immediately
         std::thread::sleep(std::time::Duration::from_millis(10));
-        let entry = ch.take_response_url("user:dave");
+        let entry = ch.take_response_url("user--dave");
         assert!(entry.is_none());
     }
 
@@ -824,14 +824,14 @@ mod tests {
     fn wecom_prune_response_urls_removes_expired() {
         let ch = WeComChannel::new(test_memory(), None, 0, 20); // TTL = 0 seconds
 
-        ch.cache_response_url("user:eve", "msg_001", Some("https://example.com/url1"));
-        ch.cache_response_url("user:frank", "msg_002", Some("https://example.com/url2"));
+        ch.cache_response_url("user--eve", "msg_001", Some("https://example.com/url1"));
+        ch.cache_response_url("user--frank", "msg_002", Some("https://example.com/url2"));
 
         std::thread::sleep(std::time::Duration::from_millis(10));
         ch.prune_response_urls();
 
         // Both should be pruned
-        assert!(ch.take_response_url("user:eve").is_none());
-        assert!(ch.take_response_url("user:frank").is_none());
+        assert!(ch.take_response_url("user--eve").is_none());
+        assert!(ch.take_response_url("user--frank").is_none());
     }
 }

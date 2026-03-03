@@ -180,7 +180,7 @@ impl Default for ConversationState {
 fn normalize_scope_component(raw: &str) -> String {
     raw.chars()
         .map(|ch| {
-            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' || ch == ':' {
+            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
                 ch
             } else {
                 '_'
@@ -1028,7 +1028,7 @@ fn compute_scopes(cfg: &WeComRuntimeConfig, inbound: &ParsedInbound) -> ScopeDec
                 .any(|value| value == &chat_id);
 
         if is_shared {
-            let scope = format!("group:{chat_id}");
+            let scope = format!("group--{chat_id}");
             return ScopeDecision {
                 conversation_scope: scope.clone(),
                 execution_scope: scope,
@@ -1036,7 +1036,7 @@ fn compute_scopes(cfg: &WeComRuntimeConfig, inbound: &ParsedInbound) -> ScopeDec
             };
         }
 
-        let scope = format!("group:{chat_id}:user:{}", inbound.sender_userid);
+        let scope = format!("group--{chat_id}--user--{}", inbound.sender_userid);
         return ScopeDecision {
             conversation_scope: scope.clone(),
             execution_scope: scope,
@@ -1044,7 +1044,7 @@ fn compute_scopes(cfg: &WeComRuntimeConfig, inbound: &ParsedInbound) -> ScopeDec
         };
     }
 
-    let scope = format!("user:{}", inbound.sender_userid);
+    let scope = format!("user--{}", inbound.sender_userid);
     ScopeDecision {
         conversation_scope: scope.clone(),
         execution_scope: scope,
@@ -2395,8 +2395,8 @@ mod tests {
         };
 
         let scopes = compute_scopes(&cfg, &inbound);
-        assert_eq!(scopes.conversation_scope, "group:g1");
-        assert_eq!(scopes.execution_scope, "group:g1");
+        assert_eq!(scopes.conversation_scope, "group--g1");
+        assert_eq!(scopes.execution_scope, "group--g1");
         assert!(scopes.shared_group_history);
     }
 
