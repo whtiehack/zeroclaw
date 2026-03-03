@@ -75,6 +75,12 @@ impl WeComChannel {
             return;
         };
 
+        tracing::debug!(
+            "WeCom: caching response_url for scope={} msg_id={}",
+            scope,
+            msg_id
+        );
+
         let now = Instant::now();
         let expires_at = now + Duration::from_secs(self.cache_config.ttl_secs);
 
@@ -176,6 +182,17 @@ impl WeComChannel {
             format!("user:{sender_userid}")
         };
 
+        let content_preview: String = content.chars().take(80).collect();
+        tracing::info!(
+            "WeCom: received {} message from {} in {}, msg_id={}, len={}",
+            msg_type,
+            sender_userid,
+            conversation_scope,
+            msg_id,
+            content.len()
+        );
+        tracing::debug!("WeCom: content preview: {content_preview}");
+
         vec![ChannelMessage {
             id: msg_id,
             sender: sender_userid,
@@ -245,6 +262,13 @@ impl Channel for WeComChannel {
         let scope = &message.recipient;
         let chunks = split_markdown_chunks(&message.content);
 
+        tracing::info!(
+            "WeCom: sending message to scope={}, len={}, chunks={}",
+            scope,
+            message.content.len(),
+            chunks.len()
+        );
+
         // Prune expired entries before sending
         self.prune_response_urls();
 
@@ -255,8 +279,8 @@ impl Channel for WeComChannel {
             while let Some(entry) = self.take_response_url(scope) {
                 match self.send_to_url(&entry.url, &chunk).await {
                     Ok(()) => {
-                        tracing::debug!(
-                            "WeCom sent via response_url: scope={} msg_id={} age_ms={}",
+                        tracing::info!(
+                            "WeCom: sent via response_url to scope={} msg_id={} age_ms={}",
                             scope,
                             entry.msg_id,
                             entry.received_at.elapsed().as_millis()
@@ -284,7 +308,7 @@ impl Channel for WeComChannel {
             if let Some(url) = self.lookup_scope_webhook(scope).await {
                 match self.send_to_url(&url, &chunk).await {
                     Ok(()) => {
-                        tracing::debug!("WeCom sent via scope webhook: scope={}", scope);
+                        tracing::info!("WeCom: sent via scope webhook to scope={}", scope);
                         sent = true;
                     }
                     Err(err) => {
@@ -307,7 +331,7 @@ impl Channel for WeComChannel {
                     let tagged = format!("[FallbackPush] {chunk}");
                     match self.send_to_url(url, &tagged).await {
                         Ok(()) => {
-                            tracing::debug!("WeCom sent via fallback webhook: scope={}", scope);
+                            tracing::info!("WeCom: sent via fallback webhook to scope={}", scope);
                             sent = true;
                         }
                         Err(err) => {
@@ -349,7 +373,13 @@ impl Channel for WeComChannel {
     async fn health_check(&self) -> bool {
         // Healthy if fallback webhook is valid (or not configured at all)
         match &self.fallback_webhook_url {
-            Some(url) => is_valid_robot_webhook_url(url),
+            Some(url) => {
+                let valid = is_valid_robot_webhook_url(url);
+                if !valid {
+                    tracing::debug!("WeCom: health check failed — invalid fallback webhook URL");
+                }
+                valid
+            }
             None => true,
         }
     }
