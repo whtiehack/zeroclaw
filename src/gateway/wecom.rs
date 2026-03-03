@@ -266,6 +266,26 @@ fn extract_stop_signal_text(inbound: &ParsedInbound) -> Option<String> {
     }
 }
 
+fn inbound_content_preview(inbound: &ParsedInbound) -> String {
+    if let Some(text) = extract_stop_signal_text(inbound) {
+        return text;
+    }
+
+    match inbound.msg_type.as_str() {
+        "image" => "[Image message]".to_string(),
+        "file" => inbound
+            .raw_payload
+            .get("file")
+            .and_then(|v| v.get("filename"))
+            .and_then(Value::as_str)
+            .map(|name| format!("[File message: {name}]"))
+            .unwrap_or_else(|| "[File message]".to_string()),
+        "stream" => "[Stream refresh callback]".to_string(),
+        "event" => "[Event callback]".to_string(),
+        other => format!("[{other} message]"),
+    }
+}
+
 fn trim_utf8_to_max_bytes(input: &str, max_bytes: usize) -> String {
     if input.as_bytes().len() <= max_bytes {
         return input.to_string();
@@ -1911,6 +1931,23 @@ pub(super) async fn handle_wecom_callback(
     }
 
     let scopes = compute_scopes(&runtime.cfg, &parsed);
+
+    if parsed.msg_type != "stream" && parsed.msg_type != "event" {
+        let preview = crate::util::truncate_with_ellipsis(&inbound_content_preview(&parsed), 80);
+        let msg_id = if parsed.msg_id.trim().is_empty() {
+            "-"
+        } else {
+            parsed.msg_id.as_str()
+        };
+        tracing::info!(
+            "💬 [wecom] from {} in {}: {} (msg_type={}, msg_id={})",
+            parsed.sender_userid,
+            scopes.conversation_scope,
+            preview,
+            parsed.msg_type,
+            msg_id
+        );
+    }
 
     // Cache response_url in WeComChannel (not WeComRuntime)
     if let Some(wecom_channel) = &state.wecom_channel {
