@@ -386,7 +386,7 @@ fn maybe_inject_cron_add_delivery(
     let needs_target = delivery_obj
         .get("to")
         .and_then(serde_json::Value::as_str)
-        .is_none_or(|value| value.trim().is_empty());
+        .is_none_or(|value| value.trim().is_empty() || value.trim() == "current");
     if needs_target {
         delivery_obj.insert(
             "to".to_string(),
@@ -2778,6 +2778,29 @@ mod tests {
         maybe_inject_cron_add_delivery("cron_add", &mut args, "telegram", Some("-10012345"));
 
         assert!(args.get("delivery").is_none());
+    }
+
+    #[test]
+    fn maybe_inject_cron_add_delivery_overrides_current_placeholder() {
+        let mut args = serde_json::json!({
+            "job_type": "agent",
+            "prompt": "remind me later",
+            "delivery": {
+                "mode": "announce",
+                "channel": "wecom",
+                "to": "current"
+            }
+        });
+
+        maybe_inject_cron_add_delivery(
+            "cron_add",
+            &mut args,
+            "wecom",
+            Some("user--hanxiao"),
+        );
+
+        assert_eq!(args["delivery"]["channel"], "wecom");
+        assert_eq!(args["delivery"]["to"], "user--hanxiao");
     }
 
     #[test]
