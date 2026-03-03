@@ -1,7 +1,10 @@
 use super::traits::{Channel, ChannelMessage, SendMessage};
 use crate::memory::Memory;
 use async_trait::async_trait;
+use parking_lot::Mutex;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use uuid::Uuid;
 
 /// WeCom (企业微信) channel — webhook-based, push via group-bot webhook.
@@ -12,25 +15,108 @@ use uuid::Uuid;
 /// The `listen` method here is a keepalive placeholder.
 ///
 /// Outbound messages use a 3-layer fallback:
-/// 1. response_url (managed by gateway's WeComRuntime, not available here)
+/// 1. response_url (cached from incoming messages, TTL 1 hour)
 /// 2. scope-specific push webhook (looked up from memory)
 /// 3. fallback push webhook (from config)
 pub struct WeComChannel {
     memory: Arc<dyn Memory>,
     fallback_webhook_url: Option<String>,
     client: reqwest::Client,
+    /// response_url cache: scope -> FIFO queue of response URLs
+    response_urls: Arc<Mutex<HashMap<String, VecDeque<ResponseUrlEntry>>>>,
+    cache_config: ResponseUrlCacheConfig,
+}
+
+/// Cached response_url entry with expiration tracking
+#[derive(Debug, Clone)]
+struct ResponseUrlEntry {
+    url: String,
+    expires_at: Instant,
+    received_at: Instant,
+    msg_id: String,
+}
+
+/// Configuration for response_url caching
+#[derive(Debug, Clone)]
+struct ResponseUrlCacheConfig {
+    /// TTL for cached response_urls (default: 3600 seconds)
+    ttl_secs: u64,
+    /// Maximum entries per scope (default: 20)
+    max_per_scope: usize,
 }
 
 const WECOM_MARKDOWN_MAX_BYTES: usize = 20_480;
 const WECOM_MARKDOWN_CHUNK_BYTES: usize = 8_000;
 
 impl WeComChannel {
-    pub fn new(memory: Arc<dyn Memory>, fallback_webhook_url: Option<String>) -> Self {
+    pub fn new(
+        memory: Arc<dyn Memory>,
+        fallback_webhook_url: Option<String>,
+        cache_ttl_secs: u64,
+        cache_max_per_scope: usize,
+    ) -> Self {
         Self {
             memory,
             fallback_webhook_url,
             client: crate::config::build_runtime_proxy_client("channel.wecom"),
+            response_urls: Arc::new(Mutex::new(HashMap::new())),
+            cache_config: ResponseUrlCacheConfig {
+                ttl_secs: cache_ttl_secs,
+                max_per_scope: cache_max_per_scope,
+            },
         }
+    }
+
+    /// Cache a response_url for later use (called by gateway on message receipt).
+    ///
+    /// The response_url is stored in a FIFO queue per scope with TTL and size limits.
+    pub fn cache_response_url(&self, scope: &str, msg_id: &str, url: Option<&str>) {
+        let Some(url) = url.map(str::trim).filter(|v| !v.is_empty()) else {
+            return;
+        };
+
+        let now = Instant::now();
+        let expires_at = now + Duration::from_secs(self.cache_config.ttl_secs);
+
+        let mut cache = self.response_urls.lock();
+        let queue = cache.entry(scope.to_string()).or_default();
+        queue.push_back(ResponseUrlEntry {
+            url: url.to_string(),
+            expires_at,
+            received_at: now,
+            msg_id: msg_id.to_string(),
+        });
+
+        // Enforce size limit (FIFO eviction)
+        while queue.len() > self.cache_config.max_per_scope {
+            queue.pop_front();
+        }
+    }
+
+    /// Take the next available response_url for a scope (FIFO, with expiration check).
+    fn take_response_url(&self, scope: &str) -> Option<ResponseUrlEntry> {
+        let now = Instant::now();
+        let mut cache = self.response_urls.lock();
+        let queue = cache.get_mut(scope)?;
+
+        // Remove expired entries
+        queue.retain(|entry| entry.expires_at > now);
+        if queue.is_empty() {
+            return None;
+        }
+
+        // Take the oldest entry (FIFO)
+        queue.pop_front()
+    }
+
+    /// Prune expired response_urls across all scopes (called periodically).
+    fn prune_response_urls(&self) {
+        let now = Instant::now();
+        let mut cache = self.response_urls.lock();
+        cache.retain(|_, queue| {
+            queue.retain(|entry| entry.expires_at > now);
+            !queue.is_empty()
+        });
     }
 
     /// Parse a decrypted WeCom AI Bot callback payload into channel messages.
@@ -159,13 +245,55 @@ impl Channel for WeComChannel {
         let scope = &message.recipient;
         let chunks = split_markdown_chunks(&message.content);
 
+        // Prune expired entries before sending
+        self.prune_response_urls();
+
         for chunk in chunks {
             let mut sent = false;
 
+            // Level 1: response_url (from cache, FIFO with TTL)
+            while let Some(entry) = self.take_response_url(scope) {
+                match self.send_to_url(&entry.url, &chunk).await {
+                    Ok(()) => {
+                        tracing::debug!(
+                            "WeCom sent via response_url: scope={} msg_id={} age_ms={}",
+                            scope,
+                            entry.msg_id,
+                            entry.received_at.elapsed().as_millis()
+                        );
+                        sent = true;
+                        break;
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            "WeCom response_url send failed: scope={} msg_id={} age_ms={} error={}",
+                            scope,
+                            entry.msg_id,
+                            entry.received_at.elapsed().as_millis(),
+                            err
+                        );
+                    }
+                }
+            }
+
+            if sent {
+                continue;
+            }
+
             // Level 2: scope-specific push webhook (from memory)
             if let Some(url) = self.lookup_scope_webhook(scope).await {
-                if self.send_to_url(&url, &chunk).await.is_ok() {
-                    sent = true;
+                match self.send_to_url(&url, &chunk).await {
+                    Ok(()) => {
+                        tracing::debug!("WeCom sent via scope webhook: scope={}", scope);
+                        sent = true;
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            "WeCom scope webhook send failed: scope={} error={}",
+                            scope,
+                            err
+                        );
+                    }
                 }
             }
 
@@ -177,14 +305,27 @@ impl Channel for WeComChannel {
             if let Some(url) = &self.fallback_webhook_url {
                 if is_valid_robot_webhook_url(url) {
                     let tagged = format!("[FallbackPush] {chunk}");
-                    if self.send_to_url(url, &tagged).await.is_ok() {
-                        sent = true;
+                    match self.send_to_url(url, &tagged).await {
+                        Ok(()) => {
+                            tracing::debug!("WeCom sent via fallback webhook: scope={}", scope);
+                            sent = true;
+                        }
+                        Err(err) => {
+                            tracing::warn!(
+                                "WeCom fallback webhook send failed: scope={} error={}",
+                                scope,
+                                err
+                            );
+                        }
                     }
                 }
             }
 
             if !sent {
-                tracing::warn!("WeCom outbound dropped: no usable push webhook for scope={scope}");
+                tracing::warn!(
+                    "WeCom outbound dropped: no usable URL for scope={} (all 3 layers failed)",
+                    scope
+                );
             }
         }
 
@@ -353,7 +494,7 @@ mod tests {
     }
 
     fn make_channel() -> WeComChannel {
-        WeComChannel::new(test_memory(), None)
+        WeComChannel::new(test_memory(), None, 3600, 20)
     }
 
     #[test]
@@ -543,13 +684,20 @@ mod tests {
         let ch = WeComChannel::new(
             test_memory(),
             Some("https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=test".to_string()),
+            3600,
+            20,
         );
         assert!(ch.health_check().await);
     }
 
     #[tokio::test]
     async fn wecom_health_check_invalid_fallback() {
-        let ch = WeComChannel::new(test_memory(), Some("http://bad-url.com".to_string()));
+        let ch = WeComChannel::new(
+            test_memory(),
+            Some("http://bad-url.com".to_string()),
+            3600,
+            20,
+        );
         assert!(!ch.health_check().await);
     }
 
@@ -570,5 +718,90 @@ mod tests {
         let s = "Hello";
         let boundary = floor_char_boundary(s, 100);
         assert_eq!(boundary, s.len());
+    }
+
+    #[test]
+    fn wecom_cache_response_url_basic() {
+        let ch = make_channel();
+        ch.cache_response_url("user:alice", "msg_001", Some("https://example.com/url1"));
+        ch.cache_response_url("user:alice", "msg_002", Some("https://example.com/url2"));
+
+        // Should retrieve in FIFO order
+        let entry1 = ch.take_response_url("user:alice");
+        assert!(entry1.is_some());
+        assert_eq!(entry1.unwrap().url, "https://example.com/url1");
+
+        let entry2 = ch.take_response_url("user:alice");
+        assert!(entry2.is_some());
+        assert_eq!(entry2.unwrap().url, "https://example.com/url2");
+
+        // Queue should be empty now
+        let entry3 = ch.take_response_url("user:alice");
+        assert!(entry3.is_none());
+    }
+
+    #[test]
+    fn wecom_cache_response_url_ignores_empty() {
+        let ch = make_channel();
+        ch.cache_response_url("user:bob", "msg_001", Some(""));
+        ch.cache_response_url("user:bob", "msg_002", Some("   "));
+        ch.cache_response_url("user:bob", "msg_003", None);
+
+        // All should be ignored
+        let entry = ch.take_response_url("user:bob");
+        assert!(entry.is_none());
+    }
+
+    #[test]
+    fn wecom_cache_response_url_size_limit() {
+        let ch = WeComChannel::new(test_memory(), None, 3600, 3); // max 3 entries
+
+        for i in 1..=5 {
+            ch.cache_response_url(
+                "user:charlie",
+                &format!("msg_{:03}", i),
+                Some(&format!("https://example.com/url{}", i)),
+            );
+        }
+
+        // Should only have the last 3 (FIFO eviction)
+        let entry1 = ch.take_response_url("user:charlie");
+        assert_eq!(entry1.unwrap().url, "https://example.com/url3");
+
+        let entry2 = ch.take_response_url("user:charlie");
+        assert_eq!(entry2.unwrap().url, "https://example.com/url4");
+
+        let entry3 = ch.take_response_url("user:charlie");
+        assert_eq!(entry3.unwrap().url, "https://example.com/url5");
+
+        let entry4 = ch.take_response_url("user:charlie");
+        assert!(entry4.is_none());
+    }
+
+    #[test]
+    fn wecom_cache_response_url_ttl_expiration() {
+        let ch = WeComChannel::new(test_memory(), None, 0, 20); // TTL = 0 seconds (immediate expiration)
+
+        ch.cache_response_url("user:dave", "msg_001", Some("https://example.com/url1"));
+
+        // Should be expired immediately
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        let entry = ch.take_response_url("user:dave");
+        assert!(entry.is_none());
+    }
+
+    #[test]
+    fn wecom_prune_response_urls_removes_expired() {
+        let ch = WeComChannel::new(test_memory(), None, 0, 20); // TTL = 0 seconds
+
+        ch.cache_response_url("user:eve", "msg_001", Some("https://example.com/url1"));
+        ch.cache_response_url("user:frank", "msg_002", Some("https://example.com/url2"));
+
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        ch.prune_response_urls();
+
+        // Both should be pruned
+        assert!(ch.take_response_url("user:eve").is_none());
+        assert!(ch.take_response_url("user:frank").is_none());
     }
 }

@@ -5028,6 +5028,10 @@ fn default_wecom_response_url_cache_per_scope() -> usize {
     50
 }
 
+fn default_wecom_response_url_ttl_secs() -> u64 {
+    3600
+}
+
 fn default_wecom_lock_timeout_secs() -> u64 {
     900
 }
@@ -5058,6 +5062,9 @@ pub struct WeComConfig {
     /// Max retained response_url entries per conversation scope.
     #[serde(default = "default_wecom_response_url_cache_per_scope")]
     pub response_url_cache_per_scope: usize,
+    /// TTL in seconds for cached response_url entries.
+    #[serde(default = "default_wecom_response_url_ttl_secs")]
+    pub response_url_ttl_secs: u64,
     /// Lock TTL in seconds for in-flight execution scopes.
     #[serde(default = "default_wecom_lock_timeout_secs")]
     pub lock_timeout_secs: u64,
@@ -10841,6 +10848,7 @@ default_model = "legacy-model"
             file_retention_days: 5,
             max_file_size_mb: 30,
             response_url_cache_per_scope: 80,
+            response_url_ttl_secs: 3600,
             lock_timeout_secs: 1200,
             history_max_turns: 40,
             fallback_robot_webhook_url: Some(

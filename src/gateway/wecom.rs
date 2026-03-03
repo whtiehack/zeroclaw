@@ -1,4 +1,5 @@
 use super::{run_gateway_chat_with_tools, AppState};
+use crate::channels::traits::Channel;
 use aes::Aes256;
 use anyhow::{Context, Result};
 use axum::{
@@ -53,7 +54,6 @@ pub(super) struct WeComRuntime {
     cfg: WeComRuntimeConfig,
     crypto: WeComCrypto,
     client: reqwest::Client,
-    response_urls: Arc<Mutex<HashMap<String, VecDeque<ResponseUrlEntry>>>>,
     execution_locks: Arc<Mutex<HashMap<String, ExecutionLockEntry>>>,
     inflight_tasks: Arc<Mutex<HashMap<String, InflightTaskEntry>>>,
     stream_states: Arc<Mutex<HashMap<String, StreamState>>>,
@@ -69,10 +69,8 @@ struct WeComRuntimeConfig {
     group_shared_history_chat_ids: Vec<String>,
     file_retention_days: u32,
     max_file_size_bytes: u64,
-    response_url_cache_per_scope: usize,
     lock_timeout_secs: u64,
     history_max_turns: usize,
-    fallback_robot_webhook_url: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -98,14 +96,6 @@ struct ScopeDecision {
     conversation_scope: String,
     execution_scope: String,
     shared_group_history: bool,
-}
-
-#[derive(Debug, Clone)]
-struct ResponseUrlEntry {
-    url: String,
-    expires_at: Instant,
-    received_at: Instant,
-    msg_id: String,
 }
 
 #[derive(Debug, Clone)]
@@ -1026,19 +1016,9 @@ impl WeComRuntime {
             .build()
             .context("failed to initialize WeCom HTTP client")?;
 
-        let normalized_fallback = cfg
-            .fallback_robot_webhook_url
-            .as_deref()
-            .map(str::trim)
-            .filter(|url| !url.is_empty())
-            .map(ToOwned::to_owned);
-
         let fingerprint = format!(
-            "{}|{}|{}|{}",
-            cfg.token,
-            cfg.encoding_aes_key,
-            cfg.group_shared_history_enabled,
-            normalized_fallback.as_deref().unwrap_or("")
+            "{}|{}|{}",
+            cfg.token, cfg.encoding_aes_key, cfg.group_shared_history_enabled
         );
 
         Ok(Self {
@@ -1048,14 +1028,11 @@ impl WeComRuntime {
                 group_shared_history_chat_ids: cfg.group_shared_history_chat_ids.clone(),
                 file_retention_days: cfg.file_retention_days,
                 max_file_size_bytes: cfg.max_file_size_mb.saturating_mul(1024 * 1024),
-                response_url_cache_per_scope: cfg.response_url_cache_per_scope.max(1),
                 lock_timeout_secs: cfg.lock_timeout_secs.max(30),
                 history_max_turns: cfg.history_max_turns.max(2),
-                fallback_robot_webhook_url: normalized_fallback,
             },
             crypto,
             client,
-            response_urls: Arc::new(Mutex::new(HashMap::new())),
             execution_locks: Arc::new(Mutex::new(HashMap::new())),
             inflight_tasks: Arc::new(Mutex::new(HashMap::new())),
             stream_states: Arc::new(Mutex::new(HashMap::new())),
@@ -1063,57 +1040,6 @@ impl WeComRuntime {
             last_cleanup: Arc::new(Mutex::new(Instant::now())),
             fingerprint,
         })
-    }
-
-    fn cache_response_url(&self, scope: &str, msg_id: &str, url: Option<&str>) {
-        let Some(url) = url.map(str::trim).filter(|value| !value.is_empty()) else {
-            return;
-        };
-
-        let now = Instant::now();
-        let expires_at = now + Duration::from_secs(WECOM_RESPONSE_URL_TTL_SECS);
-
-        let mut cache = self.response_urls.lock();
-        let queue = cache.entry(scope.to_string()).or_default();
-        queue.push_back(ResponseUrlEntry {
-            url: url.to_string(),
-            expires_at,
-            received_at: now,
-            msg_id: msg_id.to_string(),
-        });
-
-        while queue.len() > self.cfg.response_url_cache_per_scope {
-            queue.pop_front();
-        }
-    }
-
-    fn take_next_response_url(&self, scope: &str) -> Option<ResponseUrlEntry> {
-        let now = Instant::now();
-        let mut cache = self.response_urls.lock();
-        let queue = cache.get_mut(scope)?;
-
-        queue.retain(|entry| entry.expires_at > now);
-        if queue.is_empty() {
-            return None;
-        }
-
-        let mut idx = 0usize;
-        for i in 1..queue.len() {
-            if queue[i].expires_at < queue[idx].expires_at {
-                idx = i;
-            }
-        }
-
-        queue.remove(idx)
-    }
-
-    fn prune_response_urls(&self) {
-        let now = Instant::now();
-        let mut cache = self.response_urls.lock();
-        cache.retain(|_, queue| {
-            queue.retain(|entry| entry.expires_at > now);
-            !queue.is_empty()
-        });
     }
 
     fn prune_execution_locks(&self) {
@@ -1336,7 +1262,6 @@ impl WeComRuntime {
     }
 
     async fn maybe_cleanup_files(&self) {
-        self.prune_response_urls();
         self.prune_execution_locks();
         self.prune_inflight_tasks();
         self.prune_stream_states();
@@ -1812,75 +1737,6 @@ impl WeComRuntime {
 
         Ok(())
     }
-
-    async fn lookup_scope_push_url(&self, state: &AppState, scope: &str) -> Option<String> {
-        let key = format!("wecom_push_url::{scope}");
-        let entry = state.mem.get(&key).await.ok().flatten()?;
-        let candidate = entry.content.trim();
-        if is_valid_robot_webhook_url(candidate) {
-            Some(candidate.to_string())
-        } else {
-            None
-        }
-    }
-
-    async fn send_text_with_fallbacks(&self, state: &AppState, scope: &str, text: &str) {
-        let chunks = split_markdown_chunks(text);
-
-        for chunk in chunks {
-            let mut sent = false;
-
-            while let Some(entry) = self.take_next_response_url(scope) {
-                match self.send_markdown_to_url(&entry.url, &chunk).await {
-                    Ok(()) => {
-                        sent = true;
-                        break;
-                    }
-                    Err(err) => {
-                        tracing::warn!(
-                            "WeCom response_url send failed for msg_id={} age_ms={}: {}",
-                            entry.msg_id,
-                            entry.received_at.elapsed().as_millis(),
-                            err
-                        );
-                    }
-                }
-            }
-
-            if sent {
-                continue;
-            }
-
-            if let Some(scope_push_url) = self.lookup_scope_push_url(state, scope).await {
-                if let Err(err) = self.send_markdown_to_url(&scope_push_url, &chunk).await {
-                    tracing::warn!("WeCom scope push webhook send failed: {err}");
-                } else {
-                    sent = true;
-                }
-            }
-
-            if sent {
-                continue;
-            }
-
-            if let Some(fallback) = self.cfg.fallback_robot_webhook_url.as_deref() {
-                if is_valid_robot_webhook_url(fallback) {
-                    let tagged = format!("[FallbackPush] {chunk}");
-                    if let Err(err) = self.send_markdown_to_url(fallback, &tagged).await {
-                        tracing::warn!("WeCom fallback push webhook send failed: {err}");
-                    } else {
-                        sent = true;
-                    }
-                }
-            }
-
-            if !sent {
-                tracing::warn!(
-                    "WeCom outbound dropped: no usable response_url or push webhook for scope={scope}"
-                );
-            }
-        }
-    }
 }
 
 fn resolve_runtime(state: &AppState) -> Result<Option<Arc<WeComRuntime>>> {
@@ -2034,11 +1890,16 @@ pub(super) async fn handle_wecom_callback(
     }
 
     let scopes = compute_scopes(&runtime.cfg, &parsed);
-    runtime.cache_response_url(
-        &scopes.conversation_scope,
-        parsed.msg_id.as_str(),
-        parsed.response_url.as_deref(),
-    );
+
+    // Cache response_url in WeComChannel (not WeComRuntime)
+    if let Some(wecom_channel) = &state.wecom_channel {
+        wecom_channel.cache_response_url(
+            &scopes.conversation_scope,
+            &parsed.msg_id,
+            parsed.response_url.as_deref(),
+        );
+    }
+
     runtime.maybe_cleanup_files().await;
 
     if parsed.msg_type == "stream" {
@@ -2320,9 +2181,18 @@ async fn process_inbound_message(
 
             if let Some(extra) = overflow {
                 let extra_msg = format!("[补充消息]\n{extra}");
-                runtime
-                    .send_text_with_fallbacks(&state, &scopes.conversation_scope, &extra_msg)
-                    .await;
+                // Use WeComChannel::send instead of WeComRuntime::send_text_with_fallbacks
+                if let Some(wecom_channel) = &state.wecom_channel {
+                    let send_msg = crate::channels::SendMessage {
+                        content: extra_msg,
+                        recipient: scopes.conversation_scope.clone(),
+                        subject: None,
+                        thread_ts: None,
+                    };
+                    if let Err(err) = wecom_channel.send(&send_msg).await {
+                        tracing::error!("WeCom overflow message send failed: {err}");
+                    }
+                }
             }
 
             runtime.maybe_cleanup_files().await;
@@ -2408,10 +2278,8 @@ mod tests {
             group_shared_history_chat_ids: vec!["g1".to_string()],
             file_retention_days: 3,
             max_file_size_bytes: 20 * 1024 * 1024,
-            response_url_cache_per_scope: 20,
             lock_timeout_secs: 900,
             history_max_turns: 30,
-            fallback_robot_webhook_url: None,
         };
 
         let inbound = ParsedInbound {
@@ -2462,7 +2330,7 @@ mod tests {
     #[test]
     fn crypto_encrypt_and_decrypt_roundtrip() {
         let crypto =
-            WeComCrypto::new("token123", "abcdefghijklmnopqrstuvwxyz0123456789ABCDEFG").unwrap();
+            WeComCrypto::new("token123", "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY").unwrap();
         let nonce = "nonce123";
         let timestamp = "1700000000";
         let plain = r#"{"msgtype":"stream","stream":{"id":"sid","finish":false,"content":"hi"}}"#;
@@ -2490,7 +2358,7 @@ mod tests {
     #[test]
     fn crypto_signature_verification_matches_sorted_sha1() {
         let crypto =
-            WeComCrypto::new("token123", "abcdefghijklmnopqrstuvwxyz0123456789ABCDEFG").unwrap();
+            WeComCrypto::new("token123", "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY").unwrap();
         let encrypt = "enc_payload";
         let timestamp = "1700000000";
         let nonce = "nonce123";

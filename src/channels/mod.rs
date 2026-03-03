@@ -4719,20 +4719,20 @@ fn collect_configured_channels(
     // WeCom: requires memory instance for scope webhook lookup.
     // Instantiated here with a lightweight markdown memory for health-check registration;
     // the full memory-backed instance is wired in the gateway (run_gateway).
-    if config.channels_config.wecom.is_some() {
+    if let Some(ref wecom_cfg) = config.channels_config.wecom {
         let mem_cfg = crate::config::MemoryConfig {
             backend: "markdown".into(),
             ..Default::default()
         };
         if let Ok(mem) = crate::memory::create_memory(&mem_cfg, &config.workspace_dir, None) {
-            let fallback = config
-                .channels_config
-                .wecom
-                .as_ref()
-                .and_then(|w| w.fallback_robot_webhook_url.clone());
             channels.push(ConfiguredChannel {
                 display_name: "WeCom",
-                channel: Arc::new(WeComChannel::new(Arc::from(mem), fallback)),
+                channel: Arc::new(WeComChannel::new(
+                    Arc::from(mem),
+                    wecom_cfg.fallback_robot_webhook_url.clone(),
+                    wecom_cfg.response_url_ttl_secs,
+                    wecom_cfg.response_url_cache_per_scope,
+                )),
             });
         }
     }

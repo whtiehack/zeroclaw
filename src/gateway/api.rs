@@ -1031,6 +1031,7 @@ mod tests {
             file_retention_days: 3,
             max_file_size_mb: 20,
             response_url_cache_per_scope: 50,
+            response_url_ttl_secs: 3600,
             lock_timeout_secs: 900,
             history_max_turns: 30,
             fallback_robot_webhook_url: Some(
@@ -1142,6 +1143,7 @@ mod tests {
             file_retention_days: 3,
             max_file_size_mb: 20,
             response_url_cache_per_scope: 50,
+            response_url_ttl_secs: 3600,
             lock_timeout_secs: 900,
             history_max_turns: 30,
             fallback_robot_webhook_url: Some(

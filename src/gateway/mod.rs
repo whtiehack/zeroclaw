@@ -591,6 +591,8 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
             Arc::new(WeComChannel::new(
                 mem.clone(),
                 wecom_cfg.fallback_robot_webhook_url.clone(),
+                wecom_cfg.response_url_ttl_secs,
+                wecom_cfg.response_url_cache_per_scope,
             ))
         });
 
