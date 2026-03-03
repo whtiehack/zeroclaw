@@ -1053,6 +1053,7 @@ pub(super) async fn run_gateway_chat_with_history(
     channel_name: Option<&str>,
     reply_target: Option<&str>,
     prior_history: Vec<ChatMessage>,
+    on_delta: Option<tokio::sync::mpsc::Sender<String>>,
 ) -> anyhow::Result<String> {
     let config = state.config.lock().clone();
     crate::agent::process_message_for_channel_with_history(
@@ -1061,6 +1062,7 @@ pub(super) async fn run_gateway_chat_with_history(
         channel_name,
         reply_target,
         prior_history,
+        on_delta,
     )
     .await
 }

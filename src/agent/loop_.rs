@@ -1442,9 +1442,15 @@ pub(crate) async fn run_tool_call_loop(
                     "\u{274c}"
                 };
                 tracing::debug!(tool = %call.name, secs, "Sending progress complete to draft");
+                let error_line = if !outcome.success && !outcome.output.trim().is_empty() {
+                    let snippet = truncate_with_ellipsis(outcome.output.trim(), 100);
+                    format!("\n  \u{2514} {snippet}")
+                } else {
+                    String::new()
+                };
                 let _ = tx
                     .send(format!(
-                        "{DRAFT_PROGRESS_SENTINEL}{icon} {} ({secs}s)\n",
+                        "{DRAFT_PROGRESS_SENTINEL}{icon} {} ({secs}s){error_line}\n",
                         call.name
                     ))
                     .await;
@@ -2440,6 +2446,7 @@ pub async fn process_message_for_channel_with_history(
     channel_name: Option<&str>,
     reply_target: Option<&str>,
     prior_history: Vec<ChatMessage>,
+    on_delta: Option<tokio::sync::mpsc::Sender<String>>,
 ) -> Result<String> {
     let observer: Arc<dyn Observer> =
         Arc::from(observability::create_observer(&config.observability));
@@ -2648,7 +2655,7 @@ pub async fn process_message_for_channel_with_history(
         &config.multimodal,
         config.agent.max_tool_iterations,
         None,
-        None,
+        on_delta,
         None,
         &[],
     )
@@ -2792,12 +2799,7 @@ mod tests {
             }
         });
 
-        maybe_inject_cron_add_delivery(
-            "cron_add",
-            &mut args,
-            "wecom",
-            Some("user--hanxiao"),
-        );
+        maybe_inject_cron_add_delivery("cron_add", &mut args, "wecom", Some("user--hanxiao"));
 
         assert_eq!(args["delivery"]["channel"], "wecom");
         assert_eq!(args["delivery"]["to"], "user--hanxiao");

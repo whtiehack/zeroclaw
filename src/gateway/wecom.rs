@@ -2249,12 +2249,36 @@ async fn process_inbound_message(
                 prior_history.remove(0);
             }
 
+            // Create progress channel for streaming delta updates during tool calls
+            let (delta_tx, mut delta_rx) = tokio::sync::mpsc::channel::<String>(64);
+            let progress_runtime = runtime.clone();
+            let progress_stream_id = stream_id.clone();
+            let progress_consumer = tokio::spawn(async move {
+                use crate::agent::loop_::{DRAFT_CLEAR_SENTINEL, DRAFT_PROGRESS_SENTINEL};
+                let mut accumulated = String::new();
+                while let Some(delta) = delta_rx.recv().await {
+                    if delta == DRAFT_CLEAR_SENTINEL {
+                        break;
+                    }
+                    let visible = delta
+                        .strip_prefix(DRAFT_PROGRESS_SENTINEL)
+                        .unwrap_or(&delta);
+                    accumulated.push_str(visible);
+                    progress_runtime.update_stream_state_content(
+                        &progress_stream_id,
+                        &accumulated,
+                        false,
+                    );
+                }
+            });
+
             let llm_response = match Box::pin(run_gateway_chat_with_history(
                 &state,
                 &composed.user_message_for_model,
                 Some("wecom"),
                 Some(scopes.conversation_scope.as_str()),
                 prior_history,
+                Some(delta_tx),
             ))
             .await
             {
@@ -2264,6 +2288,9 @@ async fn process_inbound_message(
                     "抱歉，我暂时无法处理这条消息。".to_string()
                 }
             };
+
+            // Wait for progress consumer to finish (it exits on CLEAR sentinel or sender drop)
+            let _ = progress_consumer.await;
             tracing::info!(
                 "🤖 [wecom] model reply in {}: {} (len={}, stream_id={}, msg_id={})",
                 scopes.conversation_scope,
