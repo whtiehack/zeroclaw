@@ -2140,9 +2140,39 @@ pub async fn run(
     Ok(final_output)
 }
 
+fn append_channel_delivery_system_instructions(
+    mut system_prompt: String,
+    channel_name: Option<&str>,
+) -> String {
+    let Some(channel_name) = channel_name
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return system_prompt;
+    };
+
+    if let Some(instructions) = crate::channels::get_channel_delivery_instructions(channel_name) {
+        system_prompt.push_str("\n\n## Channel Delivery\n\n");
+        system_prompt.push_str(instructions);
+        system_prompt.push('\n');
+    }
+
+    system_prompt
+}
+
 /// Process a single message through the full agent (with tools, peripherals, memory).
 /// Used by channels (Telegram, Discord, etc.) to enable hardware and tool use.
 pub async fn process_message(config: Config, message: &str) -> Result<String> {
+    process_message_for_channel(config, message, None).await
+}
+
+/// Process a single message with optional channel-scoped delivery instructions
+/// injected into the system prompt.
+pub async fn process_message_for_channel(
+    config: Config,
+    message: &str,
+    channel_name: Option<&str>,
+) -> Result<String> {
     let observer: Arc<dyn Observer> =
         Arc::from(observability::create_observer(&config.observability));
     let runtime: Arc<dyn runtime::RuntimeAdapter> =
@@ -2296,6 +2326,7 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
         system_prompt.push_str(&build_tool_instructions(&tools_registry));
     }
     system_prompt.push_str(&build_shell_policy_instructions(&config.autonomy));
+    system_prompt = append_channel_delivery_system_instructions(system_prompt, channel_name);
 
     let mem_context = build_context(mem.as_ref(), message, config.memory.min_relevance_score).await;
     let rag_limit = if config.agent.compact_context { 2 } else { 5 };
@@ -2340,6 +2371,32 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
+
+    #[test]
+    fn append_channel_delivery_system_instructions_injects_known_channel_guidance() {
+        let prompt = append_channel_delivery_system_instructions(
+            "base system prompt".to_string(),
+            Some("wecom"),
+        );
+
+        assert!(prompt.contains("base system prompt"));
+        assert!(prompt.contains("## Channel Delivery"));
+        assert!(prompt.contains("When responding on WeCom"));
+    }
+
+    #[test]
+    fn append_channel_delivery_system_instructions_skips_unknown_or_empty_channel() {
+        let unchanged =
+            append_channel_delivery_system_instructions("base".to_string(), Some("unknown"));
+        assert_eq!(unchanged, "base");
+
+        let unchanged =
+            append_channel_delivery_system_instructions("base".to_string(), Some("   "));
+        assert_eq!(unchanged, "base");
+
+        let unchanged = append_channel_delivery_system_instructions("base".to_string(), None);
+        assert_eq!(unchanged, "base");
+    }
 
     #[test]
     fn test_scrub_credentials() {

@@ -1026,19 +1026,7 @@ pub(super) async fn run_gateway_chat_with_tools_for_channel(
     channel_name: Option<&str>,
 ) -> anyhow::Result<String> {
     let config = state.config.lock().clone();
-
-    // Prepend channel delivery instructions to the user message if channel is specified
-    let enhanced_message = if let Some(channel) = channel_name {
-        if let Some(instructions) = crate::channels::get_channel_delivery_instructions(channel) {
-            format!("<channel_context>\n{}\n</channel_context>\n\n{}", instructions, message)
-        } else {
-            message.to_string()
-        }
-    } else {
-        message.to_string()
-    };
-
-    crate::agent::process_message(config, &enhanced_message).await
+    crate::agent::process_message_for_channel(config, message, channel_name).await
 }
 
 fn sanitize_gateway_response(response: &str, tools: &[Box<dyn Tool>]) -> String {

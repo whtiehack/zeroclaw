@@ -787,7 +787,10 @@ impl WeComCrypto {
             .context("failed to decode WeCom EncodingAESKey - tried STANDARD, STANDARD_NO_PAD, URL_SAFE variants")?;
 
         if raw.len() != 32 {
-            anyhow::bail!("invalid WeCom EncodingAESKey length: expected 32 bytes, got {}", raw.len());
+            anyhow::bail!(
+                "invalid WeCom EncodingAESKey length: expected 32 bytes, got {}",
+                raw.len()
+            );
         }
         let mut key = [0u8; 32];
         key.copy_from_slice(&raw);
@@ -2174,14 +2177,19 @@ async fn process_inbound_message(
             let prior = runtime.snapshot_conversation(&scopes.conversation_scope);
             let composed = runtime.compose_input(&inbound, &scopes, &content, &prior);
 
-            let llm_response =
-                match run_gateway_chat_with_tools_for_channel(&state, &composed.user_message_for_model, Some("wecom")).await {
-                    Ok(text) => text,
-                    Err(err) => {
-                        tracing::error!("WeCom LLM execution failed: {err:#}");
-                        "抱歉，我暂时无法处理这条消息。".to_string()
-                    }
-                };
+            let llm_response = match run_gateway_chat_with_tools_for_channel(
+                &state,
+                &composed.user_message_for_model,
+                Some("wecom"),
+            )
+            .await
+            {
+                Ok(text) => text,
+                Err(err) => {
+                    tracing::error!("WeCom LLM execution failed: {err:#}");
+                    "抱歉，我暂时无法处理这条消息。".to_string()
+                }
+            };
 
             let (text_without_images, image_paths) = parse_image_markers(&llm_response);
             let images = prepare_stream_images(&image_paths).await;

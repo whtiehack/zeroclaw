@@ -34,9 +34,9 @@ This document records the implementation decisions for the WeCom MVP gateway int
 
 ## Prompt / Delivery Instruction Handling (Current)
 
-- Gateway injects WeCom delivery instructions by prepending:
-  - `<channel_context> ... </channel_context>`
-  - then the composed WeCom message payload.
+- Gateway passes channel identity (`wecom`) into the agent pipeline.
+- Agent injects WeCom delivery instructions into the **system prompt** (same layer as other channel system constraints).
+- User message payload remains pure WeCom-composed content (no channel-delivery preamble prepended into user text).
 - WeCom composed payload includes:
   - static context (`WECOM_STATIC_CONTEXT_V1`, first turn only)
   - recent history block (`WECOM_HISTORY`)
