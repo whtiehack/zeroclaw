@@ -670,14 +670,11 @@ fn wecom_static_context(
         format!("chat_type={}", inbound.chat_type),
         format!("chat_id={chat_id}"),
         format!("conversation_scope={}", scopes.conversation_scope),
-        format!("execution_scope={}", scopes.execution_scope),
         format!("aibot_id={}", inbound.aibot_id),
         format!(
             "push_url_memory_key=wecom_push_url::{}",
             scopes.conversation_scope
         ),
-        "push_url_set_hint=When user asks to configure proactive push, call memory_store with key=push_url_memory_key, content=<raw webhook URL>, category=wecom_push."
-            .to_string(),
     ];
 
     if include_sender {

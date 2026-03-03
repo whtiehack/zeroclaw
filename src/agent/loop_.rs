@@ -2141,6 +2141,37 @@ pub async fn run(
     Ok(final_output)
 }
 
+/// Extract `[WECOM_STATIC_CONTEXT_V1]...[/WECOM_STATIC_CONTEXT_V1]` from a user message,
+/// append it to the system prompt as `## WeCom Context`, and return the cleaned message.
+/// If the block is not found, returns the original message unchanged.
+fn extract_wecom_static_context_to_system(system_prompt: &mut String, message: &str) -> String {
+    const OPEN: &str = "[WECOM_STATIC_CONTEXT_V1]";
+    const CLOSE: &str = "[/WECOM_STATIC_CONTEXT_V1]";
+
+    let Some(start) = message.find(OPEN) else {
+        return message.to_string();
+    };
+    let Some(end) = message.find(CLOSE) else {
+        return message.to_string();
+    };
+
+    let block_end = end + CLOSE.len();
+    let inner = &message[start + OPEN.len()..end].trim();
+
+    system_prompt.push_str("\n\n## WeCom Context\n\n");
+    system_prompt.push_str(inner);
+    system_prompt.push('\n');
+
+    let mut cleaned = String::with_capacity(message.len());
+    cleaned.push_str(&message[..start]);
+    cleaned.push_str(&message[block_end..]);
+    // Collapse any leftover double-blank-lines from removal
+    while cleaned.contains("\n\n\n") {
+        cleaned = cleaned.replace("\n\n\n", "\n\n");
+    }
+    cleaned.trim().to_string()
+}
+
 fn append_channel_delivery_system_instructions(
     mut system_prompt: String,
     channel_name: Option<&str>,
@@ -2340,11 +2371,22 @@ pub async fn process_message_for_channel_with_reply_target(
     system_prompt.push_str(&build_shell_policy_instructions(&config.autonomy));
     system_prompt = append_channel_delivery_system_instructions(system_prompt, channel_name);
 
-    let mem_context = build_context(mem.as_ref(), message, config.memory.min_relevance_score).await;
+    // For WeCom: extract static context block from user message into system prompt
+    let message = if channel_name.map(str::trim) == Some("wecom") {
+        std::borrow::Cow::Owned(extract_wecom_static_context_to_system(
+            &mut system_prompt,
+            message,
+        ))
+    } else {
+        std::borrow::Cow::Borrowed(message)
+    };
+
+    let mem_context =
+        build_context(mem.as_ref(), &message, config.memory.min_relevance_score).await;
     let rag_limit = if config.agent.compact_context { 2 } else { 5 };
     let hw_context = hardware_rag
         .as_ref()
-        .map(|r| build_hardware_context(r, message, &board_names, rag_limit))
+        .map(|r| build_hardware_context(r, &message, &board_names, rag_limit))
         .unwrap_or_default();
     let context = format!("{mem_context}{hw_context}");
     let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S %Z");
@@ -2423,6 +2465,32 @@ mod tests {
 
         let unchanged = append_channel_delivery_system_instructions("base".to_string(), None);
         assert_eq!(unchanged, "base");
+    }
+
+    #[test]
+    fn extract_wecom_static_context_moves_block_to_system_prompt() {
+        let mut system_prompt = "base system".to_string();
+        let message = "[WECOM_STATIC_CONTEXT_V1]\nchat_type=group\nchat_id=g1\nconversation_scope=group:g1\n[/WECOM_STATIC_CONTEXT_V1]\n\n[WECOM_HISTORY]\nUser: hello\n[/WECOM_HISTORY]\n\nWhat is up?";
+
+        let cleaned = extract_wecom_static_context_to_system(&mut system_prompt, message);
+
+        assert!(system_prompt.contains("## WeCom Context"));
+        assert!(system_prompt.contains("chat_type=group"));
+        assert!(system_prompt.contains("conversation_scope=group:g1"));
+        assert!(!cleaned.contains("WECOM_STATIC_CONTEXT_V1"));
+        assert!(cleaned.contains("WECOM_HISTORY"));
+        assert!(cleaned.contains("What is up?"));
+    }
+
+    #[test]
+    fn extract_wecom_static_context_noop_without_block() {
+        let mut system_prompt = "base system".to_string();
+        let message = "Just a normal message without static block";
+
+        let cleaned = extract_wecom_static_context_to_system(&mut system_prompt, message);
+
+        assert_eq!(system_prompt, "base system");
+        assert_eq!(cleaned, message);
     }
 
     #[test]

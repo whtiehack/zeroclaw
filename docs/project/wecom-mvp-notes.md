@@ -32,7 +32,7 @@ This document records the implementation decisions for the WeCom MVP gateway int
 
 ## Context Injection Rules
 
-- Static context (first turn only): `WECOM_STATIC_CONTEXT_V1`
+- Static context (first turn only): `WECOM_STATIC_CONTEXT_V1` — injected into **system prompt** (not user message) to reduce token usage and keep user messages clean.
 - Shared-group dynamic context (every turn): `WECOM_TURN_CONTEXT_V1` with `sender_userid`
 - Single / non-shared group do not repeat sender injection each turn.
 
@@ -40,9 +40,11 @@ This document records the implementation decisions for the WeCom MVP gateway int
 
 - Gateway passes channel identity (`wecom`) into the agent pipeline.
 - Agent injects WeCom delivery instructions into the **system prompt** (same layer as other channel system constraints).
-- User message payload remains pure WeCom-composed content (no channel-delivery preamble prepended into user text).
+- Agent extracts `WECOM_STATIC_CONTEXT_V1` block from the composed user message and appends it to the system prompt as `## WeCom Context`.
+- User message payload after extraction contains only business context (history, quotes, current input).
+- Push URL configuration guidance is provided solely via system prompt channel delivery instructions (`channel_delivery_instructions("wecom")`); no duplicate hint in static context.
+- `execution_scope` is used internally for concurrency control (locks, inflight tracking) but is not exposed to the LLM context.
 - WeCom composed payload includes:
-  - static context (`WECOM_STATIC_CONTEXT_V1`, first turn only)
   - recent history block (`WECOM_HISTORY`)
   - shared-group turn context (`WECOM_TURN_CONTEXT_V1`, when enabled)
   - quote context (`WECOM_QUOTE`, when present)
