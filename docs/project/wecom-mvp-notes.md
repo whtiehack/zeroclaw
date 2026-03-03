@@ -43,7 +43,6 @@ This document records the implementation decisions for the WeCom MVP gateway int
   - shared-group turn context (`WECOM_TURN_CONTEXT_V1`, when enabled)
   - quote context (`WECOM_QUOTE`, when present)
   - normalized current user message / attachment markers.
-- A dedicated `PromptGuard` blocking/sanitizing stage is currently **not** wired in the WeCom callback ingress path.
 
 ## Streaming Strategy in MVP
 
@@ -69,7 +68,6 @@ This document records the implementation decisions for the WeCom MVP gateway int
 
 - Attachment type sniffing is minimal (fixed extension defaults for now).
 - Fallback push URL governance currently relies on URL validation + memory key convention.
-- PromptGuard module exists globally but is not currently enforced in the WeCom callback ingestion path.
 
 ## Config Keys Added
 
