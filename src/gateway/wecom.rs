@@ -211,11 +211,61 @@ fn contains_stop_command(text: &str) -> bool {
 }
 
 fn is_clear_session_command(text: &str) -> bool {
-    let trimmed = text.trim();
-    trimmed == "新会话"
-        || trimmed == "清除历史"
-        || trimmed.eq_ignore_ascii_case("new session")
-        || trimmed.eq_ignore_ascii_case("clear history")
+    let stripped = strip_edge_mentions(text);
+    stripped.eq_ignore_ascii_case("/clear") || stripped.eq_ignore_ascii_case("/new")
+}
+
+/// Remove `@mention` tokens from the start and end of `text`.
+/// A mention is `@` followed by one or more non-whitespace characters.
+fn strip_edge_mentions(text: &str) -> String {
+    let s = text.trim();
+    if s.is_empty() {
+        return String::new();
+    }
+
+    // --- strip leading @mentions ---------------------------------------------------
+    let bytes = s.as_bytes();
+    let len = bytes.len();
+    let mut start = 0usize;
+    loop {
+        // skip whitespace
+        while start < len && bytes[start].is_ascii_whitespace() {
+            start += 1;
+        }
+        if start >= len || bytes[start] != b'@' {
+            break;
+        }
+        // skip the '@' and the non-whitespace token
+        start += 1;
+        while start < len && !bytes[start].is_ascii_whitespace() {
+            start += 1;
+        }
+    }
+
+    // --- strip trailing @mentions --------------------------------------------------
+    let mut end = len;
+    loop {
+        // skip trailing whitespace
+        while end > start && bytes[end - 1].is_ascii_whitespace() {
+            end -= 1;
+        }
+        if end <= start {
+            break;
+        }
+        // look backwards for `@token` (no whitespace between @ and end)
+        let mut probe = end;
+        while probe > start && !bytes[probe - 1].is_ascii_whitespace() && bytes[probe - 1] != b'@' {
+            probe -= 1;
+        }
+        if probe > start && bytes[probe - 1] == b'@' {
+            // confirm everything from probe..end is non-whitespace (already guaranteed)
+            end = probe - 1;
+        } else {
+            break;
+        }
+    }
+
+    s[start..end].trim().to_string()
 }
 
 fn extract_stop_signal_text(inbound: &ParsedInbound) -> Option<String> {
@@ -2685,5 +2735,36 @@ mod tests {
         let payload = make_stream_payload("sid3", "partial", false, &imgs);
         let stream = payload.get("stream").expect("stream key");
         assert!(stream.get("msg_item").is_none());
+    }
+
+    // ── is_clear_session_command ──────────────────────────────────────
+    #[test]
+    fn clear_session_bare_commands() {
+        assert!(is_clear_session_command("/clear"));
+        assert!(is_clear_session_command("/new"));
+        assert!(is_clear_session_command("/CLEAR"));
+        assert!(is_clear_session_command("/New"));
+        assert!(is_clear_session_command("  /clear  "));
+    }
+
+    #[test]
+    fn clear_session_with_mentions() {
+        assert!(is_clear_session_command("@光点Claw /clear"));
+        assert!(is_clear_session_command("/clear @bot"));
+        assert!(is_clear_session_command("@bot1 @bot2 /new"));
+        assert!(is_clear_session_command("@bot /new @other"));
+    }
+
+    #[test]
+    fn clear_session_rejects_old_and_invalid() {
+        // old commands no longer supported
+        assert!(!is_clear_session_command("新会话"));
+        assert!(!is_clear_session_command("clear history"));
+        // extra words → not a match
+        assert!(!is_clear_session_command("/clear now"));
+        assert!(!is_clear_session_command("please /new"));
+        // empty
+        assert!(!is_clear_session_command(""));
+        assert!(!is_clear_session_command("   "));
     }
 }
