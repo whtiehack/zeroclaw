@@ -1622,7 +1622,13 @@ impl WeComRuntime {
                     NormalizedMessage::Ready(text_parts.join("\n\n"))
                 }
             }
-            _ => NormalizedMessage::Unsupported,
+            other => {
+                tracing::info!(
+                    "[wecom] unsupported msg_type={other}, raw_payload={}",
+                    inbound.raw_payload
+                );
+                NormalizedMessage::Unsupported
+            }
         }
     }
 
@@ -2268,6 +2274,11 @@ async fn process_inbound_message(
                 outbound_content_preview(&msg),
                 stream_id,
                 inbound.msg_id
+            );
+            tracing::info!(
+                "[wecom] unsupported message detail: msg_type={}, raw_payload={}",
+                inbound.msg_type,
+                inbound.raw_payload
             );
         }
         NormalizedMessage::Ready(content) => {
