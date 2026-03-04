@@ -393,6 +393,23 @@ fn split_stream_content_and_overflow(input: &str) -> (String, Option<String>) {
     }
 }
 
+fn append_final_answer_to_stream_content(existing_content: &str, final_answer: &str) -> String {
+    if existing_content.trim().is_empty() {
+        return final_answer.to_string();
+    }
+    if final_answer.trim().is_empty() {
+        return existing_content.to_string();
+    }
+    if existing_content.ends_with(final_answer) {
+        return existing_content.to_string();
+    }
+    if existing_content.ends_with('\n') {
+        format!("{existing_content}---\n{final_answer}")
+    } else {
+        format!("{existing_content}\n---\n{final_answer}")
+    }
+}
+
 fn parse_image_markers(text: &str) -> (String, Vec<String>) {
     let mut cleaned = String::new();
     let mut paths = Vec::new();
@@ -2337,11 +2354,16 @@ async fn process_inbound_message(
             let (text_without_images, image_paths) = parse_image_markers(&llm_response);
             let images = prepare_stream_images(&image_paths).await;
 
-            // Prepend progress trace so the user sees tool-call history above the final answer
-            let display_text = if progress_text.is_empty() {
-                text_without_images.clone()
+            // Keep the already displayed stream content intact, then append final answer.
+            // This avoids losing intermediate progress lines at finish time.
+            let persisted_progress = runtime
+                .get_stream_state(&stream_id)
+                .map(|snapshot| snapshot.content)
+                .unwrap_or_default();
+            let display_text = if persisted_progress.trim().is_empty() {
+                append_final_answer_to_stream_content(&progress_text, &text_without_images)
             } else {
-                format!("{progress_text}---\n{text_without_images}")
+                append_final_answer_to_stream_content(&persisted_progress, &text_without_images)
             };
 
             let (stream_content, overflow) = split_stream_content_and_overflow(&display_text);
@@ -2690,6 +2712,36 @@ mod tests {
         let (cleaned, paths) = parse_image_markers(input);
         assert_eq!(cleaned, "No images here.");
         assert!(paths.is_empty());
+    }
+
+    #[test]
+    fn append_final_answer_to_stream_content_preserves_progress() {
+        let existing = "🤔 Thinking...\n💬 Got 1 tool call(s) (1s)\n✅ shell (0s)\n";
+        let final_answer = "workspace 里有这些...";
+        let merged = append_final_answer_to_stream_content(existing, final_answer);
+        assert_eq!(
+            merged,
+            "🤔 Thinking...\n💬 Got 1 tool call(s) (1s)\n✅ shell (0s)\n---\nworkspace 里有这些..."
+        );
+    }
+
+    #[test]
+    fn append_final_answer_to_stream_content_uses_final_when_existing_empty() {
+        let merged = append_final_answer_to_stream_content("", "最终回复");
+        assert_eq!(merged, "最终回复");
+    }
+
+    #[test]
+    fn append_final_answer_to_stream_content_keeps_existing_when_final_empty() {
+        let merged = append_final_answer_to_stream_content("中间过程", "   ");
+        assert_eq!(merged, "中间过程");
+    }
+
+    #[test]
+    fn append_final_answer_to_stream_content_avoids_duplicate_suffix() {
+        let existing = "中间过程\n---\n最终回复";
+        let merged = append_final_answer_to_stream_content(existing, "最终回复");
+        assert_eq!(merged, existing);
     }
 
     #[test]
