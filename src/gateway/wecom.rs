@@ -2253,24 +2253,26 @@ async fn process_inbound_message(
             let (delta_tx, mut delta_rx) = tokio::sync::mpsc::channel::<String>(64);
             let progress_runtime = runtime.clone();
             let progress_stream_id = stream_id.clone();
-            let progress_consumer = tokio::spawn(async move {
-                use crate::agent::loop_::{DRAFT_CLEAR_SENTINEL, DRAFT_PROGRESS_SENTINEL};
-                let mut accumulated = String::new();
-                while let Some(delta) = delta_rx.recv().await {
-                    if delta == DRAFT_CLEAR_SENTINEL {
-                        break;
+            let progress_consumer: tokio::task::JoinHandle<String> =
+                tokio::spawn(async move {
+                    use crate::agent::loop_::{DRAFT_CLEAR_SENTINEL, DRAFT_PROGRESS_SENTINEL};
+                    let mut accumulated = String::new();
+                    while let Some(delta) = delta_rx.recv().await {
+                        if delta == DRAFT_CLEAR_SENTINEL {
+                            break;
+                        }
+                        let visible = delta
+                            .strip_prefix(DRAFT_PROGRESS_SENTINEL)
+                            .unwrap_or(&delta);
+                        accumulated.push_str(visible);
+                        progress_runtime.update_stream_state_content(
+                            &progress_stream_id,
+                            &accumulated,
+                            false,
+                        );
                     }
-                    let visible = delta
-                        .strip_prefix(DRAFT_PROGRESS_SENTINEL)
-                        .unwrap_or(&delta);
-                    accumulated.push_str(visible);
-                    progress_runtime.update_stream_state_content(
-                        &progress_stream_id,
-                        &accumulated,
-                        false,
-                    );
-                }
-            });
+                    accumulated
+                });
 
             let llm_response = match Box::pin(run_gateway_chat_with_history(
                 &state,
@@ -2290,7 +2292,7 @@ async fn process_inbound_message(
             };
 
             // Wait for progress consumer to finish (it exits on CLEAR sentinel or sender drop)
-            let _ = progress_consumer.await;
+            let progress_text = progress_consumer.await.unwrap_or_default();
             tracing::info!(
                 "🤖 [wecom] model reply in {}: {} (len={}, stream_id={}, msg_id={})",
                 scopes.conversation_scope,
@@ -2303,8 +2305,15 @@ async fn process_inbound_message(
             let (text_without_images, image_paths) = parse_image_markers(&llm_response);
             let images = prepare_stream_images(&image_paths).await;
 
+            // Prepend progress trace so the user sees tool-call history above the final answer
+            let display_text = if progress_text.is_empty() {
+                text_without_images.clone()
+            } else {
+                format!("{progress_text}---\n{text_without_images}")
+            };
+
             let (stream_content, overflow) =
-                split_stream_content_and_overflow(&text_without_images);
+                split_stream_content_and_overflow(&display_text);
             runtime.update_stream_state_with_images(&stream_id, &stream_content, true, images);
 
             runtime.upsert_conversation(
