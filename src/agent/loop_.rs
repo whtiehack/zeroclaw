@@ -39,7 +39,7 @@ use execution::{
 };
 #[cfg(test)]
 use history::{apply_compaction_summary, build_compaction_transcript};
-use history::{auto_compact_history, trim_history};
+use history::{auto_compact_history, estimate_history_tokens, trim_history};
 #[allow(unused_imports)]
 use parsing::{
     default_param_for_tool, detect_tool_call_parse_issue, extract_json_values, map_tool_name_alias,
@@ -2631,6 +2631,30 @@ pub async fn process_message_for_channel_with_history(
     let mut history = vec![ChatMessage::system(&system_prompt)];
     history.extend(prior_history);
     history.push(ChatMessage::user(&enriched));
+
+    // Token-aware auto-compaction for WeCom multi-turn history
+    if channel_name.map(str::trim) == Some("wecom") {
+        const DEFAULT_COMPRESS_TOKEN_THRESHOLD: u64 = 150_000;
+        let compress_threshold: u64 = match mem.get("wecom_config_compress_token").await {
+            Ok(Some(entry)) => entry
+                .content
+                .trim()
+                .parse()
+                .unwrap_or(DEFAULT_COMPRESS_TOKEN_THRESHOLD),
+            _ => DEFAULT_COMPRESS_TOKEN_THRESHOLD,
+        };
+        let estimated_tokens = estimate_history_tokens(&history);
+        if estimated_tokens > compress_threshold {
+            let _ = auto_compact_history(
+                &mut history,
+                provider.as_ref(),
+                &model_name,
+                config.agent.max_history_messages,
+            )
+            .await;
+            trim_history(&mut history, config.agent.max_history_messages);
+        }
+    }
 
     let tool_loop_channel_name = channel_name
         .map(str::trim)
