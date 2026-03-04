@@ -130,7 +130,6 @@ struct StreamImageItem {
 
 #[derive(Debug, Clone)]
 struct ConversationState {
-    static_injected: bool,
     turns: VecDeque<ConversationTurn>,
     last_active_at: Instant,
 }
@@ -169,7 +168,6 @@ enum NormalizedMessage {
 impl Default for ConversationState {
     fn default() -> Self {
         Self {
-            static_injected: false,
             turns: VecDeque::new(),
             last_active_at: Instant::now(),
         }
@@ -680,13 +678,10 @@ fn wecom_static_context(
     scopes: &ScopeDecision,
     include_sender: bool,
 ) -> String {
-    let chat_id = inbound.chat_id.as_deref().unwrap_or("-");
     let mut lines = vec![
         "[WECOM_STATIC_CONTEXT_V1]".to_string(),
         format!("chat_type={}", inbound.chat_type),
-        format!("chat_id={chat_id}"),
         format!("conversation_scope={}", scopes.conversation_scope),
-        format!("aibot_id={}", inbound.aibot_id),
         format!(
             "push_url_memory_key=wecom_push_url::{}",
             scopes.conversation_scope
@@ -699,16 +694,6 @@ fn wecom_static_context(
 
     lines.push("[/WECOM_STATIC_CONTEXT_V1]".to_string());
     lines.join("\n")
-}
-
-fn wecom_turn_context(inbound: &ParsedInbound) -> String {
-    [
-        "[WECOM_TURN_CONTEXT_V1]".to_string(),
-        format!("sender_userid={}", inbound.sender_userid),
-        format!("msg_id={}", inbound.msg_id),
-        "[/WECOM_TURN_CONTEXT_V1]".to_string(),
-    ]
-    .join("\n")
 }
 
 fn bytes_timestamp_now() -> u64 {
@@ -1239,16 +1224,9 @@ impl WeComRuntime {
         ConversationState::default()
     }
 
-    fn upsert_conversation(
-        &self,
-        scope: &str,
-        static_injected: bool,
-        user_turn: &str,
-        assistant_turn: &str,
-    ) {
+    fn upsert_conversation(&self, scope: &str, user_turn: &str, assistant_turn: &str) {
         let mut conversations = self.conversations.lock();
         let state = conversations.entry(scope.to_string()).or_default();
-        state.static_injected = state.static_injected || static_injected;
         state.last_active_at = Instant::now();
 
         state.turns.push_back(ConversationTurn {
@@ -1672,28 +1650,33 @@ impl WeComRuntime {
         inbound: &ParsedInbound,
         scopes: &ScopeDecision,
         normalized: &str,
-        prior: &ConversationState,
+        _prior: &ConversationState,
     ) -> ComposedInput {
         let mut blocks: Vec<String> = Vec::new();
         let include_sender_in_static = !scopes.shared_group_history;
         let quote_context = extract_quote_context(&inbound.raw_payload);
 
-        if !prior.static_injected {
-            blocks.push(wecom_static_context(
-                inbound,
-                scopes,
-                include_sender_in_static,
-            ));
-        }
+        blocks.push(wecom_static_context(
+            inbound,
+            scopes,
+            include_sender_in_static,
+        ));
 
         if scopes.shared_group_history {
-            blocks.push(wecom_turn_context(inbound));
+            blocks.push(format!(
+                "[sender_userid={}] {}",
+                inbound.sender_userid, normalized
+            ));
+        } else {
+            blocks.push(normalized.to_string());
         }
 
         if let Some(quote) = quote_context.as_deref() {
+            // Insert quote before the user message
+            let last = blocks.pop().unwrap();
             blocks.push(quote.to_string());
+            blocks.push(last);
         }
-        blocks.push(normalized.to_string());
 
         let mut user_turn_for_history = normalized.to_string();
         if let Some(quote) = quote_context.as_deref() {
@@ -2253,26 +2236,25 @@ async fn process_inbound_message(
             let (delta_tx, mut delta_rx) = tokio::sync::mpsc::channel::<String>(64);
             let progress_runtime = runtime.clone();
             let progress_stream_id = stream_id.clone();
-            let progress_consumer: tokio::task::JoinHandle<String> =
-                tokio::spawn(async move {
-                    use crate::agent::loop_::{DRAFT_CLEAR_SENTINEL, DRAFT_PROGRESS_SENTINEL};
-                    let mut accumulated = String::new();
-                    while let Some(delta) = delta_rx.recv().await {
-                        if delta == DRAFT_CLEAR_SENTINEL {
-                            break;
-                        }
-                        let visible = delta
-                            .strip_prefix(DRAFT_PROGRESS_SENTINEL)
-                            .unwrap_or(&delta);
-                        accumulated.push_str(visible);
-                        progress_runtime.update_stream_state_content(
-                            &progress_stream_id,
-                            &accumulated,
-                            false,
-                        );
+            let progress_consumer: tokio::task::JoinHandle<String> = tokio::spawn(async move {
+                use crate::agent::loop_::{DRAFT_CLEAR_SENTINEL, DRAFT_PROGRESS_SENTINEL};
+                let mut accumulated = String::new();
+                while let Some(delta) = delta_rx.recv().await {
+                    if delta == DRAFT_CLEAR_SENTINEL {
+                        break;
                     }
-                    accumulated
-                });
+                    let visible = delta
+                        .strip_prefix(DRAFT_PROGRESS_SENTINEL)
+                        .unwrap_or(&delta);
+                    accumulated.push_str(visible);
+                    progress_runtime.update_stream_state_content(
+                        &progress_stream_id,
+                        &accumulated,
+                        false,
+                    );
+                }
+                accumulated
+            });
 
             let llm_response = match Box::pin(run_gateway_chat_with_history(
                 &state,
@@ -2312,13 +2294,11 @@ async fn process_inbound_message(
                 format!("{progress_text}---\n{text_without_images}")
             };
 
-            let (stream_content, overflow) =
-                split_stream_content_and_overflow(&display_text);
+            let (stream_content, overflow) = split_stream_content_and_overflow(&display_text);
             runtime.update_stream_state_with_images(&stream_id, &stream_content, true, images);
 
             runtime.upsert_conversation(
                 &scopes.conversation_scope,
-                true,
                 &composed.user_turn_for_history,
                 &text_without_images,
             );

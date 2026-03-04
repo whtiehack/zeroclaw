@@ -2701,7 +2701,7 @@ mod tests {
     #[test]
     fn extract_wecom_static_context_moves_block_to_system_prompt() {
         let mut system_prompt = "base system".to_string();
-        let message = "[WECOM_STATIC_CONTEXT_V1]\nchat_type=group\nchat_id=g1\nconversation_scope=group--g1\n[/WECOM_STATIC_CONTEXT_V1]\n\n[WECOM_HISTORY]\nUser: hello\n[/WECOM_HISTORY]\n\nWhat is up?";
+        let message = "[WECOM_STATIC_CONTEXT_V1]\nchat_type=group\nconversation_scope=group--g1\n[/WECOM_STATIC_CONTEXT_V1]\n\n[WECOM_HISTORY]\nUser: hello\n[/WECOM_HISTORY]\n\nWhat is up?";
 
         let cleaned = extract_wecom_static_context_to_system(&mut system_prompt, message);
 
