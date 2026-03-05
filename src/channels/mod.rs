@@ -4737,15 +4737,17 @@ fn collect_configured_channels(
             ..Default::default()
         };
         if let Ok(mem) = crate::memory::create_memory(&mem_cfg, &config.workspace_dir, None) {
-            channels.push(ConfiguredChannel {
-                display_name: "WeCom",
-                channel: Arc::new(WeComChannel::new(
-                    Arc::from(mem),
-                    wecom_cfg.fallback_robot_webhook_url.clone(),
-                    wecom_cfg.response_url_ttl_secs,
-                    wecom_cfg.response_url_cache_per_scope,
-                )),
-            });
+            if let Ok(ch) = WeComChannel::new(
+                wecom_cfg,
+                &config.workspace_dir,
+                Arc::from(mem),
+                config.clone(),
+            ) {
+                channels.push(ConfiguredChannel {
+                    display_name: "WeCom",
+                    channel: Arc::new(ch),
+                });
+            }
         }
     }
 

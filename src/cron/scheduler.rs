@@ -400,11 +400,11 @@ pub(crate) async fn deliver_announcement(
                     config.api_key.as_deref(),
                 )?);
                 let channel = WeComChannel::new(
+                    wecom,
+                    &config.workspace_dir,
                     memory,
-                    wecom.fallback_robot_webhook_url.clone(),
-                    wecom.response_url_ttl_secs,
-                    wecom.response_url_cache_per_scope,
-                );
+                    config.clone(),
+                )?;
                 channel.send(&SendMessage::new(output, target)).await?;
             }
         }

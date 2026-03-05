@@ -1,30 +1,173 @@
 use super::traits::{Channel, ChannelMessage, SendMessage};
+use crate::config::Config;
 use crate::memory::Memory;
+use crate::providers::ChatMessage;
+use aes::Aes256;
+use anyhow::{Context, Result};
 use async_trait::async_trait;
+use axum::body::Bytes;
+use base64::Engine as _;
+use cbc::cipher::{block_padding::NoPadding, BlockDecryptMut, BlockEncryptMut, KeyIvInit};
+use md5 as md5_crate;
 use parking_lot::Mutex;
-use std::collections::{HashMap, VecDeque};
+use rand::RngExt;
+use serde::Deserialize;
+use serde_json::Value;
+use sha1::{Digest, Sha1};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
-use uuid::Uuid;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use tokio::task::JoinHandle;
 
-/// WeCom (企业微信) channel — webhook-based, push via group-bot webhook.
-///
-/// This channel operates in webhook mode (push-based).
-/// Messages are received via the gateway's `/wecom` webhook endpoint where
-/// the gateway handles AES decryption / signature verification / stream protocol.
-/// The `listen` method here is a keepalive placeholder.
-///
-/// Outbound messages use a 3-layer fallback:
-/// 1. response_url (cached from incoming messages, TTL 1 hour)
-/// 2. scope-specific push webhook (looked up from memory)
-/// 3. fallback push webhook (from config)
-pub struct WeComChannel {
-    memory: Arc<dyn Memory>,
-    fallback_webhook_url: Option<String>,
-    client: reqwest::Client,
-    /// response_url cache: scope -> FIFO queue of response URLs
-    response_urls: Arc<Mutex<HashMap<String, VecDeque<ResponseUrlEntry>>>>,
-    cache_config: ResponseUrlCacheConfig,
+// ── Constants ────────────────────────────────────────────────────────
+
+const WECOM_RESPONSE_URL_TTL_SECS: u64 = 3600;
+const WECOM_MARKDOWN_MAX_BYTES: usize = 20_480;
+const WECOM_MARKDOWN_CHUNK_BYTES: usize = 8_000;
+const WECOM_EMOJIS: &[&str] = &["\u{1F642}", "\u{1F604}", "\u{1F91D}", "\u{1F680}", "\u{1F44C}"];
+const WECOM_HISTORY_WINDOW_TURNS: usize = 50;
+const WECOM_FILE_CLEANUP_INTERVAL_SECS: u64 = 1800;
+const WECOM_STREAM_STATE_TTL_SECS: u64 = 7200;
+const WECOM_CONVERSATION_TTL_SECS: u64 = 172_800;
+const WECOM_HTTP_TIMEOUT_SECS: u64 = 60;
+const WECOM_STREAM_BOOTSTRAP_CONTENT: &str = "\u{6b63}\u{5728}\u{5904}\u{7406}\u{4e2d}\u{ff0c}\u{8bf7}\u{7a0d}\u{5019}\u{3002}";
+const WECOM_STREAM_MAX_IMAGES: usize = 10;
+const WECOM_IMAGE_MAX_BYTES: usize = 10 * 1024 * 1024;
+
+// ── Communication types (gateway <-> channel) ────────────────────────
+
+#[derive(Debug, Deserialize)]
+pub struct WeComCallbackQuery {
+    pub msg_signature: String,
+    pub timestamp: String,
+    pub nonce: String,
+    pub echostr: Option<String>,
+}
+
+/// Gateway -> Channel request
+pub struct WeComInboundRequest {
+    pub query: WeComCallbackQuery,
+    pub body: Bytes,
+    pub reply_tx: tokio::sync::oneshot::Sender<WeComInboundResponse>,
+}
+
+/// Channel -> Gateway response
+pub struct WeComInboundResponse {
+    pub status_code: u16,
+    pub body: String,
+}
+
+// ── Internal types ───────────────────────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+struct WeComEncryptedEnvelope {
+    encrypt: String,
+}
+
+#[derive(Debug, Clone)]
+struct ParsedInbound {
+    msg_id: String,
+    msg_type: String,
+    chat_type: String,
+    chat_id: Option<String>,
+    sender_userid: String,
+    aibot_id: String,
+    response_url: Option<String>,
+    raw_payload: Value,
+}
+
+#[derive(Debug, Clone)]
+struct ScopeDecision {
+    conversation_scope: String,
+    execution_scope: String,
+    shared_group_history: bool,
+}
+
+#[derive(Debug, Clone)]
+struct ExecutionLockEntry {
+    owner_msg_id: String,
+    stream_id: String,
+    expires_at: Instant,
+}
+
+struct InflightTaskEntry {
+    owner_msg_id: String,
+    stream_id: String,
+    expires_at: Instant,
+    handle: JoinHandle<()>,
+}
+
+#[derive(Debug, Clone)]
+struct StreamState {
+    execution_scope: String,
+    conversation_scope: String,
+    owner_msg_id: String,
+    content: String,
+    finish: bool,
+    images: Vec<StreamImageItem>,
+    expires_at: Instant,
+}
+
+#[derive(Debug, Clone)]
+struct StreamImageItem {
+    base64: String,
+    md5: String,
+}
+
+#[derive(Debug, Clone)]
+struct ConversationState {
+    turns: VecDeque<ConversationTurn>,
+    last_active_at: Instant,
+}
+
+#[derive(Debug, Clone)]
+struct ConversationTurn {
+    role: TurnRole,
+    content: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TurnRole {
+    User,
+    Assistant,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AttachmentKind {
+    Image,
+    File,
+}
+
+impl AttachmentKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Image => "image",
+            Self::File => "file",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ComposedInput {
+    user_message_for_model: String,
+    user_turn_for_history: String,
+}
+
+#[derive(Debug)]
+enum NormalizedMessage {
+    Ready(String),
+    VoiceMissingTranscript,
+    Unsupported,
+}
+
+impl Default for ConversationState {
+    fn default() -> Self {
+        Self {
+            turns: VecDeque::new(),
+            last_active_at: Instant::now(),
+        }
+    }
 }
 
 /// Cached response_url entry with expiration tracking
@@ -39,37 +182,306 @@ struct ResponseUrlEntry {
 /// Configuration for response_url caching
 #[derive(Debug, Clone)]
 struct ResponseUrlCacheConfig {
-    /// TTL for cached response_urls (default: 3600 seconds)
     ttl_secs: u64,
-    /// Maximum entries per scope (default: 20)
     max_per_scope: usize,
 }
 
-const WECOM_MARKDOWN_MAX_BYTES: usize = 20_480;
-const WECOM_MARKDOWN_CHUNK_BYTES: usize = 8_000;
+#[derive(Clone)]
+struct WeComRuntimeConfig {
+    workspace_dir: PathBuf,
+    file_retention_days: u32,
+    max_file_size_bytes: u64,
+    lock_timeout_secs: u64,
+    history_max_turns: usize,
+}
+
+struct SimpleIdempotencyStore {
+    seen: Mutex<HashSet<String>>,
+}
+
+impl SimpleIdempotencyStore {
+    fn new() -> Self {
+        Self {
+            seen: Mutex::new(HashSet::new()),
+        }
+    }
+    fn record_if_new(&self, key: &str) -> bool {
+        self.seen.lock().insert(key.to_string())
+    }
+}
+
+// ── WeComCrypto ──────────────────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+struct WeComCrypto {
+    token: String,
+    key: [u8; 32],
+}
+
+impl WeComCrypto {
+    fn new(token: &str, encoding_aes_key: &str) -> Result<Self> {
+        use base64::Engine;
+
+        let raw = base64::engine::general_purpose::STANDARD
+            .decode(format!("{}=", encoding_aes_key.trim()))
+            .or_else(|_| {
+                base64::engine::general_purpose::STANDARD_NO_PAD
+                    .decode(encoding_aes_key.trim())
+            })
+            .or_else(|_| {
+                base64::engine::general_purpose::URL_SAFE
+                    .decode(format!("{}=", encoding_aes_key.trim()))
+            })
+            .or_else(|_| {
+                base64::engine::general_purpose::URL_SAFE_NO_PAD
+                    .decode(encoding_aes_key.trim())
+            })
+            .context("failed to decode WeCom EncodingAESKey - tried STANDARD, STANDARD_NO_PAD, URL_SAFE variants")?;
+
+        if raw.len() != 32 {
+            anyhow::bail!(
+                "invalid WeCom EncodingAESKey length: expected 32 bytes, got {}",
+                raw.len()
+            );
+        }
+        let mut key = [0u8; 32];
+        key.copy_from_slice(&raw);
+
+        Ok(Self {
+            token: token.trim().to_string(),
+            key,
+        })
+    }
+
+    fn verify_signature(
+        &self,
+        msg_signature: &str,
+        timestamp: &str,
+        nonce: &str,
+        encrypt: &str,
+    ) -> bool {
+        let mut parts = vec![
+            self.token.as_str(),
+            timestamp.trim(),
+            nonce.trim(),
+            encrypt.trim(),
+        ];
+        parts.sort_unstable();
+
+        let mut sha = Sha1::new();
+        sha.update(parts.join(""));
+        let expected = hex::encode(sha.finalize());
+        expected.eq_ignore_ascii_case(msg_signature.trim())
+    }
+
+    fn encrypt_json_ciphertext(
+        &self,
+        plaintext: &str,
+        nonce: &str,
+        timestamp: &str,
+        receive_id: &str,
+    ) -> Result<String> {
+        let plaintext_bytes = plaintext.as_bytes();
+        if plaintext_bytes.len() > (u32::MAX as usize) {
+            anyhow::bail!("WeCom plaintext payload too large");
+        }
+
+        let mut raw = Vec::with_capacity(plaintext_bytes.len() + receive_id.len() + 64);
+        raw.extend_from_slice(random_ascii_token(16).as_bytes());
+        raw.extend_from_slice(&(plaintext_bytes.len() as u32).to_be_bytes());
+        raw.extend_from_slice(plaintext_bytes);
+        raw.extend_from_slice(receive_id.as_bytes());
+
+        let pad_len = 32 - (raw.len() % 32);
+        let actual_pad = if pad_len == 0 { 32 } else { pad_len };
+        raw.extend(vec![actual_pad as u8; actual_pad]);
+
+        let iv = &self.key[..16];
+        let mut buf = raw.clone();
+        let encrypted = cbc::Encryptor::<Aes256>::new((&self.key).into(), iv.into())
+            .encrypt_padded_mut::<NoPadding>(&mut buf, raw.len())
+            .context("failed to encrypt WeCom response payload")?;
+        let encrypted_b64 = base64::engine::general_purpose::STANDARD.encode(encrypted);
+
+        let mut parts = vec![
+            self.token.as_str(),
+            timestamp.trim(),
+            nonce.trim(),
+            &encrypted_b64,
+        ];
+        parts.sort_unstable();
+        let mut sha = Sha1::new();
+        sha.update(parts.join(""));
+        let signature = hex::encode(sha.finalize());
+
+        let envelope = serde_json::json!({
+            "encrypt": encrypted_b64,
+            "msgsignature": signature,
+            "timestamp": timestamp.trim(),
+            "nonce": nonce.trim(),
+        });
+        Ok(envelope.to_string())
+    }
+
+    fn decrypt_json_ciphertext(&self, encrypt: &str, receive_id: &str) -> Result<String> {
+        let ciphertext = base64::engine::general_purpose::STANDARD
+            .decode(encrypt.trim())
+            .context("failed to decode WeCom ciphertext")?;
+
+        let iv = &self.key[..16];
+        let mut buf = ciphertext.clone();
+        let plaintext = cbc::Decryptor::<Aes256>::new((&self.key).into(), iv.into())
+            .decrypt_padded_mut::<NoPadding>(&mut buf)
+            .context("failed to decrypt WeCom ciphertext")?;
+
+        let unpadded = strip_wecom_padding(plaintext)?;
+        if unpadded.len() < 20 {
+            anyhow::bail!("decrypted WeCom payload is too short");
+        }
+
+        let msg_len =
+            u32::from_be_bytes([unpadded[16], unpadded[17], unpadded[18], unpadded[19]]) as usize;
+        let msg_start = 20usize;
+        let msg_end = msg_start.saturating_add(msg_len);
+        if msg_end > unpadded.len() {
+            anyhow::bail!("decrypted WeCom payload length is invalid");
+        }
+
+        let msg = std::str::from_utf8(&unpadded[msg_start..msg_end])
+            .context("decrypted WeCom payload is not utf-8")?
+            .to_string();
+        let from_receive_id = std::str::from_utf8(&unpadded[msg_end..])
+            .context("decrypted WeCom receive_id is not utf-8")?;
+
+        if from_receive_id != receive_id {
+            anyhow::bail!("wecom receive_id mismatch");
+        }
+
+        Ok(msg)
+    }
+
+    fn decrypt_file_payload(&self, encrypted: &[u8]) -> Result<Vec<u8>> {
+        let iv = &self.key[..16];
+        let mut buf = encrypted.to_vec();
+        let plaintext = cbc::Decryptor::<Aes256>::new((&self.key).into(), iv.into())
+            .decrypt_padded_mut::<NoPadding>(&mut buf)
+            .context("failed to decrypt WeCom attachment")?;
+        Ok(strip_wecom_padding(plaintext)?.to_vec())
+    }
+}
+
+// ── WeComChannel struct ──────────────────────────────────────────────
+
+/// WeCom (企业微信) channel — absorbs all business logic from gateway.
+///
+/// Inbound messages arrive via mpsc from the gateway HTTP relay.
+/// `listen()` processes them (crypto, routing, LLM calls) and replies
+/// via oneshot back to the gateway for the HTTP response.
+///
+/// Outbound messages use a 3-layer fallback:
+/// 1. response_url (cached from incoming messages, TTL 1 hour)
+/// 2. scope-specific push webhook (looked up from memory)
+/// 3. fallback push webhook (from config)
+pub struct WeComChannel {
+    // mpsc pair for gateway -> channel communication
+    inbound_tx: tokio::sync::mpsc::Sender<WeComInboundRequest>,
+    inbound_rx: tokio::sync::Mutex<Option<tokio::sync::mpsc::Receiver<WeComInboundRequest>>>,
+
+    // Crypto
+    crypto: WeComCrypto,
+
+    // Runtime config
+    cfg: WeComRuntimeConfig,
+
+    // Agent config for calling process_message_for_channel_with_history
+    agent_config: Arc<Mutex<Config>>,
+
+    // HTTP client for attachment downloads and webhook sends
+    client: reqwest::Client,
+
+    // Outbound send client (may use proxy)
+    send_client: reqwest::Client,
+
+    // Memory backend
+    memory: Arc<dyn Memory>,
+
+    // Fallback webhook
+    fallback_webhook_url: Option<String>,
+
+    // response_url cache
+    response_urls: Arc<Mutex<HashMap<String, VecDeque<ResponseUrlEntry>>>>,
+    cache_config: ResponseUrlCacheConfig,
+
+    // Runtime state
+    execution_locks: Arc<Mutex<HashMap<String, ExecutionLockEntry>>>,
+    inflight_tasks: Arc<Mutex<HashMap<String, InflightTaskEntry>>>,
+    stream_states: Arc<Mutex<HashMap<String, StreamState>>>,
+    conversations: Arc<Mutex<HashMap<String, ConversationState>>>,
+    last_cleanup: Arc<Mutex<Instant>>,
+    idempotency: Arc<SimpleIdempotencyStore>,
+
+    fingerprint: String,
+}
 
 impl WeComChannel {
     pub fn new(
+        config: &crate::config::WeComConfig,
+        workspace_dir: &Path,
         memory: Arc<dyn Memory>,
-        fallback_webhook_url: Option<String>,
-        cache_ttl_secs: u64,
-        cache_max_per_scope: usize,
-    ) -> Self {
-        Self {
+        agent_config: Config,
+    ) -> Result<Self> {
+        let crypto = WeComCrypto::new(&config.token, &config.encoding_aes_key)?;
+
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(WECOM_HTTP_TIMEOUT_SECS))
+            .build()
+            .context("failed to initialize WeCom HTTP client")?;
+
+        let send_client = crate::config::build_runtime_proxy_client("channel.wecom");
+
+        let fingerprint = format!("{}|{}", config.token, config.encoding_aes_key);
+
+        let (inbound_tx, inbound_rx) = tokio::sync::mpsc::channel(64);
+
+        Ok(Self {
+            inbound_tx,
+            inbound_rx: tokio::sync::Mutex::new(Some(inbound_rx)),
+            crypto,
+            cfg: WeComRuntimeConfig {
+                workspace_dir: workspace_dir.to_path_buf(),
+                file_retention_days: config.file_retention_days,
+                max_file_size_bytes: config.max_file_size_mb.saturating_mul(1024 * 1024),
+                lock_timeout_secs: config.lock_timeout_secs.max(30),
+                history_max_turns: config.history_max_turns.max(2),
+            },
+            agent_config: Arc::new(Mutex::new(agent_config)),
+            client,
+            send_client,
             memory,
-            fallback_webhook_url,
-            client: crate::config::build_runtime_proxy_client("channel.wecom"),
+            fallback_webhook_url: config.fallback_robot_webhook_url.clone(),
             response_urls: Arc::new(Mutex::new(HashMap::new())),
             cache_config: ResponseUrlCacheConfig {
-                ttl_secs: cache_ttl_secs,
-                max_per_scope: cache_max_per_scope,
+                ttl_secs: config.response_url_ttl_secs,
+                max_per_scope: config.response_url_cache_per_scope,
             },
-        }
+            execution_locks: Arc::new(Mutex::new(HashMap::new())),
+            inflight_tasks: Arc::new(Mutex::new(HashMap::new())),
+            stream_states: Arc::new(Mutex::new(HashMap::new())),
+            conversations: Arc::new(Mutex::new(HashMap::new())),
+            last_cleanup: Arc::new(Mutex::new(Instant::now())),
+            idempotency: Arc::new(SimpleIdempotencyStore::new()),
+            fingerprint,
+        })
     }
 
-    /// Cache a response_url for later use (called by gateway on message receipt).
-    ///
-    /// The response_url is stored in a FIFO queue per scope with TTL and size limits.
+    /// Get a sender for the gateway to forward HTTP requests.
+    pub fn inbound_sender(&self) -> tokio::sync::mpsc::Sender<WeComInboundRequest> {
+        self.inbound_tx.clone()
+    }
+
+    // ── response_url cache ───────────────────────────────────────────
+
+    /// Cache a response_url for later use.
     pub fn cache_response_url(&self, scope: &str, msg_id: &str, url: Option<&str>) {
         let Some(url) = url.map(str::trim).filter(|v| !v.is_empty()) else {
             return;
@@ -93,29 +505,22 @@ impl WeComChannel {
             msg_id: msg_id.to_string(),
         });
 
-        // Enforce size limit (FIFO eviction)
         while queue.len() > self.cache_config.max_per_scope {
             queue.pop_front();
         }
     }
 
-    /// Take the next available response_url for a scope (FIFO, with expiration check).
     fn take_response_url(&self, scope: &str) -> Option<ResponseUrlEntry> {
         let now = Instant::now();
         let mut cache = self.response_urls.lock();
         let queue = cache.get_mut(scope)?;
-
-        // Remove expired entries
         queue.retain(|entry| entry.expires_at > now);
         if queue.is_empty() {
             return None;
         }
-
-        // Take the oldest entry (FIFO)
         queue.pop_front()
     }
 
-    /// Prune expired response_urls across all scopes (called periodically).
     fn prune_response_urls(&self) {
         let now = Instant::now();
         let mut cache = self.response_urls.lock();
@@ -125,83 +530,866 @@ impl WeComChannel {
         });
     }
 
-    /// Parse a decrypted WeCom AI Bot callback payload into channel messages.
-    ///
-    /// The `payload` is the JSON value after AES decryption by the gateway.
-    /// Field names follow WeCom AI Bot callback format (lowercase keys).
-    pub fn parse_webhook_payload(&self, payload: &serde_json::Value) -> Vec<ChannelMessage> {
-        let msg_type = payload
-            .get("msgtype")
-            .and_then(|v| v.as_str())
+    // ── execution locks ──────────────────────────────────────────────
+
+    fn prune_execution_locks(&self) {
+        let now = Instant::now();
+        let mut locks = self.execution_locks.lock();
+        locks.retain(|_, lock| lock.expires_at > now);
+    }
+
+    fn is_execution_locked(&self, execution_scope: &str) -> bool {
+        self.prune_execution_locks();
+        self.execution_locks.lock().contains_key(execution_scope)
+    }
+
+    fn try_acquire_execution_lock(
+        &self,
+        execution_scope: &str,
+        msg_id: &str,
+        stream_id: &str,
+    ) -> bool {
+        self.prune_execution_locks();
+        let now = Instant::now();
+        let mut locks = self.execution_locks.lock();
+
+        if locks.contains_key(execution_scope) {
+            return false;
+        }
+
+        locks.insert(
+            execution_scope.to_string(),
+            ExecutionLockEntry {
+                owner_msg_id: msg_id.to_string(),
+                stream_id: stream_id.to_string(),
+                expires_at: now + Duration::from_secs(self.cfg.lock_timeout_secs),
+            },
+        );
+        tracing::info!(
+            "WeCom: acquired execution lock for scope={} msg_id={} stream_id={}",
+            execution_scope, msg_id, stream_id
+        );
+        true
+    }
+
+    fn release_execution_lock(&self, execution_scope: &str, msg_id: &str) {
+        let mut locks = self.execution_locks.lock();
+        if locks
+            .get(execution_scope)
+            .is_some_and(|lock| lock.owner_msg_id == msg_id)
+        {
+            locks.remove(execution_scope);
+            tracing::info!(
+                "WeCom: released execution lock for scope={} msg_id={}",
+                execution_scope, msg_id
+            );
+        }
+    }
+
+    fn force_release_execution_lock(&self, execution_scope: &str) {
+        self.execution_locks.lock().remove(execution_scope);
+    }
+
+    fn current_stream_id_for_scope(&self, execution_scope: &str) -> Option<String> {
+        self.prune_execution_locks();
+        self.execution_locks
+            .lock()
+            .get(execution_scope)
+            .map(|entry| entry.stream_id.clone())
+    }
+
+    // ── inflight tasks ───────────────────────────────────────────────
+
+    fn register_inflight_task(
+        &self,
+        execution_scope: &str,
+        owner_msg_id: &str,
+        stream_id: &str,
+        handle: JoinHandle<()>,
+    ) {
+        self.prune_inflight_tasks();
+        self.inflight_tasks.lock().insert(
+            execution_scope.to_string(),
+            InflightTaskEntry {
+                owner_msg_id: owner_msg_id.to_string(),
+                stream_id: stream_id.to_string(),
+                expires_at: Instant::now() + Duration::from_secs(self.cfg.lock_timeout_secs),
+                handle,
+            },
+        );
+    }
+
+    fn prune_inflight_tasks(&self) {
+        let now = Instant::now();
+        let mut inflight = self.inflight_tasks.lock();
+        let stale_scopes: Vec<String> = inflight
+            .iter()
+            .filter(|(_, task)| task.expires_at <= now || task.handle.is_finished())
+            .map(|(scope, _)| scope.clone())
+            .collect();
+
+        for scope in stale_scopes {
+            if let Some(task) = inflight.remove(&scope) {
+                if !task.handle.is_finished() {
+                    task.handle.abort();
+                }
+            }
+        }
+    }
+
+    fn clear_inflight_task_if_owner(&self, execution_scope: &str, owner_msg_id: &str) {
+        let mut inflight = self.inflight_tasks.lock();
+        if inflight
+            .get(execution_scope)
+            .is_some_and(|entry| entry.owner_msg_id == owner_msg_id)
+        {
+            inflight.remove(execution_scope);
+        }
+    }
+
+    fn abort_inflight_task(&self, execution_scope: &str) -> Option<String> {
+        self.prune_inflight_tasks();
+        let task = self.inflight_tasks.lock().remove(execution_scope)?;
+        let stream_id = task.stream_id;
+        task.handle.abort();
+        Some(stream_id)
+    }
+
+    // ── stream states ────────────────────────────────────────────────
+
+    fn upsert_stream_state(
+        &self,
+        stream_id: &str,
+        execution_scope: &str,
+        conversation_scope: &str,
+        owner_msg_id: &str,
+        content: &str,
+        finish: bool,
+        images: Vec<StreamImageItem>,
+    ) {
+        let mut states = self.stream_states.lock();
+        states.insert(
+            stream_id.to_string(),
+            StreamState {
+                execution_scope: execution_scope.to_string(),
+                conversation_scope: conversation_scope.to_string(),
+                owner_msg_id: owner_msg_id.to_string(),
+                content: normalize_stream_content(content),
+                finish,
+                images,
+                expires_at: Instant::now() + Duration::from_secs(WECOM_STREAM_STATE_TTL_SECS),
+            },
+        );
+        tracing::debug!(
+            "WeCom: upsert stream state stream_id={} finish={}",
+            stream_id, finish
+        );
+    }
+
+    fn update_stream_state_content(&self, stream_id: &str, content: &str, finish: bool) {
+        let mut states = self.stream_states.lock();
+        if let Some(state) = states.get_mut(stream_id) {
+            state.content = normalize_stream_content(content);
+            state.finish = finish;
+            state.images = Vec::new();
+            state.expires_at = Instant::now() + Duration::from_secs(WECOM_STREAM_STATE_TTL_SECS);
+        }
+    }
+
+    fn update_stream_state_with_images(
+        &self,
+        stream_id: &str,
+        content: &str,
+        finish: bool,
+        images: Vec<StreamImageItem>,
+    ) {
+        let mut states = self.stream_states.lock();
+        if let Some(state) = states.get_mut(stream_id) {
+            state.content = normalize_stream_content(content);
+            state.finish = finish;
+            state.images = images;
+            state.expires_at = Instant::now() + Duration::from_secs(WECOM_STREAM_STATE_TTL_SECS);
+        }
+    }
+
+    fn get_stream_state(&self, stream_id: &str) -> Option<StreamState> {
+        self.prune_stream_states();
+        self.stream_states.lock().get(stream_id).cloned()
+    }
+
+    fn prune_stream_states(&self) {
+        let now = Instant::now();
+        self.stream_states
+            .lock()
+            .retain(|_, state| state.expires_at > now);
+    }
+
+    // ── conversation state ───────────────────────────────────────────
+
+    fn snapshot_conversation(&self, scope: &str) -> ConversationState {
+        let mut conversations = self.conversations.lock();
+        if let Some(state) = conversations.get_mut(scope) {
+            state.last_active_at = Instant::now();
+            return state.clone();
+        }
+        ConversationState::default()
+    }
+
+    fn upsert_conversation(&self, scope: &str, user_turn: &str, assistant_turn: &str) {
+        let mut conversations = self.conversations.lock();
+        let state = conversations.entry(scope.to_string()).or_default();
+        state.last_active_at = Instant::now();
+
+        state.turns.push_back(ConversationTurn {
+            role: TurnRole::User,
+            content: user_turn.to_string(),
+        });
+        state.turns.push_back(ConversationTurn {
+            role: TurnRole::Assistant,
+            content: assistant_turn.to_string(),
+        });
+
+        while state.turns.len() > self.cfg.history_max_turns {
+            state.turns.pop_front();
+        }
+    }
+
+    fn prune_conversations(&self) {
+        let now = Instant::now();
+        let retention = Duration::from_secs(WECOM_CONVERSATION_TTL_SECS);
+        self.conversations
+            .lock()
+            .retain(|_, state| now.duration_since(state.last_active_at) <= retention);
+    }
+
+    fn clear_conversation(&self, scope: &str) {
+        self.conversations.lock().remove(scope);
+    }
+
+    // ── file cleanup ─────────────────────────────────────────────────
+
+    async fn maybe_cleanup_files(&self) {
+        self.prune_execution_locks();
+        self.prune_inflight_tasks();
+        self.prune_stream_states();
+        self.prune_conversations();
+
+        let now = Instant::now();
+        {
+            let mut last = self.last_cleanup.lock();
+            if now.duration_since(*last) < Duration::from_secs(WECOM_FILE_CLEANUP_INTERVAL_SECS) {
+                return;
+            }
+            *last = now;
+        }
+
+        let retention = Duration::from_secs((self.cfg.file_retention_days as u64) * 86_400);
+        let root = self.cfg.workspace_dir.join("wecom_files");
+        tokio::spawn(async move {
+            cleanup_inbox_files(root, retention).await;
+        });
+    }
+
+    // ── attachment handling ──────────────────────────────────────────
+
+    async fn materialize_quote_attachments(&self, inbound: &mut ParsedInbound) {
+        let quote_type = inbound
+            .raw_payload
+            .get("quote")
+            .and_then(|v| v.get("msgtype"))
+            .and_then(Value::as_str)
+            .map(str::trim)
             .unwrap_or("");
 
-        // Only handle content-bearing message types
-        if !matches!(msg_type, "text" | "voice" | "image" | "file" | "mixed") {
-            return Vec::new();
-        }
-
-        let content = extract_text_content(payload, msg_type);
-        if content.is_empty() {
-            return Vec::new();
-        }
-
-        let sender_userid = payload
-            .get("from")
-            .and_then(|v| v.get("userid"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-
-        if sender_userid.is_empty() {
-            return Vec::new();
-        }
-
-        let msg_id = payload
-            .get("msgid")
-            .and_then(|v| v.as_str())
-            .map(ToOwned::to_owned)
-            .unwrap_or_else(|| Uuid::new_v4().to_string());
-
-        let timestamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-
-        let chat_type = payload
-            .get("chattype")
-            .and_then(|v| v.as_str())
-            .unwrap_or("single");
-
-        let conversation_scope = if chat_type == "group" {
-            if let Some(chat_id) = payload.get("chatid").and_then(|v| v.as_str()) {
-                format!("group--{chat_id}")
-            } else {
-                format!("user--{sender_userid}")
+        if quote_type == "image" {
+            let quote_url = inbound
+                .raw_payload
+                .get("quote")
+                .and_then(|v| v.get("image"))
+                .and_then(|v| v.get("url"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+                .map(ToOwned::to_owned);
+            if let Some(url) = quote_url {
+                let marker = match self
+                    .download_and_store_attachment(&url, AttachmentKind::Image, inbound)
+                    .await
+                {
+                    Ok(value) => value,
+                    Err(err) => {
+                        log_attachment_processing_failure(
+                            "WeCom quote image processing failed",
+                            &err,
+                            inbound,
+                            AttachmentKind::Image,
+                            &url,
+                        );
+                        "[\u{5f15}\u{7528}\u{56fe}\u{7247}\u{4e0b}\u{8f7d}\u{5931}\u{8d25}]".to_string()
+                    }
+                };
+                if let Some(quote) = inbound.raw_payload.get_mut("quote") {
+                    quote["image"] = serde_json::json!({ "local_path": marker });
+                }
             }
-        } else {
-            format!("user--{sender_userid}")
-        };
+            return;
+        }
 
-        let content_preview: String = content.chars().take(80).collect();
-        tracing::info!(
-            "WeCom: received {} message from {} in {}, msg_id={}, len={}",
-            msg_type,
-            sender_userid,
-            conversation_scope,
-            msg_id,
-            content.len()
+        if quote_type == "file" {
+            let quote_url = inbound
+                .raw_payload
+                .get("quote")
+                .and_then(|v| v.get("file"))
+                .and_then(|v| v.get("url"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+                .map(ToOwned::to_owned);
+            if let Some(url) = quote_url {
+                let marker = match self
+                    .download_and_store_attachment(&url, AttachmentKind::File, inbound)
+                    .await
+                {
+                    Ok(value) => value,
+                    Err(err) => {
+                        log_attachment_processing_failure(
+                            "WeCom quote file processing failed",
+                            &err,
+                            inbound,
+                            AttachmentKind::File,
+                            &url,
+                        );
+                        "[\u{5f15}\u{7528}\u{6587}\u{4ef6}\u{4e0b}\u{8f7d}\u{5931}\u{8d25}]".to_string()
+                    }
+                };
+                if let Some(quote) = inbound.raw_payload.get_mut("quote") {
+                    quote["file"] = serde_json::json!({ "local_path": marker });
+                }
+            }
+            return;
+        }
+
+        if quote_type == "mixed" {
+            let quote_images: Vec<(usize, String)> = inbound
+                .raw_payload
+                .get("quote")
+                .and_then(|v| v.get("mixed"))
+                .and_then(|v| v.get("msg_item"))
+                .and_then(Value::as_array)
+                .map(|items| {
+                    items
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(idx, item)| {
+                            let item_type = item
+                                .get("msgtype")
+                                .and_then(Value::as_str)
+                                .unwrap_or_default();
+                            if item_type != "image" {
+                                return None;
+                            }
+                            item.get("image")
+                                .and_then(|v| v.get("url"))
+                                .and_then(Value::as_str)
+                                .map(str::trim)
+                                .filter(|v| !v.is_empty())
+                                .map(|url| (idx, url.to_string()))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+
+            if quote_images.is_empty() {
+                return;
+            }
+
+            let mut results: Vec<(usize, String)> = Vec::with_capacity(quote_images.len());
+            for (idx, url) in quote_images {
+                let marker = match self
+                    .download_and_store_attachment(&url, AttachmentKind::Image, inbound)
+                    .await
+                {
+                    Ok(value) => value,
+                    Err(err) => {
+                        log_attachment_processing_failure(
+                            "WeCom quote mixed image processing failed",
+                            &err,
+                            inbound,
+                            AttachmentKind::Image,
+                            &url,
+                        );
+                        "[\u{5f15}\u{7528}\u{56fe}\u{7247}\u{4e0b}\u{8f7d}\u{5931}\u{8d25}]".to_string()
+                    }
+                };
+                results.push((idx, marker));
+            }
+
+            if let Some(items) = inbound
+                .raw_payload
+                .get_mut("quote")
+                .and_then(|v| v.get_mut("mixed"))
+                .and_then(|v| v.get_mut("msg_item"))
+                .and_then(Value::as_array_mut)
+            {
+                for (idx, marker) in results {
+                    if let Some(item) = items.get_mut(idx) {
+                        item["image"] = serde_json::json!({ "local_path": marker });
+                    }
+                }
+            }
+        }
+    }
+
+    async fn normalize_message(&self, inbound: &ParsedInbound) -> NormalizedMessage {
+        match inbound.msg_type.as_str() {
+            "text" => {
+                let content = inbound
+                    .raw_payload
+                    .get("text")
+                    .and_then(|v| v.get("content"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .trim()
+                    .to_string();
+
+                if content.is_empty() {
+                    NormalizedMessage::Unsupported
+                } else {
+                    NormalizedMessage::Ready(content)
+                }
+            }
+            "voice" => {
+                let content = inbound
+                    .raw_payload
+                    .get("voice")
+                    .and_then(|v| v.get("content"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .trim()
+                    .to_string();
+
+                if content.is_empty() {
+                    NormalizedMessage::VoiceMissingTranscript
+                } else {
+                    NormalizedMessage::Ready(format!("[Voice transcript]\n{content}"))
+                }
+            }
+            "image" => {
+                let url = inbound
+                    .raw_payload
+                    .get("image")
+                    .and_then(|v| v.get("url"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .trim();
+
+                if url.is_empty() {
+                    return NormalizedMessage::Unsupported;
+                }
+
+                match self
+                    .download_and_store_attachment(url, AttachmentKind::Image, inbound)
+                    .await
+                {
+                    Ok(marker) => NormalizedMessage::Ready(marker),
+                    Err(err) => {
+                        log_attachment_processing_failure(
+                            "WeCom image processing failed",
+                            &err,
+                            inbound,
+                            AttachmentKind::Image,
+                            url,
+                        );
+                        NormalizedMessage::Ready(
+                            "[Image attachment processing failed; please continue without this image.]"
+                                .to_string(),
+                        )
+                    }
+                }
+            }
+            "file" => {
+                let url = inbound
+                    .raw_payload
+                    .get("file")
+                    .and_then(|v| v.get("url"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .trim();
+
+                if url.is_empty() {
+                    return NormalizedMessage::Unsupported;
+                }
+
+                match self
+                    .download_and_store_attachment(url, AttachmentKind::File, inbound)
+                    .await
+                {
+                    Ok(marker) => NormalizedMessage::Ready(marker),
+                    Err(err) => {
+                        log_attachment_processing_failure(
+                            "WeCom file processing failed",
+                            &err,
+                            inbound,
+                            AttachmentKind::File,
+                            url,
+                        );
+                        NormalizedMessage::Ready(
+                            "[File attachment processing failed; please continue without this file.]"
+                                .to_string(),
+                        )
+                    }
+                }
+            }
+            "mixed" => {
+                let mut text_parts = Vec::new();
+                if let Some(items) = inbound
+                    .raw_payload
+                    .get("mixed")
+                    .and_then(|v| v.get("msg_item"))
+                    .and_then(Value::as_array)
+                {
+                    for item in items {
+                        let item_type = item
+                            .get("msgtype")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default();
+                        if item_type == "text" {
+                            if let Some(text) = item
+                                .get("text")
+                                .and_then(|v| v.get("content"))
+                                .and_then(Value::as_str)
+                            {
+                                let trimmed = text.trim();
+                                if !trimmed.is_empty() {
+                                    text_parts.push(trimmed.to_string());
+                                }
+                            }
+                        } else if item_type == "image" {
+                            if let Some(url) = item
+                                .get("image")
+                                .and_then(|v| v.get("url"))
+                                .and_then(Value::as_str)
+                            {
+                                match self
+                                    .download_and_store_attachment(
+                                        url,
+                                        AttachmentKind::Image,
+                                        inbound,
+                                    )
+                                    .await
+                                {
+                                    Ok(marker) => text_parts.push(marker),
+                                    Err(err) => {
+                                        log_attachment_processing_failure(
+                                            "WeCom mixed image processing failed",
+                                            &err,
+                                            inbound,
+                                            AttachmentKind::Image,
+                                            url,
+                                        );
+                                        text_parts.push(
+                                            "[Image attachment processing failed in mixed message.]"
+                                                .to_string(),
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if text_parts.is_empty() {
+                    NormalizedMessage::Unsupported
+                } else {
+                    NormalizedMessage::Ready(text_parts.join("\n\n"))
+                }
+            }
+            other => {
+                tracing::info!(
+                    "[wecom] unsupported msg_type={other}, raw_payload={}",
+                    inbound.raw_payload
+                );
+                NormalizedMessage::Unsupported
+            }
+        }
+    }
+
+    async fn download_and_store_attachment(
+        &self,
+        url: &str,
+        kind: AttachmentKind,
+        inbound: &ParsedInbound,
+    ) -> Result<String> {
+        if self.cfg.max_file_size_bytes == 0 {
+            anyhow::bail!("WeCom max_file_size_bytes is zero");
+        }
+
+        let started = Instant::now();
+        let chat_id = inbound.chat_id.as_deref().unwrap_or("single");
+        let url_target = summarize_attachment_url_for_log(url);
+        tracing::debug!(
+            msg_id = %inbound.msg_id,
+            msg_type = %inbound.msg_type,
+            chat_type = %inbound.chat_type,
+            chat_id = %chat_id,
+            sender_userid = %inbound.sender_userid,
+            attachment_kind = %kind.as_str(),
+            url_target = %url_target,
+            timeout_secs = WECOM_HTTP_TIMEOUT_SECS,
+            "WeCom attachment download started"
         );
-        tracing::debug!("WeCom: content preview: {content_preview}");
 
-        vec![ChannelMessage {
-            id: msg_id,
-            sender: sender_userid,
-            reply_target: conversation_scope,
-            content,
-            channel: "wecom".to_string(),
-            timestamp,
-            thread_ts: None,
-        }]
+        let response = self
+            .client
+            .get(url)
+            .send()
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to download WeCom attachment: kind={} msg_id={} msg_type={} chat_type={} chat_id={} sender_userid={} url_target={} elapsed_ms={} timeout_secs={}",
+                    kind.as_str(),
+                    inbound.msg_id,
+                    inbound.msg_type,
+                    inbound.chat_type,
+                    chat_id,
+                    inbound.sender_userid,
+                    url_target,
+                    started.elapsed().as_millis(),
+                    WECOM_HTTP_TIMEOUT_SECS
+                )
+            })?;
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            let body_preview = truncate_for_log(&body, 512);
+            anyhow::bail!(
+                "WeCom attachment download failed: kind={} msg_id={} msg_type={} chat_type={} chat_id={} sender_userid={} url_target={} status={} elapsed_ms={} body_preview={}",
+                kind.as_str(),
+                inbound.msg_id,
+                inbound.msg_type,
+                inbound.chat_type,
+                chat_id,
+                inbound.sender_userid,
+                url_target,
+                status,
+                started.elapsed().as_millis(),
+                body_preview
+            );
+        }
+
+        if let Some(len) = response.content_length() {
+            if len > self.cfg.max_file_size_bytes {
+                tracing::warn!(
+                    msg_id = %inbound.msg_id,
+                    msg_type = %inbound.msg_type,
+                    chat_type = %inbound.chat_type,
+                    chat_id = %chat_id,
+                    sender_userid = %inbound.sender_userid,
+                    attachment_kind = %kind.as_str(),
+                    url_target = %url_target,
+                    declared_bytes = len,
+                    max_file_size_bytes = self.cfg.max_file_size_bytes,
+                    elapsed_ms = started.elapsed().as_millis(),
+                    "WeCom attachment skipped: declared size exceeds configured limit"
+                );
+                return Ok(format!(
+                    "[AttachmentTooLarge kind={:?} size={}B limit={}B]",
+                    kind, len, self.cfg.max_file_size_bytes
+                ));
+            }
+        }
+
+        let bytes = response
+            .bytes()
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to read WeCom attachment bytes: kind={} msg_id={} msg_type={} chat_type={} chat_id={} sender_userid={} url_target={} elapsed_ms={}",
+                    kind.as_str(),
+                    inbound.msg_id,
+                    inbound.msg_type,
+                    inbound.chat_type,
+                    chat_id,
+                    inbound.sender_userid,
+                    url_target,
+                    started.elapsed().as_millis()
+                )
+            })?;
+
+        if bytes.len() as u64 > self.cfg.max_file_size_bytes {
+            tracing::warn!(
+                msg_id = %inbound.msg_id,
+                msg_type = %inbound.msg_type,
+                chat_type = %inbound.chat_type,
+                chat_id = %chat_id,
+                sender_userid = %inbound.sender_userid,
+                attachment_kind = %kind.as_str(),
+                url_target = %url_target,
+                actual_bytes = bytes.len(),
+                max_file_size_bytes = self.cfg.max_file_size_bytes,
+                elapsed_ms = started.elapsed().as_millis(),
+                "WeCom attachment skipped: payload exceeds configured limit"
+            );
+            return Ok(format!(
+                "[AttachmentTooLarge kind={:?} size={}B limit={}B]",
+                kind,
+                bytes.len(),
+                self.cfg.max_file_size_bytes
+            ));
+        }
+
+        let decrypted = self.crypto.decrypt_file_payload(&bytes).with_context(|| {
+            format!(
+                "failed to decrypt WeCom attachment payload: kind={} msg_id={} msg_type={} chat_type={} chat_id={} sender_userid={} url_target={} encrypted_bytes={}",
+                kind.as_str(),
+                inbound.msg_id,
+                inbound.msg_type,
+                inbound.chat_type,
+                chat_id,
+                inbound.sender_userid,
+                url_target,
+                bytes.len()
+            )
+        })?;
+        let decrypted_len = decrypted.len();
+
+        let ext = match kind {
+            AttachmentKind::Image => "png",
+            AttachmentKind::File => "bin",
+        };
+        let safe_scope = normalize_scope_component(&format!(
+            "{}_{}",
+            inbound.chat_id.as_deref().unwrap_or("single"),
+            inbound.sender_userid
+        ));
+        let ts = bytes_timestamp_now();
+        let file_name = format!(
+            "{safe_scope}_{ts}_{}_{}.{}",
+            inbound.msg_id,
+            random_ascii_token(6),
+            ext
+        );
+
+        let dir = self.cfg.workspace_dir.join("wecom_files");
+        tokio::fs::create_dir_all(&dir).await.with_context(|| {
+            format!(
+                "failed to create WeCom inbox directory: msg_id={} path={}",
+                inbound.msg_id,
+                dir.display()
+            )
+        })?;
+        let path = dir.join(file_name);
+
+        tokio::fs::write(&path, decrypted).await.with_context(|| {
+            format!(
+                "failed to persist WeCom attachment: kind={} msg_id={} path={}",
+                kind.as_str(),
+                inbound.msg_id,
+                path.display()
+            )
+        })?;
+
+        self.maybe_cleanup_files().await;
+
+        let abs = path.canonicalize().unwrap_or(path);
+        tracing::debug!(
+            msg_id = %inbound.msg_id,
+            msg_type = %inbound.msg_type,
+            chat_type = %inbound.chat_type,
+            chat_id = %chat_id,
+            sender_userid = %inbound.sender_userid,
+            attachment_kind = %kind.as_str(),
+            url_target = %url_target,
+            encrypted_bytes = bytes.len(),
+            decrypted_bytes = decrypted_len,
+            local_path = %abs.display(),
+            elapsed_ms = started.elapsed().as_millis(),
+            "WeCom attachment download completed"
+        );
+        match kind {
+            AttachmentKind::Image => Ok(format!("[IMAGE:{}]", abs.display())),
+            AttachmentKind::File => Ok(format!("[Document: {}]", abs.display())),
+        }
+    }
+
+    // ── compose input ────────────────────────────────────────────────
+
+    fn compose_input(
+        &self,
+        inbound: &ParsedInbound,
+        scopes: &ScopeDecision,
+        normalized: &str,
+        _prior: &ConversationState,
+    ) -> ComposedInput {
+        let mut blocks: Vec<String> = Vec::new();
+        let include_sender_in_static = !scopes.shared_group_history;
+        let quote_context = extract_quote_context(&inbound.raw_payload);
+
+        blocks.push(wecom_static_context(
+            inbound,
+            scopes,
+            include_sender_in_static,
+        ));
+
+        if scopes.shared_group_history {
+            blocks.push(format!(
+                "[sender_userid={}] {}",
+                inbound.sender_userid, normalized
+            ));
+        } else {
+            blocks.push(normalized.to_string());
+        }
+
+        if let Some(quote) = quote_context.as_deref() {
+            let last = blocks.pop().unwrap();
+            blocks.push(quote.to_string());
+            blocks.push(last);
+        }
+
+        let mut user_turn_for_history = normalized.to_string();
+        if let Some(quote) = quote_context.as_deref() {
+            user_turn_for_history = format!("{quote}\n{user_turn_for_history}");
+        }
+        if scopes.shared_group_history {
+            user_turn_for_history =
+                format!("[{}] {}", inbound.sender_userid, user_turn_for_history);
+        }
+
+        let payload = blocks.join("\n\n");
+        ComposedInput {
+            user_message_for_model: payload,
+            user_turn_for_history,
+        }
+    }
+
+    // ── outbound send helpers ────────────────────────────────────────
+
+    async fn send_markdown_to_url(&self, url: &str, content: &str) -> Result<()> {
+        let payload = serde_json::json!({
+            "msgtype": "markdown",
+            "markdown": {
+                "content": content,
+            }
+        });
+
+        let response = self
+            .send_client
+            .post(url)
+            .json(&payload)
+            .send()
+            .await
+            .context("failed to send WeCom markdown")?;
+
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        if !status.is_success() {
+            anyhow::bail!("WeCom markdown send failed: status={} body={body}", status);
+        }
+        if let Err(err) = parse_wecom_business_response(&body) {
+            anyhow::bail!("WeCom markdown send business failed: {err}; body={body}");
+        }
+
+        Ok(())
     }
 
     /// Look up a scope-specific push webhook URL from memory.
@@ -216,8 +1404,8 @@ impl WeComChannel {
         }
     }
 
-    /// Send markdown content to a WeCom group-bot webhook URL.
-    async fn send_to_url(&self, url: &str, content: &str) -> anyhow::Result<()> {
+    /// Send content to a WeCom group-bot webhook URL (used by send()).
+    async fn send_to_url(&self, url: &str, content: &str) -> Result<()> {
         let payload = serde_json::json!({
             "msgtype": "markdown",
             "markdown": {
@@ -225,16 +1413,15 @@ impl WeComChannel {
             }
         });
 
-        let resp = self.client.post(url).json(&payload).send().await?;
+        let resp = self.send_client.post(url).json(&payload).send().await?;
 
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
         if !status.is_success() {
-            anyhow::bail!("WeCom webhook send failed: {status} — {body}");
+            anyhow::bail!("WeCom webhook send failed: {status} \u{2014} {body}");
         }
 
-        // Check WeCom business-level error
-        if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&body) {
+        if let Ok(parsed) = serde_json::from_str::<Value>(&body) {
             if let Some(errcode) = parsed.get("errcode").and_then(|v| v.as_i64()) {
                 if errcode != 0 {
                     let errmsg = parsed
@@ -250,7 +1437,1303 @@ impl WeComChannel {
 
         Ok(())
     }
+
+    // ── encrypt helpers ──────────────────────────────────────────────
+
+    fn encrypt_passive_stream_reply(
+        &self,
+        query: &WeComCallbackQuery,
+        stream_id: &str,
+        content: &str,
+        finish: bool,
+        images: &[StreamImageItem],
+    ) -> Result<String> {
+        let timestamp = reply_timestamp(query);
+        let nonce = reply_nonce(query);
+        let payload = make_stream_payload(stream_id, content, finish, images);
+        self.crypto
+            .encrypt_json_ciphertext(&payload.to_string(), &nonce, &timestamp, "")
+    }
+
+    fn encrypt_passive_text_reply(
+        &self,
+        query: &WeComCallbackQuery,
+        content: &str,
+    ) -> Result<String> {
+        let timestamp = reply_timestamp(query);
+        let nonce = reply_nonce(query);
+        let payload = make_text_payload(content);
+        self.crypto
+            .encrypt_json_ciphertext(&payload.to_string(), &nonce, &timestamp, "")
+    }
+
+    // ── handle_callback (main routing) ───────────────────────────────
+
+    async fn handle_callback(&self, req: WeComInboundRequest) {
+        let query = req.query;
+        let body = req.body;
+        let reply_tx = req.reply_tx;
+
+        // Verification request (echostr present)
+        if let Some(echostr) = query.echostr.as_deref() {
+            tracing::info!("WeCom: received URL verification request");
+            if !self.crypto.verify_signature(
+                &query.msg_signature,
+                &query.timestamp,
+                &query.nonce,
+                echostr,
+            ) {
+                let _ = reply_tx.send(WeComInboundResponse {
+                    status_code: 401,
+                    body: r#"{"error":"invalid signature"}"#.to_string(),
+                });
+                return;
+            }
+            tracing::info!("WeCom: signature verified for URL verification");
+
+            match self.crypto.decrypt_json_ciphertext(echostr, "") {
+                Ok(plain) => {
+                    let _ = reply_tx.send(WeComInboundResponse {
+                        status_code: 200,
+                        body: plain,
+                    });
+                }
+                Err(err) => {
+                    tracing::warn!("WeCom URL verify decrypt failed: {err}");
+                    let _ = reply_tx.send(WeComInboundResponse {
+                        status_code: 400,
+                        body: r#"{"error":"decrypt failed"}"#.to_string(),
+                    });
+                }
+            }
+            return;
+        }
+
+        // Parse encrypted envelope
+        let envelope = match serde_json::from_slice::<WeComEncryptedEnvelope>(&body) {
+            Ok(value) => value,
+            Err(_) => {
+                let _ = reply_tx.send(WeComInboundResponse {
+                    status_code: 400,
+                    body: r#"{"error":"invalid encrypted payload"}"#.to_string(),
+                });
+                return;
+            }
+        };
+
+        // Verify signature
+        if !self.crypto.verify_signature(
+            &query.msg_signature,
+            &query.timestamp,
+            &query.nonce,
+            &envelope.encrypt,
+        ) {
+            let _ = reply_tx.send(WeComInboundResponse {
+                status_code: 401,
+                body: r#"{"error":"invalid signature"}"#.to_string(),
+            });
+            return;
+        }
+        tracing::debug!("WeCom: callback signature verified");
+
+        // Decrypt
+        let plaintext = match self
+            .crypto
+            .decrypt_json_ciphertext(&envelope.encrypt, "")
+        {
+            Ok(value) => value,
+            Err(err) => {
+                tracing::warn!("WeCom callback decrypt failed: {err}");
+                let _ = reply_tx.send(WeComInboundResponse {
+                    status_code: 400,
+                    body: r#"{"error":"decrypt failed"}"#.to_string(),
+                });
+                return;
+            }
+        };
+        tracing::debug!("WeCom: callback decrypted successfully");
+
+        // Parse JSON payload
+        let payload: Value = match serde_json::from_str(&plaintext) {
+            Ok(value) => value,
+            Err(_) => {
+                let _ = reply_tx.send(WeComInboundResponse {
+                    status_code: 400,
+                    body: r#"{"error":"invalid callback json"}"#.to_string(),
+                });
+                return;
+            }
+        };
+
+        // Parse inbound
+        let parsed = match parse_inbound_payload(payload) {
+            Ok(value) => value,
+            Err(err) => {
+                tracing::warn!("WeCom callback parse failed: {err}");
+                let _ = reply_tx.send(WeComInboundResponse {
+                    status_code: 200,
+                    body: "success".to_string(),
+                });
+                return;
+            }
+        };
+
+        // Idempotency check
+        if parsed.msg_type != "stream" && !parsed.msg_id.is_empty() {
+            let key = format!("wecom_msg_{}", parsed.msg_id);
+            if !self.idempotency.record_if_new(&key) {
+                let _ = reply_tx.send(WeComInboundResponse {
+                    status_code: 200,
+                    body: "success".to_string(),
+                });
+                return;
+            }
+        }
+
+        let scopes = compute_scopes(&self.cfg, &parsed);
+
+        // Log inbound info
+        if parsed.msg_type != "stream" && parsed.msg_type != "event" {
+            let preview = crate::util::truncate_with_ellipsis(&inbound_content_preview(&parsed), 80);
+            let msg_id = if parsed.msg_id.trim().is_empty() {
+                "-"
+            } else {
+                parsed.msg_id.as_str()
+            };
+            tracing::info!(
+                "[wecom] from {} in {}: {} (msg_type={}, msg_id={})",
+                parsed.sender_userid,
+                scopes.conversation_scope,
+                preview,
+                parsed.msg_type,
+                msg_id
+            );
+        }
+
+        // Cache response_url
+        self.cache_response_url(
+            &scopes.conversation_scope,
+            &parsed.msg_id,
+            parsed.response_url.as_deref(),
+        );
+
+        self.maybe_cleanup_files().await;
+
+        // ── Route by msg_type ────────────────────────────────────────
+
+        // Stream refresh
+        if parsed.msg_type == "stream" {
+            tracing::debug!("WeCom: routing as stream refresh callback");
+            let stream_id = parse_stream_id(&parsed.raw_payload).unwrap_or_else(next_stream_id);
+            let state_snapshot = self.get_stream_state(&stream_id);
+            let (content, finish, images) = if let Some(snapshot) = state_snapshot {
+                tracing::debug!(
+                    "WeCom stream refresh hit: stream_id={} scope={} exec_scope={} finish={} owner={}",
+                    stream_id,
+                    snapshot.conversation_scope,
+                    snapshot.execution_scope,
+                    snapshot.finish,
+                    snapshot.owner_msg_id
+                );
+                (snapshot.content, snapshot.finish, snapshot.images)
+            } else {
+                ("\u{4efb}\u{52a1}\u{5df2}\u{7ed3}\u{675f}\u{6216}\u{4e0d}\u{5b58}\u{5728}\u{3002}".to_string(), true, Vec::new())
+            };
+            let resp = match self.encrypt_passive_stream_reply(&query, &stream_id, &content, finish, &images) {
+                Ok(r) => WeComInboundResponse { status_code: 200, body: r },
+                Err(err) => {
+                    tracing::error!("WeCom stream refresh encrypt failed: {err:#}");
+                    WeComInboundResponse { status_code: 200, body: "success".to_string() }
+                }
+            };
+            let _ = reply_tx.send(resp);
+            return;
+        }
+
+        // Event handling
+        if parsed.msg_type == "event" {
+            tracing::debug!("WeCom: routing as event callback");
+            let event_type =
+                parse_event_type(&parsed.raw_payload).unwrap_or_else(|| "unknown".to_string());
+            if event_type == "enter_chat" {
+                let content = format!("\u{4f60}\u{597d}\u{ff0c}\u{6b22}\u{8fce}\u{6765}\u{627e}\u{6211}\u{804a}\u{5929} {}", random_emoji());
+                let resp = match self.encrypt_passive_text_reply(&query, &content) {
+                    Ok(r) => WeComInboundResponse { status_code: 200, body: r },
+                    Err(err) => {
+                        tracing::error!("WeCom enter_chat reply encrypt failed: {err:#}");
+                        WeComInboundResponse { status_code: 200, body: "success".to_string() }
+                    }
+                };
+                let _ = reply_tx.send(resp);
+                return;
+            }
+            if event_type == "template_card_event" {
+                let event_key = extract_template_card_event_key(&parsed.raw_payload)
+                    .unwrap_or_else(|| "-".to_string());
+                tracing::info!(
+                    "WeCom template_card_event received: msg_id={} event_key={}",
+                    parsed.msg_id,
+                    event_key
+                );
+                let _ = reply_tx.send(WeComInboundResponse {
+                    status_code: 200,
+                    body: "success".to_string(),
+                });
+                return;
+            }
+            if event_type == "feedback_event" {
+                let summary = extract_feedback_event_summary(&parsed.raw_payload)
+                    .unwrap_or_else(|| "feedback=invalid-payload".to_string());
+                tracing::info!(
+                    "WeCom feedback_event received: msg_id={} {}",
+                    parsed.msg_id,
+                    summary
+                );
+                let _ = reply_tx.send(WeComInboundResponse {
+                    status_code: 200,
+                    body: "success".to_string(),
+                });
+                return;
+            }
+
+            tracing::info!(
+                "WeCom event ignored: event_type={} msg_id={}",
+                event_type,
+                parsed.msg_id
+            );
+            let _ = reply_tx.send(WeComInboundResponse {
+                status_code: 200,
+                body: "success".to_string(),
+            });
+            return;
+        }
+
+        // Unsupported message type
+        if !is_model_supported_msgtype(&parsed.msg_type) {
+            tracing::info!(
+                "WeCom unsupported message ignored: msg_type={} msg_id={}",
+                parsed.msg_type,
+                parsed.msg_id
+            );
+            let _ = reply_tx.send(WeComInboundResponse {
+                status_code: 200,
+                body: "success".to_string(),
+            });
+            return;
+        }
+
+        // ── Normal message processing ────────────────────────────────
+
+        let stop_text = extract_stop_signal_text(&parsed).unwrap_or_default();
+
+        // Clear session
+        if is_clear_session_command(&stop_text) {
+            if self.is_execution_locked(&scopes.execution_scope) {
+                if let Some(stream_id) = self.current_stream_id_for_scope(&scopes.execution_scope) {
+                    self.update_stream_state_content(&stream_id, "\u{4f1a}\u{8bdd}\u{5df2}\u{6e05}\u{9664}", true);
+                }
+                self.abort_inflight_task(&scopes.execution_scope);
+                self.force_release_execution_lock(&scopes.execution_scope);
+            }
+            self.clear_conversation(&scopes.conversation_scope);
+            let msg = "\u{4f1a}\u{8bdd}\u{5df2}\u{6e05}\u{9664}\u{ff0c}\u{5f00}\u{59cb}\u{65b0}\u{5bf9}\u{8bdd}\u{3002}";
+            let clear_stream = next_stream_id();
+            self.upsert_stream_state(
+                &clear_stream,
+                &scopes.execution_scope,
+                &scopes.conversation_scope,
+                &parsed.msg_id,
+                msg,
+                true,
+                Vec::new(),
+            );
+            tracing::info!(
+                "WeCom session cleared: scope={} msg_id={}",
+                scopes.conversation_scope,
+                parsed.msg_id
+            );
+            let resp = match self.encrypt_passive_stream_reply(&query, &clear_stream, msg, true, &[]) {
+                Ok(r) => WeComInboundResponse { status_code: 200, body: r },
+                Err(err) => {
+                    tracing::error!("WeCom clear-session reply encrypt failed: {err:#}");
+                    WeComInboundResponse { status_code: 200, body: "success".to_string() }
+                }
+            };
+            let _ = reply_tx.send(resp);
+            return;
+        }
+
+        // Execution locked — stop or busy
+        if self.is_execution_locked(&scopes.execution_scope) {
+            if contains_stop_command(&stop_text) {
+                let stopped = "\u{5df2}\u{505c}\u{6b62}\u{5f53}\u{524d}\u{6d88}\u{606f}\u{5904}\u{7406}\u{3002}";
+                if let Some(stream_id) = self.current_stream_id_for_scope(&scopes.execution_scope) {
+                    self.update_stream_state_content(&stream_id, stopped, true);
+                }
+                self.abort_inflight_task(&scopes.execution_scope);
+                self.force_release_execution_lock(&scopes.execution_scope);
+
+                let stop_reply_stream = next_stream_id();
+                self.upsert_stream_state(
+                    &stop_reply_stream,
+                    &scopes.execution_scope,
+                    &scopes.conversation_scope,
+                    &parsed.msg_id,
+                    stopped,
+                    true,
+                    Vec::new(),
+                );
+                let resp = match self.encrypt_passive_stream_reply(&query, &stop_reply_stream, stopped, true, &[]) {
+                    Ok(r) => WeComInboundResponse { status_code: 200, body: r },
+                    Err(err) => {
+                        tracing::error!("WeCom stop reply encrypt failed: {err:#}");
+                        WeComInboundResponse { status_code: 200, body: "success".to_string() }
+                    }
+                };
+                let _ = reply_tx.send(resp);
+                return;
+            }
+
+            let busy = format!(
+                "\u{6709}\u{6d88}\u{606f}\u{6b63}\u{5728}\u{5904}\u{7406}\u{4e2d}\u{ff0c}\u{4f46}\u{662f}\u{591a}\u{4e86}\u{4e00}\u{6b21}\u{56de}\u{590d}\u{673a}\u{4f1a}\u{ff01}\u{5982}\u{679c}\u{9700}\u{8981}\u{505c}\u{6b62}\u{5f53}\u{524d}\u{6d88}\u{606f}\u{5904}\u{7406}\u{ff0c}\u{8bf7}\u{53d1}\u{9001}\u{505c}\u{6b62}\u{6216}\u{8005}stop\u{3002}{}",
+                random_emoji()
+            );
+            let busy_stream = next_stream_id();
+            self.upsert_stream_state(
+                &busy_stream,
+                &scopes.execution_scope,
+                &scopes.conversation_scope,
+                &parsed.msg_id,
+                &busy,
+                true,
+                Vec::new(),
+            );
+            let resp = match self.encrypt_passive_stream_reply(&query, &busy_stream, &busy, true, &[]) {
+                Ok(r) => WeComInboundResponse { status_code: 200, body: r },
+                Err(err) => {
+                    tracing::error!("WeCom busy reply encrypt failed: {err:#}");
+                    WeComInboundResponse { status_code: 200, body: "success".to_string() }
+                }
+            };
+            let _ = reply_tx.send(resp);
+            return;
+        }
+
+        // Voice without transcript
+        if is_voice_without_transcript(&parsed) {
+            let msg = format!("\u{6211}\u{73b0}\u{5728}\u{65e0}\u{6cd5}\u{5904}\u{7406}\u{8bed}\u{97f3}\u{6d88}\u{606f} {}", random_emoji());
+            let stream_id = next_stream_id();
+            self.upsert_stream_state(
+                &stream_id,
+                &scopes.execution_scope,
+                &scopes.conversation_scope,
+                &parsed.msg_id,
+                &msg,
+                true,
+                Vec::new(),
+            );
+            let resp = match self.encrypt_passive_stream_reply(&query, &stream_id, &msg, true, &[]) {
+                Ok(r) => WeComInboundResponse { status_code: 200, body: r },
+                Err(err) => {
+                    tracing::error!("WeCom voice fallback encrypt failed: {err:#}");
+                    WeComInboundResponse { status_code: 200, body: "success".to_string() }
+                }
+            };
+            let _ = reply_tx.send(resp);
+            return;
+        }
+
+        // Acquire execution lock
+        let stream_id = next_stream_id();
+        if !self.try_acquire_execution_lock(&scopes.execution_scope, &parsed.msg_id, &stream_id) {
+            let busy = format!(
+                "\u{6709}\u{6d88}\u{606f}\u{6b63}\u{5728}\u{5904}\u{7406}\u{4e2d}\u{ff0c}\u{4f46}\u{662f}\u{591a}\u{4e86}\u{4e00}\u{6b21}\u{56de}\u{590d}\u{673a}\u{4f1a}\u{ff01}\u{5982}\u{679c}\u{9700}\u{8981}\u{505c}\u{6b62}\u{5f53}\u{524d}\u{6d88}\u{606f}\u{5904}\u{7406}\u{ff0c}\u{8bf7}\u{53d1}\u{9001}\u{505c}\u{6b62}\u{6216}\u{8005}stop\u{3002}{}",
+                random_emoji()
+            );
+            let busy_stream = next_stream_id();
+            self.upsert_stream_state(
+                &busy_stream,
+                &scopes.execution_scope,
+                &scopes.conversation_scope,
+                &parsed.msg_id,
+                &busy,
+                true,
+                Vec::new(),
+            );
+            let resp = match self.encrypt_passive_stream_reply(&query, &busy_stream, &busy, true, &[]) {
+                Ok(r) => WeComInboundResponse { status_code: 200, body: r },
+                Err(err) => {
+                    tracing::error!("WeCom race-busy reply encrypt failed: {err:#}");
+                    WeComInboundResponse { status_code: 200, body: "success".to_string() }
+                }
+            };
+            let _ = reply_tx.send(resp);
+            return;
+        }
+
+        // Bootstrap stream state
+        self.upsert_stream_state(
+            &stream_id,
+            &scopes.execution_scope,
+            &scopes.conversation_scope,
+            &parsed.msg_id,
+            WECOM_STREAM_BOOTSTRAP_CONTENT,
+            false,
+            Vec::new(),
+        );
+
+        // Reply immediately with bootstrap stream
+        let resp = match self.encrypt_passive_stream_reply(
+            &query,
+            &stream_id,
+            WECOM_STREAM_BOOTSTRAP_CONTENT,
+            false,
+            &[],
+        ) {
+            Ok(r) => WeComInboundResponse { status_code: 200, body: r },
+            Err(err) => {
+                tracing::error!("WeCom bootstrap stream encrypt failed: {err:#}");
+                WeComInboundResponse { status_code: 200, body: "success".to_string() }
+            }
+        };
+        let _ = reply_tx.send(resp);
+
+        // Spawn async LLM processing task
+        // Save values needed after the move into the spawn closure.
+        let exec_scope_for_register = scopes.execution_scope.clone();
+        let msg_id_for_register = parsed.msg_id.clone();
+        let stream_id_for_register = stream_id.clone();
+
+        tracing::info!(
+            "WeCom: spawning LLM processing task for msg_id={} stream_id={} scope={}",
+            msg_id_for_register, stream_id_for_register, scopes.conversation_scope
+        );
+
+        // Clone individual fields for the spawned task (can't get Arc<Self> from &self).
+        let cfg = self.cfg.clone();
+        let crypto = self.crypto.clone();
+        let client = self.client.clone();
+        let send_client = self.send_client.clone();
+        let agent_config = self.agent_config.clone();
+        let memory = self.memory.clone();
+        let fallback_webhook_url = self.fallback_webhook_url.clone();
+        let response_urls = self.response_urls.clone();
+        let cache_config = self.cache_config.clone();
+        let execution_locks = self.execution_locks.clone();
+        let inflight_tasks = self.inflight_tasks.clone();
+        let stream_states = self.stream_states.clone();
+        let conversations = self.conversations.clone();
+        let last_cleanup = self.last_cleanup.clone();
+
+        let handle = tokio::spawn(async move {
+            let channel_ref = ChannelRef {
+                cfg,
+                crypto,
+                client,
+                send_client,
+                agent_config,
+                memory,
+                fallback_webhook_url,
+                response_urls,
+                cache_config,
+                execution_locks,
+                inflight_tasks,
+                stream_states,
+                conversations,
+                last_cleanup,
+            };
+            channel_ref.process_inbound_message(parsed, scopes, stream_id).await;
+        });
+
+        self.register_inflight_task(&exec_scope_for_register, &msg_id_for_register, &stream_id_for_register, handle);
+    }
 }
+
+// ── ChannelRef — cloned state for spawned tasks ──────────────────────
+
+/// Holds cloned references to WeComChannel state for use in spawned tasks.
+/// This avoids needing `Arc<WeComChannel>` while keeping the same API surface
+/// for methods that operate on shared state.
+struct ChannelRef {
+    cfg: WeComRuntimeConfig,
+    crypto: WeComCrypto,
+    client: reqwest::Client,
+    send_client: reqwest::Client,
+    agent_config: Arc<Mutex<Config>>,
+    memory: Arc<dyn Memory>,
+    fallback_webhook_url: Option<String>,
+    response_urls: Arc<Mutex<HashMap<String, VecDeque<ResponseUrlEntry>>>>,
+    cache_config: ResponseUrlCacheConfig,
+    execution_locks: Arc<Mutex<HashMap<String, ExecutionLockEntry>>>,
+    #[allow(dead_code)]
+    inflight_tasks: Arc<Mutex<HashMap<String, InflightTaskEntry>>>,
+    stream_states: Arc<Mutex<HashMap<String, StreamState>>>,
+    conversations: Arc<Mutex<HashMap<String, ConversationState>>>,
+    last_cleanup: Arc<Mutex<Instant>>,
+}
+
+impl ChannelRef {
+    fn update_stream_state_content(&self, stream_id: &str, content: &str, finish: bool) {
+        let mut states = self.stream_states.lock();
+        if let Some(state) = states.get_mut(stream_id) {
+            state.content = normalize_stream_content(content);
+            state.finish = finish;
+            state.images = Vec::new();
+            state.expires_at = Instant::now() + Duration::from_secs(WECOM_STREAM_STATE_TTL_SECS);
+        }
+    }
+
+    fn update_stream_state_with_images(
+        &self,
+        stream_id: &str,
+        content: &str,
+        finish: bool,
+        images: Vec<StreamImageItem>,
+    ) {
+        let mut states = self.stream_states.lock();
+        if let Some(state) = states.get_mut(stream_id) {
+            state.content = normalize_stream_content(content);
+            state.finish = finish;
+            state.images = images;
+            state.expires_at = Instant::now() + Duration::from_secs(WECOM_STREAM_STATE_TTL_SECS);
+        }
+    }
+
+    fn snapshot_conversation(&self, scope: &str) -> ConversationState {
+        let mut conversations = self.conversations.lock();
+        if let Some(state) = conversations.get_mut(scope) {
+            state.last_active_at = Instant::now();
+            return state.clone();
+        }
+        ConversationState::default()
+    }
+
+    fn upsert_conversation(&self, scope: &str, user_turn: &str, assistant_turn: &str) {
+        let mut conversations = self.conversations.lock();
+        let state = conversations.entry(scope.to_string()).or_default();
+        state.last_active_at = Instant::now();
+
+        state.turns.push_back(ConversationTurn {
+            role: TurnRole::User,
+            content: user_turn.to_string(),
+        });
+        state.turns.push_back(ConversationTurn {
+            role: TurnRole::Assistant,
+            content: assistant_turn.to_string(),
+        });
+
+        while state.turns.len() > self.cfg.history_max_turns {
+            state.turns.pop_front();
+        }
+    }
+
+    fn release_execution_lock(&self, execution_scope: &str, msg_id: &str) {
+        let mut locks = self.execution_locks.lock();
+        if locks
+            .get(execution_scope)
+            .is_some_and(|lock| lock.owner_msg_id == msg_id)
+        {
+            locks.remove(execution_scope);
+            tracing::info!(
+                "WeCom: released execution lock for scope={} msg_id={}",
+                execution_scope, msg_id
+            );
+        }
+    }
+
+    fn clear_inflight_task_if_owner(&self, execution_scope: &str, owner_msg_id: &str) {
+        let mut inflight = self.inflight_tasks.lock();
+        if inflight
+            .get(execution_scope)
+            .is_some_and(|entry| entry.owner_msg_id == owner_msg_id)
+        {
+            inflight.remove(execution_scope);
+        }
+    }
+
+    async fn maybe_cleanup_files(&self) {
+        let now = Instant::now();
+        {
+            let mut last = self.last_cleanup.lock();
+            if now.duration_since(*last) < Duration::from_secs(WECOM_FILE_CLEANUP_INTERVAL_SECS) {
+                return;
+            }
+            *last = now;
+        }
+        let retention = Duration::from_secs((self.cfg.file_retention_days as u64) * 86_400);
+        let root = self.cfg.workspace_dir.join("wecom_files");
+        tokio::spawn(async move {
+            cleanup_inbox_files(root, retention).await;
+        });
+    }
+
+    async fn materialize_quote_attachments(&self, inbound: &mut ParsedInbound) {
+        let quote_type = inbound
+            .raw_payload
+            .get("quote")
+            .and_then(|v| v.get("msgtype"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .unwrap_or("");
+
+        if quote_type == "image" {
+            let quote_url = inbound
+                .raw_payload
+                .get("quote")
+                .and_then(|v| v.get("image"))
+                .and_then(|v| v.get("url"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+                .map(ToOwned::to_owned);
+            if let Some(url) = quote_url {
+                let marker = match self
+                    .download_and_store_attachment(&url, AttachmentKind::Image, inbound)
+                    .await
+                {
+                    Ok(value) => value,
+                    Err(err) => {
+                        log_attachment_processing_failure(
+                            "WeCom quote image processing failed",
+                            &err,
+                            inbound,
+                            AttachmentKind::Image,
+                            &url,
+                        );
+                        "[\u{5f15}\u{7528}\u{56fe}\u{7247}\u{4e0b}\u{8f7d}\u{5931}\u{8d25}]".to_string()
+                    }
+                };
+                if let Some(quote) = inbound.raw_payload.get_mut("quote") {
+                    quote["image"] = serde_json::json!({ "local_path": marker });
+                }
+            }
+            return;
+        }
+
+        if quote_type == "file" {
+            let quote_url = inbound
+                .raw_payload
+                .get("quote")
+                .and_then(|v| v.get("file"))
+                .and_then(|v| v.get("url"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+                .map(ToOwned::to_owned);
+            if let Some(url) = quote_url {
+                let marker = match self
+                    .download_and_store_attachment(&url, AttachmentKind::File, inbound)
+                    .await
+                {
+                    Ok(value) => value,
+                    Err(err) => {
+                        log_attachment_processing_failure(
+                            "WeCom quote file processing failed",
+                            &err,
+                            inbound,
+                            AttachmentKind::File,
+                            &url,
+                        );
+                        "[\u{5f15}\u{7528}\u{6587}\u{4ef6}\u{4e0b}\u{8f7d}\u{5931}\u{8d25}]".to_string()
+                    }
+                };
+                if let Some(quote) = inbound.raw_payload.get_mut("quote") {
+                    quote["file"] = serde_json::json!({ "local_path": marker });
+                }
+            }
+            return;
+        }
+
+        if quote_type == "mixed" {
+            let quote_images: Vec<(usize, String)> = inbound
+                .raw_payload
+                .get("quote")
+                .and_then(|v| v.get("mixed"))
+                .and_then(|v| v.get("msg_item"))
+                .and_then(Value::as_array)
+                .map(|items| {
+                    items
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(idx, item)| {
+                            let item_type = item
+                                .get("msgtype")
+                                .and_then(Value::as_str)
+                                .unwrap_or_default();
+                            if item_type != "image" {
+                                return None;
+                            }
+                            item.get("image")
+                                .and_then(|v| v.get("url"))
+                                .and_then(Value::as_str)
+                                .map(str::trim)
+                                .filter(|v| !v.is_empty())
+                                .map(|url| (idx, url.to_string()))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+
+            if quote_images.is_empty() {
+                return;
+            }
+
+            let mut results: Vec<(usize, String)> = Vec::with_capacity(quote_images.len());
+            for (idx, url) in quote_images {
+                let marker = match self
+                    .download_and_store_attachment(&url, AttachmentKind::Image, inbound)
+                    .await
+                {
+                    Ok(value) => value,
+                    Err(err) => {
+                        log_attachment_processing_failure(
+                            "WeCom quote mixed image processing failed",
+                            &err,
+                            inbound,
+                            AttachmentKind::Image,
+                            &url,
+                        );
+                        "[\u{5f15}\u{7528}\u{56fe}\u{7247}\u{4e0b}\u{8f7d}\u{5931}\u{8d25}]".to_string()
+                    }
+                };
+                results.push((idx, marker));
+            }
+
+            if let Some(items) = inbound
+                .raw_payload
+                .get_mut("quote")
+                .and_then(|v| v.get_mut("mixed"))
+                .and_then(|v| v.get_mut("msg_item"))
+                .and_then(Value::as_array_mut)
+            {
+                for (idx, marker) in results {
+                    if let Some(item) = items.get_mut(idx) {
+                        item["image"] = serde_json::json!({ "local_path": marker });
+                    }
+                }
+            }
+        }
+    }
+
+    async fn normalize_message(&self, inbound: &ParsedInbound) -> NormalizedMessage {
+        match inbound.msg_type.as_str() {
+            "text" => {
+                let content = inbound
+                    .raw_payload
+                    .get("text")
+                    .and_then(|v| v.get("content"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .trim()
+                    .to_string();
+                if content.is_empty() {
+                    NormalizedMessage::Unsupported
+                } else {
+                    NormalizedMessage::Ready(content)
+                }
+            }
+            "voice" => {
+                let content = inbound
+                    .raw_payload
+                    .get("voice")
+                    .and_then(|v| v.get("content"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .trim()
+                    .to_string();
+                if content.is_empty() {
+                    NormalizedMessage::VoiceMissingTranscript
+                } else {
+                    NormalizedMessage::Ready(format!("[Voice transcript]\n{content}"))
+                }
+            }
+            "image" => {
+                let url = inbound
+                    .raw_payload
+                    .get("image")
+                    .and_then(|v| v.get("url"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .trim();
+                if url.is_empty() {
+                    return NormalizedMessage::Unsupported;
+                }
+                match self
+                    .download_and_store_attachment(url, AttachmentKind::Image, inbound)
+                    .await
+                {
+                    Ok(marker) => NormalizedMessage::Ready(marker),
+                    Err(err) => {
+                        log_attachment_processing_failure("WeCom image processing failed", &err, inbound, AttachmentKind::Image, url);
+                        NormalizedMessage::Ready("[Image attachment processing failed; please continue without this image.]".to_string())
+                    }
+                }
+            }
+            "file" => {
+                let url = inbound
+                    .raw_payload
+                    .get("file")
+                    .and_then(|v| v.get("url"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .trim();
+                if url.is_empty() {
+                    return NormalizedMessage::Unsupported;
+                }
+                match self
+                    .download_and_store_attachment(url, AttachmentKind::File, inbound)
+                    .await
+                {
+                    Ok(marker) => NormalizedMessage::Ready(marker),
+                    Err(err) => {
+                        log_attachment_processing_failure("WeCom file processing failed", &err, inbound, AttachmentKind::File, url);
+                        NormalizedMessage::Ready("[File attachment processing failed; please continue without this file.]".to_string())
+                    }
+                }
+            }
+            "mixed" => {
+                let mut text_parts = Vec::new();
+                if let Some(items) = inbound.raw_payload.get("mixed").and_then(|v| v.get("msg_item")).and_then(Value::as_array) {
+                    for item in items {
+                        let item_type = item.get("msgtype").and_then(Value::as_str).unwrap_or_default();
+                        if item_type == "text" {
+                            if let Some(text) = item.get("text").and_then(|v| v.get("content")).and_then(Value::as_str) {
+                                let trimmed = text.trim();
+                                if !trimmed.is_empty() {
+                                    text_parts.push(trimmed.to_string());
+                                }
+                            }
+                        } else if item_type == "image" {
+                            if let Some(url) = item.get("image").and_then(|v| v.get("url")).and_then(Value::as_str) {
+                                match self.download_and_store_attachment(url, AttachmentKind::Image, inbound).await {
+                                    Ok(marker) => text_parts.push(marker),
+                                    Err(err) => {
+                                        log_attachment_processing_failure("WeCom mixed image processing failed", &err, inbound, AttachmentKind::Image, url);
+                                        text_parts.push("[Image attachment processing failed in mixed message.]".to_string());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                if text_parts.is_empty() {
+                    NormalizedMessage::Unsupported
+                } else {
+                    NormalizedMessage::Ready(text_parts.join("\n\n"))
+                }
+            }
+            other => {
+                tracing::info!("[wecom] unsupported msg_type={other}, raw_payload={}", inbound.raw_payload);
+                NormalizedMessage::Unsupported
+            }
+        }
+    }
+
+    async fn download_and_store_attachment(
+        &self,
+        url: &str,
+        kind: AttachmentKind,
+        inbound: &ParsedInbound,
+    ) -> Result<String> {
+        if self.cfg.max_file_size_bytes == 0 {
+            anyhow::bail!("WeCom max_file_size_bytes is zero");
+        }
+        let started = Instant::now();
+        let chat_id = inbound.chat_id.as_deref().unwrap_or("single");
+        let url_target = summarize_attachment_url_for_log(url);
+        tracing::debug!(
+            msg_id = %inbound.msg_id, msg_type = %inbound.msg_type,
+            chat_type = %inbound.chat_type, chat_id = %chat_id,
+            sender_userid = %inbound.sender_userid,
+            attachment_kind = %kind.as_str(), url_target = %url_target,
+            timeout_secs = WECOM_HTTP_TIMEOUT_SECS,
+            "WeCom attachment download started"
+        );
+        let response = self.client.get(url).send().await.with_context(|| {
+            format!("failed to download WeCom attachment: kind={} msg_id={}", kind.as_str(), inbound.msg_id)
+        })?;
+        let status = response.status();
+        if !status.is_success() {
+            let _body = response.text().await.unwrap_or_default();
+            anyhow::bail!("WeCom attachment download failed: status={} msg_id={}", status, inbound.msg_id);
+        }
+        if let Some(len) = response.content_length() {
+            if len > self.cfg.max_file_size_bytes {
+                return Ok(format!("[AttachmentTooLarge kind={:?} size={}B limit={}B]", kind, len, self.cfg.max_file_size_bytes));
+            }
+        }
+        let bytes = response.bytes().await.with_context(|| {
+            format!("failed to read WeCom attachment bytes: kind={} msg_id={}", kind.as_str(), inbound.msg_id)
+        })?;
+        if bytes.len() as u64 > self.cfg.max_file_size_bytes {
+            return Ok(format!("[AttachmentTooLarge kind={:?} size={}B limit={}B]", kind, bytes.len(), self.cfg.max_file_size_bytes));
+        }
+        let decrypted = self.crypto.decrypt_file_payload(&bytes).with_context(|| {
+            format!("failed to decrypt WeCom attachment payload: kind={} msg_id={}", kind.as_str(), inbound.msg_id)
+        })?;
+        let decrypted_len = decrypted.len();
+        let ext = match kind {
+            AttachmentKind::Image => "png",
+            AttachmentKind::File => "bin",
+        };
+        let safe_scope = normalize_scope_component(&format!("{}_{}", inbound.chat_id.as_deref().unwrap_or("single"), inbound.sender_userid));
+        let ts = bytes_timestamp_now();
+        let file_name = format!("{safe_scope}_{ts}_{}_{}.{}", inbound.msg_id, random_ascii_token(6), ext);
+        let dir = self.cfg.workspace_dir.join("wecom_files");
+        tokio::fs::create_dir_all(&dir).await.with_context(|| {
+            format!("failed to create WeCom inbox directory: msg_id={} path={}", inbound.msg_id, dir.display())
+        })?;
+        let path = dir.join(file_name);
+        tokio::fs::write(&path, decrypted).await.with_context(|| {
+            format!("failed to persist WeCom attachment: kind={} msg_id={} path={}", kind.as_str(), inbound.msg_id, path.display())
+        })?;
+        self.maybe_cleanup_files().await;
+        let abs = path.canonicalize().unwrap_or(path);
+        tracing::debug!(
+            msg_id = %inbound.msg_id, attachment_kind = %kind.as_str(),
+            encrypted_bytes = bytes.len(), decrypted_bytes = decrypted_len,
+            local_path = %abs.display(), elapsed_ms = started.elapsed().as_millis(),
+            "WeCom attachment download completed"
+        );
+        match kind {
+            AttachmentKind::Image => Ok(format!("[IMAGE:{}]", abs.display())),
+            AttachmentKind::File => Ok(format!("[Document: {}]", abs.display())),
+        }
+    }
+
+    fn compose_input(
+        &self,
+        inbound: &ParsedInbound,
+        scopes: &ScopeDecision,
+        normalized: &str,
+        _prior: &ConversationState,
+    ) -> ComposedInput {
+        let mut blocks: Vec<String> = Vec::new();
+        let include_sender_in_static = !scopes.shared_group_history;
+        let quote_context = extract_quote_context(&inbound.raw_payload);
+        blocks.push(wecom_static_context(inbound, scopes, include_sender_in_static));
+        if scopes.shared_group_history {
+            blocks.push(format!("[sender_userid={}] {}", inbound.sender_userid, normalized));
+        } else {
+            blocks.push(normalized.to_string());
+        }
+        if let Some(quote) = quote_context.as_deref() {
+            let last = blocks.pop().unwrap();
+            blocks.push(quote.to_string());
+            blocks.push(last);
+        }
+        let mut user_turn_for_history = normalized.to_string();
+        if let Some(quote) = quote_context.as_deref() {
+            user_turn_for_history = format!("{quote}\n{user_turn_for_history}");
+        }
+        if scopes.shared_group_history {
+            user_turn_for_history = format!("[{}] {}", inbound.sender_userid, user_turn_for_history);
+        }
+        let payload = blocks.join("\n\n");
+        ComposedInput {
+            user_message_for_model: payload,
+            user_turn_for_history,
+        }
+    }
+
+    /// Send content to a WeCom group-bot webhook URL (for overflow messages).
+    async fn send_to_url(&self, url: &str, content: &str) -> Result<()> {
+        let payload = serde_json::json!({
+            "msgtype": "markdown",
+            "markdown": { "content": content }
+        });
+        let resp = self.send_client.post(url).json(&payload).send().await?;
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        if !status.is_success() {
+            anyhow::bail!("WeCom webhook send failed: {status}");
+        }
+        if let Ok(parsed) = serde_json::from_str::<Value>(&body) {
+            if let Some(errcode) = parsed.get("errcode").and_then(|v| v.as_i64()) {
+                if errcode != 0 {
+                    let errmsg = parsed.get("errmsg").and_then(|v| v.as_str()).unwrap_or("unknown");
+                    anyhow::bail!("WeCom webhook business error: errcode={errcode} errmsg={errmsg}");
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn lookup_scope_webhook(&self, scope: &str) -> Option<String> {
+        let key = format!("wecom_push_url::{scope}");
+        let entry = self.memory.get(&key).await.ok().flatten()?;
+        let url = entry.content.trim();
+        if is_valid_robot_webhook_url(url) {
+            Some(url.to_string())
+        } else {
+            None
+        }
+    }
+
+    fn take_response_url(&self, scope: &str) -> Option<ResponseUrlEntry> {
+        let now = Instant::now();
+        let mut cache = self.response_urls.lock();
+        let queue = cache.get_mut(scope)?;
+        queue.retain(|entry| entry.expires_at > now);
+        if queue.is_empty() {
+            return None;
+        }
+        queue.pop_front()
+    }
+
+    /// Send overflow message using the 3-layer fallback chain.
+    async fn send_overflow(&self, scope: &str, content: &str) {
+        let chunks = split_markdown_chunks(content);
+        for chunk in chunks {
+            let mut sent = false;
+
+            // Level 1: response_url
+            while let Some(entry) = self.take_response_url(scope) {
+                match self.send_to_url(&entry.url, &chunk).await {
+                    Ok(()) => {
+                        tracing::info!("WeCom: overflow sent via response_url to scope={}", scope);
+                        sent = true;
+                        break;
+                    }
+                    Err(err) => {
+                        tracing::warn!("WeCom overflow response_url send failed: scope={} error={}", scope, err);
+                    }
+                }
+            }
+            if sent { continue; }
+
+            // Level 2: scope webhook
+            if let Some(url) = self.lookup_scope_webhook(scope).await {
+                match self.send_to_url(&url, &chunk).await {
+                    Ok(()) => {
+                        tracing::info!("WeCom: overflow sent via scope webhook to scope={}", scope);
+                        sent = true;
+                    }
+                    Err(err) => {
+                        tracing::warn!("WeCom overflow scope webhook send failed: scope={} error={}", scope, err);
+                    }
+                }
+            }
+            if sent { continue; }
+
+            // Level 3: fallback webhook
+            if let Some(url) = &self.fallback_webhook_url {
+                if is_valid_robot_webhook_url(url) {
+                    let tagged = format!("[FallbackPush] {chunk}");
+                    match self.send_to_url(url, &tagged).await {
+                        Ok(()) => {
+                            tracing::info!("WeCom: overflow sent via fallback webhook to scope={}", scope);
+                            sent = true;
+                        }
+                        Err(err) => {
+                            tracing::warn!("WeCom overflow fallback webhook send failed: scope={} error={}", scope, err);
+                        }
+                    }
+                }
+            }
+
+            if !sent {
+                tracing::warn!("WeCom overflow dropped: no usable URL for scope={}", scope);
+            }
+        }
+    }
+
+    // ── process_inbound_message ──────────────────────────────────────
+
+    async fn process_inbound_message(
+        &self,
+        inbound: ParsedInbound,
+        scopes: ScopeDecision,
+        stream_id: String,
+    ) {
+        let mut inbound = inbound;
+        self.materialize_quote_attachments(&mut inbound).await;
+        let normalized = self.normalize_message(&inbound).await;
+
+        match normalized {
+            NormalizedMessage::VoiceMissingTranscript => {
+                let msg = format!("\u{6211}\u{73b0}\u{5728}\u{65e0}\u{6cd5}\u{5904}\u{7406}\u{8bed}\u{97f3}\u{6d88}\u{606f} {}", random_emoji());
+                self.update_stream_state_content(&stream_id, &msg, true);
+                tracing::info!(
+                    "[wecom] reply fallback in {}: {} (stream_id={}, msg_id={})",
+                    scopes.conversation_scope,
+                    outbound_content_preview(&msg),
+                    stream_id,
+                    inbound.msg_id
+                );
+            }
+            NormalizedMessage::Unsupported => {
+                let msg = "\u{6682}\u{4e0d}\u{652f}\u{6301}\u{8be5}\u{6d88}\u{606f}\u{7c7b}\u{578b}\u{3002}".to_string();
+                self.update_stream_state_content(&stream_id, &msg, true);
+                tracing::info!(
+                    "[wecom] reply fallback in {}: {} (stream_id={}, msg_id={})",
+                    scopes.conversation_scope,
+                    outbound_content_preview(&msg),
+                    stream_id,
+                    inbound.msg_id
+                );
+                tracing::info!(
+                    "[wecom] unsupported message detail: msg_type={}, raw_payload={}",
+                    inbound.msg_type,
+                    inbound.raw_payload
+                );
+            }
+            NormalizedMessage::Ready(content) => {
+                self.update_stream_state_content(&stream_id, "\u{6b63}\u{5728}\u{8c03}\u{7528}\u{6a21}\u{578b}\u{751f}\u{6210}\u{56de}\u{590d}...", false);
+
+                let prior = self.snapshot_conversation(&scopes.conversation_scope);
+                let composed = self.compose_input(&inbound, &scopes, &content, &prior);
+
+                // Build structured prior history
+                let history_window: Vec<ConversationTurn> = prior
+                    .turns
+                    .iter()
+                    .rev()
+                    .take(WECOM_HISTORY_WINDOW_TURNS)
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .rev()
+                    .collect();
+                let mut prior_history: Vec<ChatMessage> = history_window
+                    .iter()
+                    .map(|t| match t.role {
+                        TurnRole::User => ChatMessage::user(&t.content),
+                        TurnRole::Assistant => ChatMessage::assistant(&t.content),
+                    })
+                    .collect();
+                if prior_history.first().is_some_and(|m| m.role == "assistant") {
+                    prior_history.remove(0);
+                }
+
+                // Create progress channel for streaming delta updates
+                let (delta_tx, mut delta_rx) = tokio::sync::mpsc::channel::<String>(64);
+                let progress_stream_states = self.stream_states.clone();
+                let progress_stream_id = stream_id.clone();
+                let progress_consumer: tokio::task::JoinHandle<(String, String)> =
+                    tokio::spawn(async move {
+                        use crate::agent::loop_::{DRAFT_CLEAR_SENTINEL, DRAFT_PROGRESS_SENTINEL};
+                        let mut progress = String::new();
+                        let mut final_answer = String::new();
+                        let mut cleared = false;
+                        while let Some(delta) = delta_rx.recv().await {
+                            if delta == DRAFT_CLEAR_SENTINEL {
+                                cleared = true;
+                                if progress.starts_with("\u{1F914} Thinking...\n") {
+                                    progress = progress.replacen("\u{1F914} Thinking...\n", "\u{2705} Done\n", 1);
+                                }
+                                continue;
+                            }
+                            if cleared {
+                                final_answer.push_str(&delta);
+                                let display = if progress.is_empty() {
+                                    final_answer.clone()
+                                } else {
+                                    format!("{progress}\n---\n{final_answer}")
+                                };
+                                let mut states = progress_stream_states.lock();
+                                if let Some(state) = states.get_mut(&progress_stream_id) {
+                                    state.content = normalize_stream_content(&display);
+                                    state.finish = false;
+                                    state.images = Vec::new();
+                                    state.expires_at = Instant::now() + Duration::from_secs(WECOM_STREAM_STATE_TTL_SECS);
+                                }
+                            } else {
+                                let visible = delta
+                                    .strip_prefix(DRAFT_PROGRESS_SENTINEL)
+                                    .unwrap_or(&delta);
+                                progress.push_str(visible);
+                                let mut states = progress_stream_states.lock();
+                                if let Some(state) = states.get_mut(&progress_stream_id) {
+                                    state.content = normalize_stream_content(&progress);
+                                    state.finish = false;
+                                    state.images = Vec::new();
+                                    state.expires_at = Instant::now() + Duration::from_secs(WECOM_STREAM_STATE_TTL_SECS);
+                                }
+                            }
+                        }
+                        (progress, final_answer)
+                    });
+
+                tracing::info!("WeCom: LLM processing started for msg_id={} stream_id={}", inbound.msg_id, stream_id);
+
+                let config = self.agent_config.lock().clone();
+                let llm_response = match Box::pin(
+                    crate::agent::process_message_for_channel_with_history(
+                        config,
+                        &composed.user_message_for_model,
+                        Some("wecom"),
+                        Some(scopes.conversation_scope.as_str()),
+                        prior_history,
+                        Some(delta_tx),
+                    ),
+                )
+                .await
+                {
+                    Ok(text) => text,
+                    Err(err) => {
+                        tracing::error!("WeCom LLM execution failed: {err:#}");
+                        "\u{62b1}\u{6b49}\u{ff0c}\u{6211}\u{6682}\u{65f6}\u{65e0}\u{6cd5}\u{5904}\u{7406}\u{8fd9}\u{6761}\u{6d88}\u{606f}\u{3002}".to_string()
+                    }
+                };
+
+                let (progress_text, streamed_final) = progress_consumer.await.unwrap_or_default();
+                tracing::info!(
+                    "[wecom] model reply in {}: {} (len={}, stream_id={}, msg_id={})",
+                    scopes.conversation_scope,
+                    outbound_content_preview(&llm_response),
+                    llm_response.chars().count(),
+                    stream_id,
+                    inbound.msg_id
+                );
+
+                let (text_without_images, image_paths) = parse_image_markers(&llm_response);
+                let images = prepare_stream_images(&image_paths).await;
+
+                let final_text = if streamed_final.trim().is_empty() {
+                    text_without_images.clone()
+                } else {
+                    streamed_final
+                };
+
+                let display_text = if progress_text.trim().is_empty() {
+                    final_text
+                } else {
+                    format!("{progress_text}\n---\n{final_text}")
+                };
+
+                let (stream_content, overflow) = split_stream_content_and_overflow(&display_text);
+                self.update_stream_state_with_images(&stream_id, &stream_content, true, images);
+
+                self.upsert_conversation(
+                    &scopes.conversation_scope,
+                    &composed.user_turn_for_history,
+                    &text_without_images,
+                );
+
+                if let Some(extra) = overflow {
+                    let extra_msg = format!("[\u{8865}\u{5145}\u{6d88}\u{606f}]\n{extra}");
+                    let extra_preview = outbound_content_preview(&extra_msg);
+                    self.send_overflow(&scopes.conversation_scope, &extra_msg).await;
+                    tracing::info!(
+                        "[wecom] overflow sent in {}: {} (stream_id={}, msg_id={})",
+                        scopes.conversation_scope,
+                        extra_preview,
+                        stream_id,
+                        inbound.msg_id
+                    );
+                }
+
+                self.maybe_cleanup_files().await;
+            }
+        }
+
+        self.release_execution_lock(&scopes.execution_scope, &inbound.msg_id);
+        self.clear_inflight_task_if_owner(&scopes.execution_scope, &inbound.msg_id);
+    }
+}
+
+// ── Channel trait impl ───────────────────────────────────────────────
 
 #[async_trait]
 impl Channel for WeComChannel {
@@ -258,7 +2741,7 @@ impl Channel for WeComChannel {
         "wecom"
     }
 
-    async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
+    async fn send(&self, message: &SendMessage) -> Result<()> {
         let scope = &message.recipient;
         let chunks = split_markdown_chunks(&message.content);
 
@@ -269,13 +2752,12 @@ impl Channel for WeComChannel {
             chunks.len()
         );
 
-        // Prune expired entries before sending
         self.prune_response_urls();
 
         for chunk in chunks {
             let mut sent = false;
 
-            // Level 1: response_url (from cache, FIFO with TTL)
+            // Level 1: response_url
             while let Some(entry) = self.take_response_url(scope) {
                 match self.send_to_url(&entry.url, &chunk).await {
                     Ok(()) => {
@@ -300,11 +2782,9 @@ impl Channel for WeComChannel {
                 }
             }
 
-            if sent {
-                continue;
-            }
+            if sent { continue; }
 
-            // Level 2: scope-specific push webhook (from memory)
+            // Level 2: scope-specific push webhook
             if let Some(url) = self.lookup_scope_webhook(scope).await {
                 match self.send_to_url(&url, &chunk).await {
                     Ok(()) => {
@@ -321,11 +2801,9 @@ impl Channel for WeComChannel {
                 }
             }
 
-            if sent {
-                continue;
-            }
+            if sent { continue; }
 
-            // Level 3: fallback push webhook (from config)
+            // Level 3: fallback push webhook
             if let Some(url) = &self.fallback_webhook_url {
                 if is_valid_robot_webhook_url(url) {
                     let tagged = format!("[FallbackPush] {chunk}");
@@ -356,27 +2834,34 @@ impl Channel for WeComChannel {
         Ok(())
     }
 
-    async fn listen(&self, _tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> anyhow::Result<()> {
-        // WeCom uses webhooks (push-based), not polling.
-        // Messages are received via the gateway's /wecom endpoint.
+    async fn listen(&self, _tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> Result<()> {
+        let mut rx = self
+            .inbound_rx
+            .lock()
+            .await
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("WeCom listen() can only be called once"))?;
+
         tracing::info!(
-            "WeCom channel active (webhook mode). \
-            Configure WeCom callback to POST to your gateway's /wecom endpoint."
+            "WeCom channel listen() started (mpsc mode, fingerprint={})",
+            self.fingerprint
         );
 
-        // Keep the task alive — it will be cancelled when the channel shuts down
-        loop {
-            tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+        while let Some(req) = rx.recv().await {
+            tracing::debug!("WeCom: received inbound request from gateway");
+            self.handle_callback(req).await;
         }
+
+        tracing::info!("WeCom channel listen() exiting: inbound sender dropped");
+        Ok(())
     }
 
     async fn health_check(&self) -> bool {
-        // Healthy if fallback webhook is valid (or not configured at all)
         match &self.fallback_webhook_url {
             Some(url) => {
                 let valid = is_valid_robot_webhook_url(url);
                 if !valid {
-                    tracing::debug!("WeCom: health check failed — invalid fallback webhook URL");
+                    tracing::debug!("WeCom: health check failed \u{2014} invalid fallback webhook URL");
                 }
                 valid
             }
@@ -385,7 +2870,677 @@ impl Channel for WeComChannel {
     }
 }
 
-/// Validate that a URL is a legitimate WeCom group-bot webhook URL.
+// ── Helper functions ─────────────────────────────────────────────────
+
+fn strip_wecom_padding(input: &[u8]) -> Result<&[u8]> {
+    let Some(last) = input.last() else {
+        anyhow::bail!("invalid WeCom padding: empty payload");
+    };
+    let pad_len = *last as usize;
+    if pad_len == 0 || pad_len > 32 || pad_len > input.len() {
+        anyhow::bail!("invalid WeCom padding length");
+    }
+    Ok(&input[..input.len() - pad_len])
+}
+
+fn parse_inbound_payload(payload: Value) -> Result<ParsedInbound> {
+    let msg_type = payload
+        .get("msgtype")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    if msg_type.is_empty() {
+        anyhow::bail!("missing msgtype");
+    }
+
+    let msg_id = payload
+        .get("msgid")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+
+    let chat_type = payload
+        .get("chattype")
+        .and_then(Value::as_str)
+        .unwrap_or("single")
+        .to_string();
+
+    let chat_id = payload
+        .get("chatid")
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned);
+
+    let sender_userid = payload
+        .get("from")
+        .and_then(|v| v.get("userid"))
+        .and_then(Value::as_str)
+        .unwrap_or("unknown")
+        .to_string();
+
+    let aibot_id = payload
+        .get("aibotid")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown")
+        .to_string();
+
+    let response_url = payload
+        .get("response_url")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|url| !url.is_empty())
+        .map(ToOwned::to_owned);
+
+    Ok(ParsedInbound {
+        msg_id,
+        msg_type,
+        chat_type,
+        chat_id,
+        sender_userid,
+        aibot_id,
+        response_url,
+        raw_payload: payload,
+    })
+}
+
+fn compute_scopes(_cfg: &WeComRuntimeConfig, inbound: &ParsedInbound) -> ScopeDecision {
+    let chat_type = inbound.chat_type.to_ascii_lowercase();
+    if chat_type == "group" {
+        let chat_id = inbound
+            .chat_id
+            .clone()
+            .unwrap_or_else(|| "unknown".to_string());
+        let scope = format!("group--{chat_id}");
+        return ScopeDecision {
+            conversation_scope: scope.clone(),
+            execution_scope: scope,
+            shared_group_history: true,
+        };
+    }
+
+    let scope = format!("user--{}", inbound.sender_userid);
+    ScopeDecision {
+        conversation_scope: scope.clone(),
+        execution_scope: scope,
+        shared_group_history: false,
+    }
+}
+
+fn normalize_scope_component(raw: &str) -> String {
+    raw.chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+fn summarize_attachment_url_for_log(url: &str) -> String {
+    let trimmed = url.trim();
+    if trimmed.is_empty() {
+        return "empty-url".to_string();
+    }
+    match reqwest::Url::parse(trimmed) {
+        Ok(parsed) => {
+            let host = parsed.host_str().unwrap_or("unknown-host");
+            let query_state = if parsed.query().is_some() {
+                "query=present"
+            } else {
+                "query=none"
+            };
+            format!(
+                "{}://{}{} ({query_state})",
+                parsed.scheme(),
+                host,
+                parsed.path()
+            )
+        }
+        Err(_) => format!("invalid-url(len={})", trimmed.len()),
+    }
+}
+
+fn truncate_for_log(input: &str, max_chars: usize) -> String {
+    if input.chars().count() <= max_chars {
+        return input.to_string();
+    }
+    let prefix: String = input.chars().take(max_chars).collect();
+    format!("{prefix}...(truncated)")
+}
+
+fn log_attachment_processing_failure(
+    stage: &str,
+    err: &anyhow::Error,
+    inbound: &ParsedInbound,
+    kind: AttachmentKind,
+    url: &str,
+) {
+    tracing::warn!(
+        msg_id = %inbound.msg_id,
+        msg_type = %inbound.msg_type,
+        chat_type = %inbound.chat_type,
+        chat_id = %inbound.chat_id.as_deref().unwrap_or("single"),
+        sender_userid = %inbound.sender_userid,
+        attachment_kind = %kind.as_str(),
+        url_target = %summarize_attachment_url_for_log(url),
+        error = %format_args!("{err:#}"),
+        "{stage}"
+    );
+}
+
+fn random_emoji() -> &'static str {
+    let idx = rand::rng().random_range(0..WECOM_EMOJIS.len());
+    WECOM_EMOJIS[idx]
+}
+
+fn random_ascii_token(len: usize) -> String {
+    const CHARSET: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+    let mut out = String::with_capacity(len);
+    let mut rng = rand::rng();
+    for _ in 0..len {
+        let idx = rng.random_range(0..CHARSET.len());
+        out.push(CHARSET[idx] as char);
+    }
+    out
+}
+
+fn next_stream_id() -> String {
+    format!("zs_{}", random_ascii_token(20))
+}
+
+fn contains_stop_command(text: &str) -> bool {
+    text.contains("\u{505c}\u{6b62}") || text.to_ascii_lowercase().contains("stop")
+}
+
+fn is_clear_session_command(text: &str) -> bool {
+    let stripped = strip_edge_mentions(text);
+    stripped.eq_ignore_ascii_case("/clear") || stripped.eq_ignore_ascii_case("/new")
+}
+
+fn strip_edge_mentions(text: &str) -> String {
+    let s = text.trim();
+    if s.is_empty() {
+        return String::new();
+    }
+
+    let bytes = s.as_bytes();
+    let len = bytes.len();
+    let mut start = 0usize;
+    loop {
+        while start < len && bytes[start].is_ascii_whitespace() {
+            start += 1;
+        }
+        if start >= len || bytes[start] != b'@' {
+            break;
+        }
+        start += 1;
+        while start < len && !bytes[start].is_ascii_whitespace() {
+            start += 1;
+        }
+    }
+
+    let mut end = len;
+    loop {
+        while end > start && bytes[end - 1].is_ascii_whitespace() {
+            end -= 1;
+        }
+        if end <= start {
+            break;
+        }
+        let mut probe = end;
+        while probe > start && !bytes[probe - 1].is_ascii_whitespace() && bytes[probe - 1] != b'@' {
+            probe -= 1;
+        }
+        if probe > start && bytes[probe - 1] == b'@' {
+            end = probe - 1;
+        } else {
+            break;
+        }
+    }
+
+    s[start..end].trim().to_string()
+}
+
+fn extract_stop_signal_text(inbound: &ParsedInbound) -> Option<String> {
+    match inbound.msg_type.as_str() {
+        "text" => inbound
+            .raw_payload
+            .get("text")
+            .and_then(|v| v.get("content"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(ToOwned::to_owned),
+        "voice" => inbound
+            .raw_payload
+            .get("voice")
+            .and_then(|v| v.get("content"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(ToOwned::to_owned),
+        "mixed" => {
+            let mut texts = Vec::new();
+            let items = inbound
+                .raw_payload
+                .get("mixed")
+                .and_then(|v| v.get("msg_item"))
+                .and_then(Value::as_array)?;
+            for item in items {
+                if item
+                    .get("msgtype")
+                    .and_then(Value::as_str)
+                    .is_some_and(|v| v == "text")
+                {
+                    if let Some(content) = item
+                        .get("text")
+                        .and_then(|v| v.get("content"))
+                        .and_then(Value::as_str)
+                    {
+                        let trimmed = content.trim();
+                        if !trimmed.is_empty() {
+                            texts.push(trimmed.to_string());
+                        }
+                    }
+                }
+            }
+            if texts.is_empty() {
+                None
+            } else {
+                Some(texts.join("\n"))
+            }
+        }
+        _ => None,
+    }
+}
+
+fn inbound_content_preview(inbound: &ParsedInbound) -> String {
+    if let Some(text) = extract_stop_signal_text(inbound) {
+        return text;
+    }
+
+    match inbound.msg_type.as_str() {
+        "image" => "[Image message]".to_string(),
+        "file" => inbound
+            .raw_payload
+            .get("file")
+            .and_then(|v| v.get("filename"))
+            .and_then(Value::as_str)
+            .map(|name| format!("[File message: {name}]"))
+            .unwrap_or_else(|| "[File message]".to_string()),
+        "stream" => "[Stream refresh callback]".to_string(),
+        "event" => "[Event callback]".to_string(),
+        other => format!("[{other} message]"),
+    }
+}
+
+fn outbound_content_preview(content: &str) -> String {
+    let trimmed = content.trim();
+    if trimmed.is_empty() {
+        "[Empty reply]".to_string()
+    } else {
+        crate::util::truncate_with_ellipsis(trimmed, 120)
+    }
+}
+
+fn trim_utf8_to_max_bytes(input: &str, max_bytes: usize) -> String {
+    if input.as_bytes().len() <= max_bytes {
+        return input.to_string();
+    }
+    let mut out = String::new();
+    for ch in input.chars() {
+        if out.len() + ch.len_utf8() > max_bytes {
+            break;
+        }
+        out.push(ch);
+    }
+    out
+}
+
+fn normalize_stream_content(input: &str) -> String {
+    trim_utf8_to_max_bytes(input, WECOM_MARKDOWN_MAX_BYTES)
+}
+
+fn split_stream_content_and_overflow(input: &str) -> (String, Option<String>) {
+    if input.as_bytes().len() <= WECOM_MARKDOWN_MAX_BYTES {
+        return (input.to_string(), None);
+    }
+
+    let mut head = String::new();
+    let mut tail = String::new();
+    let mut overflow = false;
+    for ch in input.chars() {
+        if !overflow && head.len() + ch.len_utf8() <= WECOM_MARKDOWN_MAX_BYTES {
+            head.push(ch);
+        } else {
+            overflow = true;
+            tail.push(ch);
+        }
+    }
+
+    if tail.is_empty() {
+        (head, None)
+    } else {
+        (head, Some(tail))
+    }
+}
+
+fn parse_image_markers(text: &str) -> (String, Vec<String>) {
+    let mut cleaned = String::new();
+    let mut paths = Vec::new();
+    let mut rest = text;
+    while let Some(start) = rest.find("[IMAGE:") {
+        cleaned.push_str(&rest[..start]);
+        let after_tag = &rest[start + 7..];
+        if let Some(end) = after_tag.find(']') {
+            let path = after_tag[..end].trim();
+            if !path.is_empty() {
+                paths.push(path.to_string());
+            }
+            rest = &after_tag[end + 1..];
+        } else {
+            cleaned.push_str(&rest[start..start + 7]);
+            rest = after_tag;
+        }
+    }
+    cleaned.push_str(rest);
+    let cleaned = cleaned
+        .lines()
+        .collect::<Vec<_>>()
+        .join("\n")
+        .trim()
+        .to_string();
+    (cleaned, paths)
+}
+
+async fn prepare_stream_images(paths: &[String]) -> Vec<StreamImageItem> {
+    let mut items = Vec::new();
+    for path_str in paths.iter().take(WECOM_STREAM_MAX_IMAGES) {
+        let path = Path::new(path_str);
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        if !matches!(ext.as_str(), "jpg" | "jpeg" | "png") {
+            tracing::warn!(
+                "WeCom stream image skipped (unsupported extension): {}",
+                path_str
+            );
+            continue;
+        }
+        let data = match tokio::fs::read(path).await {
+            Ok(d) => d,
+            Err(err) => {
+                tracing::warn!("WeCom stream image read failed: {} \u{2014} {err:#}", path_str);
+                continue;
+            }
+        };
+        if data.len() > WECOM_IMAGE_MAX_BYTES {
+            tracing::warn!(
+                "WeCom stream image skipped (too large: {} bytes): {}",
+                data.len(),
+                path_str
+            );
+            continue;
+        }
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&data);
+        let digest = md5_crate::compute(&data);
+        let md5_hex = format!("{:x}", digest);
+        items.push(StreamImageItem {
+            base64: b64,
+            md5: md5_hex,
+        });
+    }
+    items
+}
+
+fn make_stream_payload(
+    stream_id: &str,
+    content: &str,
+    finish: bool,
+    images: &[StreamImageItem],
+) -> Value {
+    let mut stream_obj = serde_json::json!({
+        "id": stream_id,
+        "finish": finish,
+        "content": normalize_stream_content(content),
+    });
+    if finish && !images.is_empty() {
+        let msg_items: Vec<Value> = images
+            .iter()
+            .map(|img| {
+                serde_json::json!({
+                    "msgtype": "image",
+                    "image": {
+                        "base64": img.base64,
+                        "md5": img.md5,
+                    }
+                })
+            })
+            .collect();
+        stream_obj["msg_item"] = Value::Array(msg_items);
+    }
+    serde_json::json!({
+        "msgtype": "stream",
+        "stream": stream_obj,
+    })
+}
+
+fn make_text_payload(content: &str) -> Value {
+    serde_json::json!({
+        "msgtype": "text",
+        "text": {
+            "content": content,
+        }
+    })
+}
+
+fn parse_stream_id(payload: &Value) -> Option<String> {
+    payload
+        .get("stream")
+        .and_then(|v| v.get("id"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn parse_event_type(payload: &Value) -> Option<String> {
+    payload
+        .get("event")
+        .and_then(|v| v.get("eventtype"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn extract_template_card_event_key(payload: &Value) -> Option<String> {
+    payload
+        .get("event")
+        .and_then(|v| v.get("template_card_event"))
+        .and_then(|v| {
+            v.get("event_key")
+                .or_else(|| v.get("eventkey"))
+                .and_then(Value::as_str)
+        })
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn extract_feedback_event_summary(payload: &Value) -> Option<String> {
+    let feedback = payload.get("event")?.get("feedback_event")?;
+    let feedback_id = feedback
+        .get("id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .unwrap_or("-");
+    let feedback_type = feedback
+        .get("type")
+        .and_then(Value::as_i64)
+        .map(|v| v.to_string())
+        .unwrap_or_else(|| "-".to_string());
+    let content = feedback
+        .get("content")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .unwrap_or("-");
+    Some(format!(
+        "feedback_id={feedback_id} feedback_type={feedback_type} content={content}"
+    ))
+}
+
+fn extract_quote_context(payload: &Value) -> Option<String> {
+    let quote = payload.get("quote")?;
+    let quote_type = quote
+        .get("msgtype")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|v| !v.is_empty())?;
+
+    let content = match quote_type {
+        "text" => quote
+            .get("text")
+            .and_then(|v| v.get("content"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(ToOwned::to_owned)
+            .unwrap_or_else(|| "[\u{5f15}\u{7528}\u{6587}\u{672c}\u{4e3a}\u{7a7a}]".to_string()),
+        "voice" => quote
+            .get("voice")
+            .and_then(|v| v.get("content"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(|v| format!("[\u{5f15}\u{7528}\u{8bed}\u{97f3}\u{8f6c}\u{5199}] {v}"))
+            .unwrap_or_else(|| "[\u{5f15}\u{7528}\u{8bed}\u{97f3}\u{65e0}\u{8f6c}\u{5199}]".to_string()),
+        "image" => quote
+            .get("image")
+            .and_then(|v| v.get("local_path"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(|v| format!("[\u{5f15}\u{7528}\u{56fe}\u{7247}] {v}"))
+            .unwrap_or_else(|| "[\u{5f15}\u{7528}\u{56fe}\u{7247}]".to_string()),
+        "file" => quote
+            .get("file")
+            .and_then(|v| v.get("local_path"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(|v| format!("[\u{5f15}\u{7528}\u{6587}\u{4ef6}] {v}"))
+            .unwrap_or_else(|| "[\u{5f15}\u{7528}\u{6587}\u{4ef6}]".to_string()),
+        "mixed" => {
+            let mut parts = Vec::new();
+            if let Some(items) = quote
+                .get("mixed")
+                .and_then(|v| v.get("msg_item"))
+                .and_then(Value::as_array)
+            {
+                for item in items {
+                    let item_type = item
+                        .get("msgtype")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default();
+                    if item_type == "text" {
+                        if let Some(text) = item
+                            .get("text")
+                            .and_then(|v| v.get("content"))
+                            .and_then(Value::as_str)
+                            .map(str::trim)
+                            .filter(|v| !v.is_empty())
+                        {
+                            parts.push(text.to_string());
+                        }
+                    } else if item_type == "image" {
+                        if let Some(path) = item
+                            .get("image")
+                            .and_then(|v| v.get("local_path"))
+                            .and_then(Value::as_str)
+                            .map(str::trim)
+                            .filter(|v| !v.is_empty())
+                        {
+                            parts.push(format!("[\u{5f15}\u{7528}\u{56fe}\u{7247}] {path}"));
+                        } else {
+                            parts.push("[\u{5f15}\u{7528}\u{56fe}\u{7247}]".to_string());
+                        }
+                    }
+                }
+            }
+
+            if parts.is_empty() {
+                "[\u{5f15}\u{7528}\u{56fe}\u{6587}\u{6d88}\u{606f}]".to_string()
+            } else {
+                parts.join("\n")
+            }
+        }
+        _ => format!("[\u{5f15}\u{7528}\u{6d88}\u{606f} type={quote_type}]"),
+    };
+
+    let content = trim_utf8_to_max_bytes(&content, 4_096);
+    Some(format!(
+        "[WECOM_QUOTE]\nmsgtype={quote_type}\ncontent={content}\n[/WECOM_QUOTE]"
+    ))
+}
+
+fn parse_wecom_business_response(body: &str) -> Result<()> {
+    let parsed: Value = serde_json::from_str(body).context("invalid WeCom response json")?;
+    let errcode = parsed
+        .get("errcode")
+        .and_then(Value::as_i64)
+        .ok_or_else(|| anyhow::anyhow!("missing errcode in WeCom response"))?;
+    if errcode != 0 {
+        let errmsg = parsed
+            .get("errmsg")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        anyhow::bail!("errcode={errcode} errmsg={errmsg}");
+    }
+    Ok(())
+}
+
+async fn cleanup_inbox_files(root: PathBuf, retention: Duration) {
+    if !root.exists() {
+        return;
+    }
+
+    let mut stack = vec![root];
+    while let Some(dir) = stack.pop() {
+        let Ok(mut rd) = tokio::fs::read_dir(&dir).await else {
+            continue;
+        };
+
+        while let Ok(Some(entry)) = rd.next_entry().await {
+            let path = entry.path();
+            let Ok(meta) = entry.metadata().await else {
+                continue;
+            };
+
+            if meta.is_dir() {
+                stack.push(path);
+                continue;
+            }
+
+            let Ok(modified) = meta.modified() else {
+                continue;
+            };
+
+            let age = SystemTime::now()
+                .duration_since(modified)
+                .unwrap_or_else(|_| Duration::from_secs(0));
+            if age > retention {
+                let _ = tokio::fs::remove_file(&path).await;
+            }
+        }
+    }
+}
+
 fn is_valid_robot_webhook_url(url: &str) -> bool {
     let Ok(parsed) = reqwest::Url::parse(url) else {
         return false;
@@ -399,60 +3554,36 @@ fn is_valid_robot_webhook_url(url: &str) -> bool {
         && parsed.path().starts_with("/cgi-bin/webhook/send")
 }
 
-/// Extract text content from a WeCom payload based on message type.
-fn extract_text_content(payload: &serde_json::Value, msg_type: &str) -> String {
-    match msg_type {
-        "text" => payload
-            .get("text")
-            .and_then(|v| v.get("content"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .trim()
-            .to_string(),
-        "voice" => payload
-            .get("voice")
-            .and_then(|v| v.get("content"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .trim()
-            .to_string(),
-        "mixed" => {
-            let mut parts = Vec::new();
-            if let Some(items) = payload
-                .get("mixed")
-                .and_then(|v| v.get("msg_item"))
-                .and_then(|v| v.as_array())
-            {
-                for item in items {
-                    let item_type = item
-                        .get("msgtype")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or_default();
-                    if item_type == "text" {
-                        if let Some(text) = item
-                            .get("text")
-                            .and_then(|v| v.get("content"))
-                            .and_then(|v| v.as_str())
-                        {
-                            let trimmed = text.trim();
-                            if !trimmed.is_empty() {
-                                parts.push(trimmed.to_string());
-                            }
-                        }
-                    }
-                }
-            }
-            parts.join("\n\n")
-        }
-        // Image and file messages produce markers in the gateway's normalize_message;
-        // the channel layer just reports an indicator.
-        "image" => "[Image message]".to_string(),
-        "file" => "[File message]".to_string(),
-        _ => String::new(),
+fn wecom_static_context(
+    inbound: &ParsedInbound,
+    scopes: &ScopeDecision,
+    include_sender: bool,
+) -> String {
+    let mut lines = vec![
+        "[WECOM_STATIC_CONTEXT_V1]".to_string(),
+        format!("chat_type={}", inbound.chat_type),
+        format!("conversation_scope={}", scopes.conversation_scope),
+        format!(
+            "push_url_memory_key=wecom_push_url::{}",
+            scopes.conversation_scope
+        ),
+    ];
+
+    if include_sender {
+        lines.push(format!("sender_userid={}", inbound.sender_userid));
     }
+
+    lines.push("[/WECOM_STATIC_CONTEXT_V1]".to_string());
+    lines.join("\n")
 }
 
-/// Split markdown content into chunks for WeCom's 20 KB per-message limit.
+fn bytes_timestamp_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
 fn split_markdown_chunks(input: &str) -> Vec<String> {
     if input.is_empty() {
         return vec![String::new()];
@@ -468,9 +3599,9 @@ fn split_markdown_chunks(input: &str) -> Vec<String> {
             format!("{current}\n{line}")
         };
 
-        if candidate.len() > WECOM_MARKDOWN_CHUNK_BYTES
+        if candidate.as_bytes().len() > WECOM_MARKDOWN_CHUNK_BYTES
             && !current.is_empty()
-            && current.len() <= WECOM_MARKDOWN_MAX_BYTES
+            && current.as_bytes().len() <= WECOM_MARKDOWN_MAX_BYTES
         {
             chunks.push(current);
             current = line.to_string();
@@ -481,24 +3612,65 @@ fn split_markdown_chunks(input: &str) -> Vec<String> {
     }
 
     if !current.is_empty() {
-        if current.len() <= WECOM_MARKDOWN_MAX_BYTES {
+        if current.as_bytes().len() <= WECOM_MARKDOWN_MAX_BYTES {
             chunks.push(current);
         } else {
-            // Force split at byte boundary
-            let mut remainder = current.as_str();
-            while !remainder.is_empty() {
-                let cut = floor_char_boundary(remainder, WECOM_MARKDOWN_CHUNK_BYTES);
-                let cut = cut.max(1);
-                chunks.push(remainder[..cut].to_string());
-                remainder = &remainder[cut..];
+            let mut buf = String::new();
+            for ch in current.chars() {
+                if buf.len() + ch.len_utf8() > WECOM_MARKDOWN_CHUNK_BYTES {
+                    chunks.push(buf);
+                    buf = String::new();
+                }
+                buf.push(ch);
+            }
+            if !buf.is_empty() {
+                chunks.push(buf);
             }
         }
+    }
+
+    if chunks.is_empty() {
+        chunks.push(String::new());
     }
 
     chunks
 }
 
-/// Find the largest char boundary ≤ `max_bytes` in `s`.
+fn reply_timestamp(query: &WeComCallbackQuery) -> String {
+    if query.timestamp.trim().is_empty() {
+        bytes_timestamp_now().to_string()
+    } else {
+        query.timestamp.trim().to_string()
+    }
+}
+
+fn reply_nonce(query: &WeComCallbackQuery) -> String {
+    if query.nonce.trim().is_empty() {
+        random_ascii_token(12)
+    } else {
+        query.nonce.trim().to_string()
+    }
+}
+
+fn is_model_supported_msgtype(msg_type: &str) -> bool {
+    matches!(msg_type, "text" | "voice" | "image" | "file" | "mixed")
+}
+
+fn is_voice_without_transcript(inbound: &ParsedInbound) -> bool {
+    if inbound.msg_type != "voice" {
+        return false;
+    }
+    inbound
+        .raw_payload
+        .get("voice")
+        .and_then(|v| v.get("content"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .unwrap_or("")
+        .is_empty()
+}
+
+/// Find the largest char boundary <= `max_bytes` in `s`.
 fn floor_char_boundary(s: &str, max_bytes: usize) -> usize {
     if max_bytes >= s.len() {
         return s.len();
@@ -514,160 +3686,60 @@ fn floor_char_boundary(s: &str, max_bytes: usize) -> usize {
 mod tests {
     use super::*;
 
-    fn test_memory() -> Arc<dyn Memory> {
-        let cfg = crate::config::MemoryConfig {
-            backend: "markdown".into(),
-            ..Default::default()
+    #[test]
+    fn scope_uses_group_shared_mode_by_default_for_group_chat() {
+        let cfg = WeComRuntimeConfig {
+            workspace_dir: PathBuf::from("."),
+            file_retention_days: 3,
+            max_file_size_bytes: 20 * 1024 * 1024,
+            lock_timeout_secs: 900,
+            history_max_turns: 30,
         };
-        let dir = std::env::temp_dir().join("zeroclaw_wecom_test");
-        Arc::from(crate::memory::create_memory(&cfg, &dir, None).unwrap())
-    }
 
-    fn make_channel() -> WeComChannel {
-        WeComChannel::new(test_memory(), None, 3600, 20)
-    }
+        let inbound = ParsedInbound {
+            msg_id: "m1".to_string(),
+            msg_type: "text".to_string(),
+            chat_type: "group".to_string(),
+            chat_id: Some("g1".to_string()),
+            sender_userid: "u1".to_string(),
+            aibot_id: "b1".to_string(),
+            response_url: None,
+            raw_payload: serde_json::json!({}),
+        };
 
-    #[test]
-    fn wecom_channel_name() {
-        let ch = make_channel();
-        assert_eq!(ch.name(), "wecom");
-    }
-
-    #[test]
-    fn wecom_parse_text_message() {
-        let ch = make_channel();
-
-        let payload = serde_json::json!({
-            "msgtype": "text",
-            "msgid": "msg_001",
-            "chattype": "single",
-            "from": { "userid": "test_user" },
-            "text": { "content": "Hello WeCom!" }
-        });
-
-        let msgs = ch.parse_webhook_payload(&payload);
-        assert_eq!(msgs.len(), 1);
-        assert_eq!(msgs[0].sender, "test_user");
-        assert_eq!(msgs[0].content, "Hello WeCom!");
-        assert_eq!(msgs[0].channel, "wecom");
-        assert_eq!(msgs[0].reply_target, "user--test_user");
-        assert_eq!(msgs[0].id, "msg_001");
+        let scopes = compute_scopes(&cfg, &inbound);
+        assert_eq!(scopes.conversation_scope, "group--g1");
+        assert_eq!(scopes.execution_scope, "group--g1");
+        assert!(scopes.shared_group_history);
     }
 
     #[test]
-    fn wecom_parse_group_message() {
-        let ch = make_channel();
-
-        let payload = serde_json::json!({
-            "msgtype": "text",
-            "msgid": "msg_002",
-            "chattype": "group",
-            "chatid": "chat_group_1",
-            "from": { "userid": "test_user" },
-            "text": { "content": "Group hello" }
-        });
-
-        let msgs = ch.parse_webhook_payload(&payload);
-        assert_eq!(msgs.len(), 1);
-        assert_eq!(msgs[0].reply_target, "group--chat_group_1");
+    fn split_markdown_chunks_preserves_large_input() {
+        let input = "a".repeat(WECOM_MARKDOWN_CHUNK_BYTES * 3 + 100);
+        let chunks = split_markdown_chunks(&input);
+        assert!(chunks.len() >= 3);
+        for chunk in chunks {
+            assert!(chunk.as_bytes().len() <= WECOM_MARKDOWN_MAX_BYTES);
+        }
     }
 
     #[test]
-    fn wecom_parse_empty_content_skipped() {
-        let ch = make_channel();
-
-        let payload = serde_json::json!({
-            "msgtype": "text",
-            "from": { "userid": "test_user" },
-            "text": { "content": "   " }
-        });
-
-        let msgs = ch.parse_webhook_payload(&payload);
-        assert!(msgs.is_empty());
+    fn split_markdown_chunks_small_input() {
+        let input = "Hello WeCom!";
+        let chunks = split_markdown_chunks(input);
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0], "Hello WeCom!");
     }
 
     #[test]
-    fn wecom_parse_event_type_skipped() {
-        let ch = make_channel();
-
-        let payload = serde_json::json!({
-            "msgtype": "event",
-            "event": { "eventtype": "enter_chat" }
-        });
-
-        let msgs = ch.parse_webhook_payload(&payload);
-        assert!(msgs.is_empty());
+    fn split_markdown_chunks_empty_input() {
+        let chunks = split_markdown_chunks("");
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0], "");
     }
 
     #[test]
-    fn wecom_parse_stream_type_skipped() {
-        let ch = make_channel();
-
-        let payload = serde_json::json!({
-            "msgtype": "stream",
-            "stream": { "id": "sid1" }
-        });
-
-        let msgs = ch.parse_webhook_payload(&payload);
-        assert!(msgs.is_empty());
-    }
-
-    #[test]
-    fn wecom_parse_missing_sender_skipped() {
-        let ch = make_channel();
-
-        let payload = serde_json::json!({
-            "msgtype": "text",
-            "text": { "content": "No sender" }
-        });
-
-        let msgs = ch.parse_webhook_payload(&payload);
-        assert!(msgs.is_empty());
-    }
-
-    #[test]
-    fn wecom_parse_voice_message() {
-        let ch = make_channel();
-
-        let payload = serde_json::json!({
-            "msgtype": "voice",
-            "msgid": "msg_voice_1",
-            "chattype": "single",
-            "from": { "userid": "test_user" },
-            "voice": { "content": "Transcribed text from voice" }
-        });
-
-        let msgs = ch.parse_webhook_payload(&payload);
-        assert_eq!(msgs.len(), 1);
-        assert_eq!(msgs[0].content, "Transcribed text from voice");
-    }
-
-    #[test]
-    fn wecom_parse_mixed_message() {
-        let ch = make_channel();
-
-        let payload = serde_json::json!({
-            "msgtype": "mixed",
-            "msgid": "msg_mixed_1",
-            "chattype": "single",
-            "from": { "userid": "test_user" },
-            "mixed": {
-                "msg_item": [
-                    { "msgtype": "text", "text": { "content": "Part 1" } },
-                    { "msgtype": "image", "image": { "url": "https://example.com/img.png" } },
-                    { "msgtype": "text", "text": { "content": "Part 2" } }
-                ]
-            }
-        });
-
-        let msgs = ch.parse_webhook_payload(&payload);
-        assert_eq!(msgs.len(), 1);
-        assert!(msgs[0].content.contains("Part 1"));
-        assert!(msgs[0].content.contains("Part 2"));
-    }
-
-    #[test]
-    fn wecom_robot_webhook_url_validation() {
+    fn robot_webhook_url_validation() {
         assert!(is_valid_robot_webhook_url(
             "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=test"
         ));
@@ -679,67 +3751,291 @@ mod tests {
     }
 
     #[test]
-    fn wecom_split_markdown_chunks_small_input() {
-        let input = "Hello WeCom!";
-        let chunks = split_markdown_chunks(input);
-        assert_eq!(chunks.len(), 1);
-        assert_eq!(chunks[0], "Hello WeCom!");
+    fn summarize_attachment_url_for_log_redacts_query_string() {
+        let url = "https://wework.qpic.cn/wwpic/123456/0?auth=secret_token&expires=123";
+        let summary = summarize_attachment_url_for_log(url);
+        assert_eq!(
+            summary,
+            "https://wework.qpic.cn/wwpic/123456/0 (query=present)"
+        );
+        assert!(!summary.contains("secret_token"));
     }
 
     #[test]
-    fn wecom_split_markdown_chunks_large_input() {
-        let input = "a".repeat(WECOM_MARKDOWN_CHUNK_BYTES * 3 + 100);
-        let chunks = split_markdown_chunks(&input);
-        assert!(chunks.len() >= 3);
-        for chunk in &chunks {
-            assert!(chunk.len() <= WECOM_MARKDOWN_MAX_BYTES);
-        }
+    fn summarize_attachment_url_for_log_handles_invalid_input() {
+        let summary = summarize_attachment_url_for_log("not a url");
+        assert_eq!(summary, "invalid-url(len=9)");
     }
 
     #[test]
-    fn wecom_split_markdown_chunks_empty_input() {
-        let chunks = split_markdown_chunks("");
-        assert_eq!(chunks.len(), 1);
-        assert_eq!(chunks[0], "");
+    fn stop_command_detection_supports_cn_and_en() {
+        assert!(contains_stop_command("\u{505c}\u{6b62}"));
+        assert!(contains_stop_command("Please STOP now"));
+        assert!(!contains_stop_command("\u{7ee7}\u{7eed}\u{5904}\u{7406}"));
     }
 
-    #[tokio::test]
-    async fn wecom_health_check_no_fallback() {
-        let ch = make_channel();
-        assert!(ch.health_check().await);
+    #[test]
+    fn crypto_encrypt_and_decrypt_roundtrip() {
+        let crypto =
+            WeComCrypto::new("token123", "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY").unwrap();
+        let nonce = "nonce123";
+        let timestamp = "1700000000";
+        let plain = r#"{"msgtype":"stream","stream":{"id":"sid","finish":false,"content":"hi"}}"#;
+
+        let envelope = crypto
+            .encrypt_json_ciphertext(plain, nonce, timestamp, "")
+            .unwrap();
+        let parsed: Value = serde_json::from_str(&envelope).unwrap();
+        let encrypt = parsed
+            .get("encrypt")
+            .and_then(Value::as_str)
+            .unwrap()
+            .to_string();
+        let signature = parsed
+            .get("msgsignature")
+            .and_then(Value::as_str)
+            .unwrap()
+            .to_string();
+
+        assert!(crypto.verify_signature(&signature, timestamp, nonce, &encrypt));
+        let decrypted = crypto.decrypt_json_ciphertext(&encrypt, "").unwrap();
+        assert_eq!(decrypted, plain);
     }
 
-    #[tokio::test]
-    async fn wecom_health_check_valid_fallback() {
-        let ch = WeComChannel::new(
-            test_memory(),
-            Some("https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=test".to_string()),
-            3600,
-            20,
+    #[test]
+    fn crypto_signature_verification_matches_sorted_sha1() {
+        let crypto =
+            WeComCrypto::new("token123", "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY").unwrap();
+        let encrypt = "enc_payload";
+        let timestamp = "1700000000";
+        let nonce = "nonce123";
+
+        let mut parts = vec!["token123", timestamp, nonce, encrypt];
+        parts.sort_unstable();
+        let mut sha = Sha1::new();
+        sha.update(parts.join(""));
+        let signature = hex::encode(sha.finalize());
+
+        assert!(crypto.verify_signature(&signature, timestamp, nonce, encrypt));
+    }
+
+    #[test]
+    fn parse_event_type_extracts_enter_chat() {
+        let payload = serde_json::json!({
+            "event": {
+                "eventtype": "enter_chat"
+            }
+        });
+        assert_eq!(parse_event_type(&payload).as_deref(), Some("enter_chat"));
+    }
+
+    #[test]
+    fn extract_quote_context_from_text_quote() {
+        let payload = serde_json::json!({
+            "quote": {
+                "msgtype": "text",
+                "text": {
+                    "content": "  \u{5f15}\u{7528}\u{5185}\u{5bb9}  "
+                }
+            }
+        });
+
+        let quote = extract_quote_context(&payload).expect("quote should be extracted");
+        assert!(quote.contains("msgtype=text"));
+        assert!(quote.contains("content=\u{5f15}\u{7528}\u{5185}\u{5bb9}"));
+    }
+
+    #[test]
+    fn extract_quote_context_from_mixed_quote() {
+        let payload = serde_json::json!({
+            "quote": {
+                "msgtype": "mixed",
+                "mixed": {
+                    "msg_item": [
+                        {
+                            "msgtype": "text",
+                            "text": {
+                                "content": "\u{7b2c}\u{4e00}\u{6bb5}"
+                            }
+                        },
+                        {
+                            "msgtype": "image",
+                            "image": {
+                                "url": "https://example.com/image.png"
+                            }
+                        }
+                    ]
+                }
+            }
+        });
+
+        let quote = extract_quote_context(&payload).expect("quote should be extracted");
+        assert!(quote.contains("\u{7b2c}\u{4e00}\u{6bb5}"));
+        assert!(quote.contains("\u{5f15}\u{7528}\u{56fe}\u{7247}"));
+    }
+
+    #[test]
+    fn parse_wecom_business_response_requires_zero_errcode() {
+        assert!(parse_wecom_business_response(r#"{"errcode":0,"errmsg":"ok"}"#).is_ok());
+        assert!(parse_wecom_business_response(r#"{"errcode":93000,"errmsg":"expired"}"#).is_err());
+        assert!(parse_wecom_business_response(r#"{"errmsg":"ok"}"#).is_err());
+    }
+
+    #[test]
+    fn extract_quote_context_does_not_leak_remote_media_url() {
+        let payload = serde_json::json!({
+            "quote": {
+                "msgtype": "image",
+                "image": {
+                    "url": "https://example.com/tmp-sign-url"
+                }
+            }
+        });
+
+        let quote = extract_quote_context(&payload).expect("quote should be extracted");
+        assert!(quote.contains("[\u{5f15}\u{7528}\u{56fe}\u{7247}]"));
+        assert!(!quote.contains("example.com/tmp-sign-url"));
+    }
+
+    #[test]
+    fn extract_template_card_event_key_reads_event_key() {
+        let payload = serde_json::json!({
+            "event": {
+                "eventtype": "template_card_event",
+                "template_card_event": {
+                    "event_key": "button_confirm"
+                }
+            }
+        });
+        assert_eq!(
+            extract_template_card_event_key(&payload).as_deref(),
+            Some("button_confirm")
         );
-        assert!(ch.health_check().await);
     }
 
-    #[tokio::test]
-    async fn wecom_health_check_invalid_fallback() {
-        let ch = WeComChannel::new(
-            test_memory(),
-            Some("http://bad-url.com".to_string()),
-            3600,
-            20,
+    #[test]
+    fn extract_feedback_event_summary_reads_fields() {
+        let payload = serde_json::json!({
+            "event": {
+                "eventtype": "feedback_event",
+                "feedback_event": {
+                    "id": "fb_1",
+                    "type": 2,
+                    "content": "not accurate"
+                }
+            }
+        });
+        let summary = extract_feedback_event_summary(&payload).expect("summary should exist");
+        assert!(summary.contains("feedback_id=fb_1"));
+        assert!(summary.contains("feedback_type=2"));
+        assert!(summary.contains("content=not accurate"));
+    }
+
+    #[test]
+    fn parse_image_markers_extracts_paths() {
+        let input = "\u{5206}\u{6790}\u{7ed3}\u{679c}:\n[IMAGE:/tmp/chart.png]\n\u{8bf7}\u{53c2}\u{8003}\u{3002}";
+        let (cleaned, paths) = parse_image_markers(input);
+        assert_eq!(paths, vec!["/tmp/chart.png"]);
+        assert!(cleaned.contains("\u{5206}\u{6790}\u{7ed3}\u{679c}:"));
+        assert!(cleaned.contains("\u{8bf7}\u{53c2}\u{8003}\u{3002}"));
+        assert!(!cleaned.contains("[IMAGE:"));
+    }
+
+    #[test]
+    fn parse_image_markers_preserves_non_image_tags() {
+        let input = "Hello [TOOL:abc] world [IMAGE:/a.jpg] end";
+        let (cleaned, paths) = parse_image_markers(input);
+        assert_eq!(paths, vec!["/a.jpg"]);
+        assert!(cleaned.contains("[TOOL:abc]"));
+        assert!(!cleaned.contains("[IMAGE:"));
+    }
+
+    #[test]
+    fn parse_image_markers_no_markers() {
+        let input = "No images here.";
+        let (cleaned, paths) = parse_image_markers(input);
+        assert_eq!(cleaned, "No images here.");
+        assert!(paths.is_empty());
+    }
+
+    #[test]
+    fn make_stream_payload_with_images_on_finish() {
+        let imgs = vec![StreamImageItem {
+            base64: "aGVsbG8=".to_string(),
+            md5: "5d41402abc4b2a76b9719d911017c592".to_string(),
+        }];
+        let payload = make_stream_payload("sid1", "done", true, &imgs);
+        let stream = payload.get("stream").expect("stream key");
+        assert_eq!(stream.get("finish").and_then(Value::as_bool), Some(true));
+        let msg_items = stream
+            .get("msg_item")
+            .and_then(Value::as_array)
+            .expect("msg_item");
+        assert_eq!(msg_items.len(), 1);
+        assert_eq!(
+            msg_items[0].get("msgtype").and_then(Value::as_str),
+            Some("image")
         );
-        assert!(!ch.health_check().await);
+        assert_eq!(
+            msg_items[0]
+                .get("image")
+                .and_then(|v| v.get("base64"))
+                .and_then(Value::as_str),
+            Some("aGVsbG8=")
+        );
+    }
+
+    #[test]
+    fn make_stream_payload_no_images() {
+        let payload = make_stream_payload("sid2", "hello", true, &[]);
+        let stream = payload.get("stream").expect("stream key");
+        assert!(stream.get("msg_item").is_none());
+    }
+
+    #[test]
+    fn make_stream_payload_ignores_images_when_not_finish() {
+        let imgs = vec![StreamImageItem {
+            base64: "aGVsbG8=".to_string(),
+            md5: "abc".to_string(),
+        }];
+        let payload = make_stream_payload("sid3", "partial", false, &imgs);
+        let stream = payload.get("stream").expect("stream key");
+        assert!(stream.get("msg_item").is_none());
+    }
+
+    #[test]
+    fn clear_session_bare_commands() {
+        assert!(is_clear_session_command("/clear"));
+        assert!(is_clear_session_command("/new"));
+        assert!(is_clear_session_command("/CLEAR"));
+        assert!(is_clear_session_command("/New"));
+        assert!(is_clear_session_command("  /clear  "));
+    }
+
+    #[test]
+    fn clear_session_with_mentions() {
+        assert!(is_clear_session_command("@bot /clear"));
+        assert!(is_clear_session_command("/clear @bot"));
+        assert!(is_clear_session_command("@bot1 @bot2 /new"));
+        assert!(is_clear_session_command("@bot /new @other"));
+    }
+
+    #[test]
+    fn clear_session_rejects_old_and_invalid() {
+        assert!(!is_clear_session_command("\u{65b0}\u{4f1a}\u{8bdd}"));
+        assert!(!is_clear_session_command("clear history"));
+        assert!(!is_clear_session_command("/clear now"));
+        assert!(!is_clear_session_command("please /new"));
+        assert!(!is_clear_session_command(""));
+        assert!(!is_clear_session_command("   "));
     }
 
     #[test]
     fn floor_char_boundary_handles_multibyte() {
-        let s = "Hello 你好世界";
-        // "Hello " = 6 bytes, "你" = 3 bytes, "好" = 3 bytes, "世" = 3 bytes, "界" = 3 bytes
-        // Total = 18 bytes
+        let s = "Hello \u{4f60}\u{597d}\u{4e16}\u{754c}";
         let boundary = floor_char_boundary(s, 8);
         assert!(s.is_char_boundary(boundary));
         assert!(boundary <= 8);
-        // Should be 6 (just "Hello ") or 9 (include "你")
         assert!(boundary == 6 || boundary == 9);
     }
 
@@ -748,90 +4044,5 @@ mod tests {
         let s = "Hello";
         let boundary = floor_char_boundary(s, 100);
         assert_eq!(boundary, s.len());
-    }
-
-    #[test]
-    fn wecom_cache_response_url_basic() {
-        let ch = make_channel();
-        ch.cache_response_url("user--alice", "msg_001", Some("https://example.com/url1"));
-        ch.cache_response_url("user--alice", "msg_002", Some("https://example.com/url2"));
-
-        // Should retrieve in FIFO order
-        let entry1 = ch.take_response_url("user--alice");
-        assert!(entry1.is_some());
-        assert_eq!(entry1.unwrap().url, "https://example.com/url1");
-
-        let entry2 = ch.take_response_url("user--alice");
-        assert!(entry2.is_some());
-        assert_eq!(entry2.unwrap().url, "https://example.com/url2");
-
-        // Queue should be empty now
-        let entry3 = ch.take_response_url("user--alice");
-        assert!(entry3.is_none());
-    }
-
-    #[test]
-    fn wecom_cache_response_url_ignores_empty() {
-        let ch = make_channel();
-        ch.cache_response_url("user--bob", "msg_001", Some(""));
-        ch.cache_response_url("user--bob", "msg_002", Some("   "));
-        ch.cache_response_url("user--bob", "msg_003", None);
-
-        // All should be ignored
-        let entry = ch.take_response_url("user--bob");
-        assert!(entry.is_none());
-    }
-
-    #[test]
-    fn wecom_cache_response_url_size_limit() {
-        let ch = WeComChannel::new(test_memory(), None, 3600, 3); // max 3 entries
-
-        for i in 1..=5 {
-            ch.cache_response_url(
-                "user--charlie",
-                &format!("msg_{:03}", i),
-                Some(&format!("https://example.com/url{}", i)),
-            );
-        }
-
-        // Should only have the last 3 (FIFO eviction)
-        let entry1 = ch.take_response_url("user--charlie");
-        assert_eq!(entry1.unwrap().url, "https://example.com/url3");
-
-        let entry2 = ch.take_response_url("user--charlie");
-        assert_eq!(entry2.unwrap().url, "https://example.com/url4");
-
-        let entry3 = ch.take_response_url("user--charlie");
-        assert_eq!(entry3.unwrap().url, "https://example.com/url5");
-
-        let entry4 = ch.take_response_url("user--charlie");
-        assert!(entry4.is_none());
-    }
-
-    #[test]
-    fn wecom_cache_response_url_ttl_expiration() {
-        let ch = WeComChannel::new(test_memory(), None, 0, 20); // TTL = 0 seconds (immediate expiration)
-
-        ch.cache_response_url("user--dave", "msg_001", Some("https://example.com/url1"));
-
-        // Should be expired immediately
-        std::thread::sleep(std::time::Duration::from_millis(10));
-        let entry = ch.take_response_url("user--dave");
-        assert!(entry.is_none());
-    }
-
-    #[test]
-    fn wecom_prune_response_urls_removes_expired() {
-        let ch = WeComChannel::new(test_memory(), None, 0, 20); // TTL = 0 seconds
-
-        ch.cache_response_url("user--eve", "msg_001", Some("https://example.com/url1"));
-        ch.cache_response_url("user--frank", "msg_002", Some("https://example.com/url2"));
-
-        std::thread::sleep(std::time::Duration::from_millis(10));
-        ch.prune_response_urls();
-
-        // Both should be pruned
-        assert!(ch.take_response_url("user--eve").is_none());
-        assert!(ch.take_response_url("user--frank").is_none());
     }
 }
