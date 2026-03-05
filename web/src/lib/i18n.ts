@@ -5,7 +5,39 @@ import { getStatus } from './api';
 // Translation dictionaries
 // ---------------------------------------------------------------------------
 
-export type Locale = 'en' | 'tr' | 'zh-CN';
+export type Locale = 'en' | 'tr' | 'zh-CN' | 'ja' | 'ru' | 'fr' | 'vi' | 'el';
+
+export const LANGUAGE_SWITCH_ORDER: ReadonlyArray<Locale> = [
+  'en',
+  'zh-CN',
+  'ja',
+  'ru',
+  'fr',
+  'vi',
+  'el',
+];
+
+export const LANGUAGE_BUTTON_LABELS: Record<Locale, string> = {
+  en: 'EN',
+  tr: 'TR',
+  'zh-CN': '简体',
+  ja: '日本語',
+  ru: 'РУ',
+  fr: 'FR',
+  vi: 'VI',
+  el: 'ΕΛ',
+};
+
+const KNOWN_LOCALES: ReadonlyArray<Locale> = [
+  'en',
+  'tr',
+  'zh-CN',
+  'ja',
+  'ru',
+  'fr',
+  'vi',
+  'el',
+];
 
 const translations: Record<Locale, Record<string, string>> = {
   en: {
@@ -16,6 +48,7 @@ const translations: Record<Locale, Record<string, string>> = {
     'nav.cron': 'Scheduled Jobs',
     'nav.integrations': 'Integrations',
     'nav.memory': 'Memory',
+    'nav.devices': 'Devices',
     'nav.config': 'Configuration',
     'nav.cost': 'Cost Tracker',
     'nav.logs': 'Logs',
@@ -199,6 +232,7 @@ const translations: Record<Locale, Record<string, string>> = {
     'nav.cron': 'Zamanlanmis Gorevler',
     'nav.integrations': 'Entegrasyonlar',
     'nav.memory': 'Hafiza',
+    'nav.devices': 'Cihazlar',
     'nav.config': 'Yapilandirma',
     'nav.cost': 'Maliyet Takibi',
     'nav.logs': 'Kayitlar',
@@ -382,6 +416,7 @@ const translations: Record<Locale, Record<string, string>> = {
     'nav.cron': '定时任务',
     'nav.integrations': '集成',
     'nav.memory': '记忆',
+    'nav.devices': '设备',
     'nav.config': '配置',
     'nav.cost': '成本追踪',
     'nav.logs': '日志',
@@ -556,6 +591,11 @@ const translations: Record<Locale, Record<string, string>> = {
     'health.uptime': '运行时长',
     'health.updated_at': '最后更新',
   },
+  ja: {},
+  ru: {},
+  fr: {},
+  vi: {},
+  el: {},
 };
 
 // ---------------------------------------------------------------------------
@@ -596,10 +636,18 @@ export function tLocale(key: string, locale: Locale): string {
 // React hook
 // ---------------------------------------------------------------------------
 
-function normalizeLocale(locale: string | undefined): Locale {
-  const lowered = locale?.toLowerCase();
-  if (lowered?.startsWith('tr')) return 'tr';
-  if (lowered === 'zh' || lowered?.startsWith('zh-')) return 'zh-CN';
+export function coerceLocale(locale: string | undefined): Locale {
+  if (!locale) return 'en';
+  if (KNOWN_LOCALES.includes(locale as Locale)) return locale as Locale;
+
+  const lowered = locale.toLowerCase();
+  if (lowered.startsWith('tr')) return 'tr';
+  if (lowered === 'zh' || lowered.startsWith('zh-')) return 'zh-CN';
+  if (lowered === 'ja' || lowered.startsWith('ja-')) return 'ja';
+  if (lowered === 'ru' || lowered.startsWith('ru-')) return 'ru';
+  if (lowered === 'fr' || lowered.startsWith('fr-')) return 'fr';
+  if (lowered === 'vi' || lowered.startsWith('vi-')) return 'vi';
+  if (lowered === 'el' || lowered.startsWith('el-')) return 'el';
   return 'en';
 }
 
@@ -616,7 +664,7 @@ export function useLocale(): { locale: Locale; t: (key: string) => string } {
     getStatus()
       .then((status) => {
         if (cancelled) return;
-        const detected = normalizeLocale(status.locale);
+        const detected = coerceLocale(status.locale);
         setLocale(detected);
         setLocaleState(detected);
       })

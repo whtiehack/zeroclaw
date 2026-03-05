@@ -1,5 +1,6 @@
 #![warn(clippy::all, clippy::pedantic)]
 #![forbid(unsafe_code)]
+#![recursion_limit = "256"]
 #![allow(
     clippy::assigning_clones,
     clippy::bool_to_int_with_if,
@@ -27,6 +28,40 @@
     clippy::too_many_lines,
     clippy::uninlined_format_args,
     clippy::unnecessary_cast,
+    clippy::assertions_on_constants,
+    clippy::await_holding_lock,
+    clippy::cast_lossless,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::default_trait_access,
+    clippy::doc_lazy_continuation,
+    clippy::explicit_iter_loop,
+    clippy::fn_params_excessive_bools,
+    clippy::format_push_string,
+    clippy::if_not_else,
+    clippy::large_enum_variant,
+    clippy::large_futures,
+    clippy::manual_clamp,
+    clippy::manual_contains,
+    clippy::manual_is_multiple_of,
+    clippy::manual_pattern_char_comparison,
+    clippy::manual_string_new,
+    clippy::match_same_arms,
+    clippy::missing_fields_in_debug,
+    clippy::needless_borrow,
+    clippy::needless_lifetimes,
+    clippy::redundant_else,
+    clippy::semicolon_if_nothing_returned,
+    clippy::should_implement_trait,
+    clippy::stable_sort_primitive,
+    clippy::struct_excessive_bools,
+    clippy::type_complexity,
+    clippy::unchecked_time_subtraction,
+    clippy::unnecessary_debug_formatting,
+    clippy::unnested_or_patterns,
+    clippy::unreadable_literal,
+    clippy::unused_async,
+    clippy::wildcard_imports,
     clippy::unnecessary_lazy_evaluations,
     clippy::unnecessary_literal_bound,
     clippy::unnecessary_map_or,
@@ -49,6 +84,7 @@ pub(crate) mod cost;
 pub(crate) mod cron;
 pub(crate) mod daemon;
 pub(crate) mod doctor;
+pub mod economic;
 pub mod gateway;
 pub mod goals;
 pub(crate) mod hardware;
@@ -72,6 +108,8 @@ pub mod runtime;
 pub(crate) mod security;
 pub(crate) mod service;
 pub(crate) mod skills;
+#[cfg(test)]
+pub(crate) mod test_locks;
 pub mod tools;
 pub(crate) mod tunnel;
 pub mod update;
@@ -112,13 +150,13 @@ Add a new channel configuration.
 Provide the channel type and a JSON object with the required \
 configuration keys for that channel type.
 
-Supported types: telegram, discord, slack, whatsapp, matrix, imessage, email.
+Supported types: telegram, discord, slack, whatsapp, github, matrix, imessage, email.
 
 Examples:
   zeroclaw channel add telegram '{\"bot_token\":\"...\",\"name\":\"my-bot\"}'
   zeroclaw channel add discord '{\"bot_token\":\"...\",\"name\":\"my-discord\"}'")]
     Add {
-        /// Channel type (telegram, discord, slack, whatsapp, matrix, imessage, email)
+        /// Channel type (telegram, discord, slack, whatsapp, github, matrix, imessage, email)
         channel_type: String,
         /// Optional configuration as JSON
         config: String,
@@ -191,15 +229,27 @@ pub enum SkillCommands {
 /// Migration subcommands
 #[derive(Subcommand, Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum MigrateCommands {
-    /// Import memory from an `OpenClaw` workspace into this `ZeroClaw` workspace
+    /// Import OpenClaw data into this ZeroClaw workspace (memory, config, agents)
     Openclaw {
         /// Optional path to `OpenClaw` workspace (defaults to ~/.openclaw/workspace)
         #[arg(long)]
         source: Option<std::path::PathBuf>,
 
+        /// Optional path to `OpenClaw` config file (defaults to ~/.openclaw/openclaw.json)
+        #[arg(long)]
+        source_config: Option<std::path::PathBuf>,
+
         /// Validate and preview migration without writing any data
         #[arg(long)]
         dry_run: bool,
+
+        /// Skip memory migration
+        #[arg(long)]
+        no_memory: bool,
+
+        /// Skip configuration and agents migration
+        #[arg(long)]
+        no_config: bool,
     },
 }
 
@@ -354,6 +404,15 @@ pub enum MemoryCommands {
         /// Skip confirmation prompt
         #[arg(long)]
         yes: bool,
+    },
+    /// Rebuild embeddings for all memories (use after changing embedding model)
+    Reindex {
+        /// Skip confirmation prompt
+        #[arg(long)]
+        yes: bool,
+        /// Show progress during reindex
+        #[arg(long, default_value = "true")]
+        progress: bool,
     },
 }
 

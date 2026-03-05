@@ -8,6 +8,9 @@ use std::time::{Duration, SystemTime};
 
 mod audit;
 mod templates;
+mod tool_handler;
+
+pub use tool_handler::SkillToolHandler;
 
 const OPEN_SKILLS_REPO_URL: &str = "https://github.com/besoeasy/open-skills";
 const OPEN_SKILLS_SYNC_MARKER: &str = ".zeroclaw-open-skills-sync";
@@ -31,6 +34,9 @@ pub struct Skill {
     pub prompts: Vec<String>,
     #[serde(skip)]
     pub location: Option<PathBuf>,
+    /// When true, include full skill instructions even in compact prompt mode.
+    #[serde(default)]
+    pub always: bool,
 }
 
 /// A tool defined by a skill (shell command, HTTP call, etc.)
@@ -57,6 +63,11 @@ struct SkillManifest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+struct SkillMetadataManifest {
+    skill: SkillMeta,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct SkillMeta {
     name: String,
     description: String,
@@ -72,9 +83,24 @@ fn default_version() -> String {
     "0.1.0".to_string()
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SkillLoadMode {
+    Full,
+    MetadataOnly,
+}
+
+impl SkillLoadMode {
+    fn from_prompt_mode(mode: crate::config::SkillsPromptInjectionMode) -> Self {
+        match mode {
+            crate::config::SkillsPromptInjectionMode::Full => Self::Full,
+            crate::config::SkillsPromptInjectionMode::Compact => Self::MetadataOnly,
+        }
+    }
+}
+
 /// Load all skills from the workspace skills directory
 pub fn load_skills(workspace_dir: &Path) -> Vec<Skill> {
-    load_skills_with_open_skills_config(workspace_dir, None, None, None)
+    load_skills_with_open_skills_config(workspace_dir, None, None, None, None, SkillLoadMode::Full)
 }
 
 /// Load skills using runtime config values (preferred at runtime).
@@ -84,6 +110,22 @@ pub fn load_skills_with_config(workspace_dir: &Path, config: &crate::config::Con
         Some(config.skills.open_skills_enabled),
         config.skills.open_skills_dir.as_deref(),
         Some(config.skills.allow_scripts),
+        Some(&config.skills.trusted_skill_roots),
+        SkillLoadMode::from_prompt_mode(config.skills.prompt_injection_mode),
+    )
+}
+
+fn load_skills_full_with_config(
+    workspace_dir: &Path,
+    config: &crate::config::Config,
+) -> Vec<Skill> {
+    load_skills_with_open_skills_config(
+        workspace_dir,
+        Some(config.skills.open_skills_enabled),
+        config.skills.open_skills_dir.as_deref(),
+        Some(config.skills.allow_scripts),
+        Some(&config.skills.trusted_skill_roots),
+        SkillLoadMode::Full,
     )
 }
 
@@ -92,26 +134,130 @@ fn load_skills_with_open_skills_config(
     config_open_skills_enabled: Option<bool>,
     config_open_skills_dir: Option<&str>,
     config_allow_scripts: Option<bool>,
+    config_trusted_skill_roots: Option<&[String]>,
+    load_mode: SkillLoadMode,
 ) -> Vec<Skill> {
     let mut skills = Vec::new();
     let allow_scripts = config_allow_scripts.unwrap_or(false);
+    let trusted_skill_roots =
+        resolve_trusted_skill_roots(workspace_dir, config_trusted_skill_roots.unwrap_or(&[]));
 
     if let Some(open_skills_dir) =
         ensure_open_skills_repo(config_open_skills_enabled, config_open_skills_dir)
     {
-        skills.extend(load_open_skills(&open_skills_dir, allow_scripts));
+        skills.extend(load_open_skills(&open_skills_dir, allow_scripts, load_mode));
     }
 
-    skills.extend(load_workspace_skills(workspace_dir, allow_scripts));
+    skills.extend(load_workspace_skills(
+        workspace_dir,
+        allow_scripts,
+        &trusted_skill_roots,
+        load_mode,
+    ));
     skills
 }
 
-fn load_workspace_skills(workspace_dir: &Path, allow_scripts: bool) -> Vec<Skill> {
+fn load_workspace_skills(
+    workspace_dir: &Path,
+    allow_scripts: bool,
+    trusted_skill_roots: &[PathBuf],
+    load_mode: SkillLoadMode,
+) -> Vec<Skill> {
     let skills_dir = workspace_dir.join("skills");
-    load_skills_from_directory(&skills_dir, allow_scripts)
+    load_skills_from_directory(&skills_dir, allow_scripts, trusted_skill_roots, load_mode)
 }
 
-fn load_skills_from_directory(skills_dir: &Path, allow_scripts: bool) -> Vec<Skill> {
+fn resolve_trusted_skill_roots(workspace_dir: &Path, raw_roots: &[String]) -> Vec<PathBuf> {
+    let home_dir = UserDirs::new().map(|dirs| dirs.home_dir().to_path_buf());
+    let mut resolved = Vec::new();
+
+    for raw in raw_roots {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        let expanded = if trimmed == "~" {
+            home_dir.clone().unwrap_or_else(|| PathBuf::from(trimmed))
+        } else if let Some(rest) = trimmed
+            .strip_prefix("~/")
+            .or_else(|| trimmed.strip_prefix("~\\"))
+        {
+            home_dir
+                .as_ref()
+                .map(|home| home.join(rest))
+                .unwrap_or_else(|| PathBuf::from(trimmed))
+        } else {
+            PathBuf::from(trimmed)
+        };
+
+        let candidate = if expanded.is_relative() {
+            workspace_dir.join(expanded)
+        } else {
+            expanded
+        };
+
+        match candidate.canonicalize() {
+            Ok(canonical) if canonical.is_dir() => resolved.push(canonical),
+            Ok(canonical) => tracing::warn!(
+                "ignoring [skills].trusted_skill_roots entry '{}': canonical path is not a directory ({})",
+                trimmed,
+                canonical.display()
+            ),
+            Err(err) => tracing::warn!(
+                "ignoring [skills].trusted_skill_roots entry '{}': failed to canonicalize {} ({err})",
+                trimmed,
+                candidate.display()
+            ),
+        }
+    }
+
+    resolved.sort();
+    resolved.dedup();
+    resolved
+}
+
+fn enforce_workspace_skill_symlink_trust(
+    path: &Path,
+    trusted_skill_roots: &[PathBuf],
+) -> Result<()> {
+    let canonical_target = path
+        .canonicalize()
+        .with_context(|| format!("failed to resolve skill symlink target {}", path.display()))?;
+
+    if !canonical_target.is_dir() {
+        anyhow::bail!(
+            "symlink target is not a directory: {}",
+            canonical_target.display()
+        );
+    }
+
+    if trusted_skill_roots
+        .iter()
+        .any(|root| canonical_target.starts_with(root))
+    {
+        return Ok(());
+    }
+
+    if trusted_skill_roots.is_empty() {
+        anyhow::bail!(
+            "symlink target {} is not allowed because [skills].trusted_skill_roots is empty",
+            canonical_target.display()
+        );
+    }
+
+    anyhow::bail!(
+        "symlink target {} is outside configured [skills].trusted_skill_roots",
+        canonical_target.display()
+    );
+}
+
+fn load_skills_from_directory(
+    skills_dir: &Path,
+    allow_scripts: bool,
+    trusted_skill_roots: &[PathBuf],
+    load_mode: SkillLoadMode,
+) -> Vec<Skill> {
     if !skills_dir.exists() {
         return Vec::new();
     }
@@ -124,7 +270,26 @@ fn load_skills_from_directory(skills_dir: &Path, allow_scripts: bool) -> Vec<Ski
 
     for entry in entries.flatten() {
         let path = entry.path();
-        if !path.is_dir() {
+        let metadata = match std::fs::symlink_metadata(&path) {
+            Ok(meta) => meta,
+            Err(err) => {
+                tracing::warn!(
+                    "skipping skill entry {}: failed to read metadata ({err})",
+                    path.display()
+                );
+                continue;
+            }
+        };
+
+        if metadata.file_type().is_symlink() {
+            if let Err(err) = enforce_workspace_skill_symlink_trust(&path, trusted_skill_roots) {
+                tracing::warn!(
+                    "skipping untrusted symlinked skill entry {}: {err}",
+                    path.display()
+                );
+                continue;
+            }
+        } else if !metadata.is_dir() {
             continue;
         }
 
@@ -155,11 +320,11 @@ fn load_skills_from_directory(skills_dir: &Path, allow_scripts: bool) -> Vec<Ski
         let md_path = path.join("SKILL.md");
 
         if manifest_path.exists() {
-            if let Ok(skill) = load_skill_toml(&manifest_path) {
+            if let Ok(skill) = load_skill_toml(&manifest_path, load_mode) {
                 skills.push(skill);
             }
         } else if md_path.exists() {
-            if let Ok(skill) = load_skill_md(&md_path, &path) {
+            if let Ok(skill) = load_skill_md(&md_path, &path, load_mode) {
                 skills.push(skill);
             }
         }
@@ -168,13 +333,13 @@ fn load_skills_from_directory(skills_dir: &Path, allow_scripts: bool) -> Vec<Ski
     skills
 }
 
-fn load_open_skills(repo_dir: &Path, allow_scripts: bool) -> Vec<Skill> {
+fn load_open_skills(repo_dir: &Path, allow_scripts: bool, load_mode: SkillLoadMode) -> Vec<Skill> {
     // Modern open-skills layout stores skill packages in `skills/<name>/SKILL.md`.
     // Prefer that structure to avoid treating repository docs (e.g. CONTRIBUTING.md)
     // as executable skills.
     let nested_skills_dir = repo_dir.join("skills");
     if nested_skills_dir.is_dir() {
-        return load_skills_from_directory(&nested_skills_dir, allow_scripts);
+        return load_skills_from_directory(&nested_skills_dir, allow_scripts, &[], load_mode);
     }
 
     let mut skills = Vec::new();
@@ -224,7 +389,7 @@ fn load_open_skills(repo_dir: &Path, allow_scripts: bool) -> Vec<Skill> {
             }
         }
 
-        if let Ok(skill) = load_open_skill_md(&path) {
+        if let Ok(skill) = load_open_skill_md(&path, load_mode) {
             skills.push(skill);
         }
     }
@@ -418,25 +583,44 @@ fn mark_open_skills_synced(repo_dir: &Path) -> Result<()> {
 }
 
 /// Load a skill from a SKILL.toml manifest
-fn load_skill_toml(path: &Path) -> Result<Skill> {
+fn load_skill_toml(path: &Path, load_mode: SkillLoadMode) -> Result<Skill> {
     let content = std::fs::read_to_string(path)?;
-    let manifest: SkillManifest = toml::from_str(&content)?;
-
-    Ok(Skill {
-        name: manifest.skill.name,
-        description: manifest.skill.description,
-        version: manifest.skill.version,
-        author: manifest.skill.author,
-        tags: manifest.skill.tags,
-        tools: manifest.tools,
-        prompts: manifest.prompts,
-        location: Some(path.to_path_buf()),
-    })
+    match load_mode {
+        SkillLoadMode::Full => {
+            let manifest: SkillManifest = toml::from_str(&content)?;
+            Ok(Skill {
+                name: manifest.skill.name,
+                description: manifest.skill.description,
+                version: manifest.skill.version,
+                author: manifest.skill.author,
+                tags: manifest.skill.tags,
+                tools: manifest.tools,
+                prompts: manifest.prompts,
+                location: Some(path.to_path_buf()),
+                always: false,
+            })
+        }
+        SkillLoadMode::MetadataOnly => {
+            let manifest: SkillMetadataManifest = toml::from_str(&content)?;
+            Ok(Skill {
+                name: manifest.skill.name,
+                description: manifest.skill.description,
+                version: manifest.skill.version,
+                author: manifest.skill.author,
+                tags: manifest.skill.tags,
+                tools: Vec::new(),
+                prompts: Vec::new(),
+                location: Some(path.to_path_buf()),
+                always: false,
+            })
+        }
+    }
 }
 
 /// Load a skill from a SKILL.md file (simpler format)
-fn load_skill_md(path: &Path, dir: &Path) -> Result<Skill> {
+fn load_skill_md(path: &Path, dir: &Path, load_mode: SkillLoadMode) -> Result<Skill> {
     let content = std::fs::read_to_string(path)?;
+    let (fm, body) = parse_front_matter(&content);
     let mut name = dir
         .file_name()
         .and_then(|n| n.to_str())
@@ -452,7 +636,8 @@ fn load_skill_md(path: &Path, dir: &Path) -> Result<Skill> {
         if let Ok(raw) = std::fs::read(&meta_path) {
             if let Ok(meta) = serde_json::from_slice::<serde_json::Value>(&raw) {
                 if let Some(slug) = meta.get("slug").and_then(|v| v.as_str()) {
-                    let normalized = normalize_skill_name(slug.split('/').last().unwrap_or(slug));
+                    let normalized =
+                        normalize_skill_name(slug.split('/').next_back().unwrap_or(slug));
                     if !normalized.is_empty() {
                         name = normalized;
                     }
@@ -467,6 +652,32 @@ fn load_skill_md(path: &Path, dir: &Path) -> Result<Skill> {
         }
     }
 
+    if let Some(fm_name) = fm.get("name") {
+        if !fm_name.is_empty() {
+            name = fm_name.clone();
+        }
+    }
+    if let Some(fm_version) = fm.get("version") {
+        if !fm_version.is_empty() {
+            version = fm_version.clone();
+        }
+    }
+    if let Some(fm_author) = fm.get("author") {
+        if !fm_author.is_empty() {
+            author = Some(fm_author.clone());
+        }
+    }
+    let always = fm_bool(&fm, "always");
+    let prompt_body = if body.trim().is_empty() {
+        content.clone()
+    } else {
+        body.to_string()
+    };
+    let prompts = match load_mode {
+        SkillLoadMode::Full => vec![prompt_body],
+        SkillLoadMode::MetadataOnly => Vec::new(),
+    };
+
     Ok(Skill {
         name,
         description: extract_description(&content),
@@ -474,18 +685,23 @@ fn load_skill_md(path: &Path, dir: &Path) -> Result<Skill> {
         author,
         tags: Vec::new(),
         tools: Vec::new(),
-        prompts: vec![content],
+        prompts,
         location: Some(path.to_path_buf()),
+        always,
     })
 }
 
-fn load_open_skill_md(path: &Path) -> Result<Skill> {
+fn load_open_skill_md(path: &Path, load_mode: SkillLoadMode) -> Result<Skill> {
     let content = std::fs::read_to_string(path)?;
     let name = path
         .file_stem()
         .and_then(|n| n.to_str())
         .unwrap_or("open-skill")
         .to_string();
+    let prompts = match load_mode {
+        SkillLoadMode::Full => vec![content.clone()],
+        SkillLoadMode::MetadataOnly => Vec::new(),
+    };
 
     Ok(Skill {
         name,
@@ -494,14 +710,81 @@ fn load_open_skill_md(path: &Path) -> Result<Skill> {
         author: Some("besoeasy/open-skills".to_string()),
         tags: vec!["open-skills".to_string()],
         tools: Vec::new(),
-        prompts: vec![content],
+        prompts,
         location: Some(path.to_path_buf()),
+        always: false,
     })
 }
 
+/// Strip matching single/double quotes from a scalar value.
+fn strip_quotes(s: &str) -> &str {
+    let trimmed = s.trim();
+    if trimmed.len() >= 2
+        && ((trimmed.starts_with('"') && trimmed.ends_with('"'))
+            || (trimmed.starts_with('\'') && trimmed.ends_with('\'')))
+    {
+        &trimmed[1..trimmed.len() - 1]
+    } else {
+        trimmed
+    }
+}
+
+/// Parse optional YAML-like front matter from a SKILL.md body.
+/// Returns (front_matter_map, body_without_front_matter).
+fn parse_front_matter(content: &str) -> (HashMap<String, String>, &str) {
+    let text = content.strip_prefix('\u{feff}').unwrap_or(content);
+    let mut lines = text.lines();
+    let Some(first) = lines.next() else {
+        return (HashMap::new(), content);
+    };
+    if first.trim() != "---" {
+        return (HashMap::new(), content);
+    }
+
+    let mut map = HashMap::new();
+    let start = first.len() + 1;
+    let mut end = start;
+    for line in lines {
+        if line.trim() == "---" {
+            let body_start = end + line.len() + 1;
+            let body = if body_start <= text.len() {
+                text[body_start..].trim_start_matches(['\n', '\r'])
+            } else {
+                ""
+            };
+            return (map, body);
+        }
+
+        if let Some((key, value)) = line.split_once(':') {
+            let key = key.trim().to_lowercase();
+            let value = strip_quotes(value).to_string();
+            if !key.is_empty() && !value.is_empty() {
+                map.insert(key, value);
+            }
+        }
+        end += line.len() + 1;
+    }
+
+    // Unclosed block: ignore as plain markdown for safety/backward compatibility.
+    (HashMap::new(), content)
+}
+
+/// Parse permissive boolean values from front matter.
+fn fm_bool(map: &HashMap<String, String>, key: &str) -> bool {
+    map.get(key)
+        .map(|v| matches!(v.to_ascii_lowercase().as_str(), "true" | "yes" | "1"))
+        .unwrap_or(false)
+}
+
 fn extract_description(content: &str) -> String {
-    content
-        .lines()
+    let (fm, body) = parse_front_matter(content);
+    if let Some(desc) = fm.get("description") {
+        if !desc.trim().is_empty() {
+            return desc.trim().to_string();
+        }
+    }
+
+    body.lines()
         .find(|line| !line.starts_with('#') && !line.trim().is_empty())
         .unwrap_or("No description")
         .trim()
@@ -545,12 +828,16 @@ fn resolve_skill_location(skill: &Skill, workspace_dir: &Path) -> PathBuf {
 
 fn render_skill_location(skill: &Skill, workspace_dir: &Path, prefer_relative: bool) -> String {
     let location = resolve_skill_location(skill, workspace_dir);
-    if prefer_relative {
-        if let Ok(relative) = location.strip_prefix(workspace_dir) {
-            return relative.display().to_string();
+    let path_str = if prefer_relative {
+        match location.strip_prefix(workspace_dir) {
+            Ok(relative) => relative.display().to_string(),
+            Err(_) => location.display().to_string(),
         }
-    }
-    location.display().to_string()
+    } else {
+        location.display().to_string()
+    };
+    // Normalize path separators to forward slashes for XML output (portable across Windows/Unix)
+    path_str.replace('\\', "/")
 }
 
 /// Build the "Available Skills" system prompt section with full skill instructions.
@@ -584,7 +871,8 @@ pub fn skills_to_prompt_with_mode(
         crate::config::SkillsPromptInjectionMode::Compact => String::from(
             "## Available Skills\n\n\
              Skill summaries are preloaded below to keep context compact.\n\
-             Skill instructions are loaded on demand: read the skill file in `location` only when needed.\n\n\
+             Skill instructions are loaded on demand: read the skill file in `location` when needed. \
+             Skills marked `always` include full instructions below even in compact mode.\n\n\
              <available_skills>\n",
         ),
     };
@@ -600,7 +888,9 @@ pub fn skills_to_prompt_with_mode(
         );
         write_xml_text_element(&mut prompt, 4, "location", &location);
 
-        if matches!(mode, crate::config::SkillsPromptInjectionMode::Full) {
+        let inject_full =
+            matches!(mode, crate::config::SkillsPromptInjectionMode::Full) || skill.always;
+        if inject_full {
             if !skill.prompts.is_empty() {
                 let _ = writeln!(prompt, "    <instructions>");
                 for instruction in &skill.prompts {
@@ -632,6 +922,39 @@ pub fn skills_to_prompt_with_mode(
 /// Get the skills directory path
 pub fn skills_dir(workspace_dir: &Path) -> PathBuf {
     workspace_dir.join("skills")
+}
+
+/// Create tool handlers for all skill tools
+pub fn create_skill_tools(
+    skills: &[Skill],
+    security: std::sync::Arc<crate::security::SecurityPolicy>,
+) -> Vec<Box<dyn crate::tools::Tool>> {
+    let mut tools: Vec<Box<dyn crate::tools::Tool>> = Vec::new();
+
+    for skill in skills {
+        for tool_def in &skill.tools {
+            match SkillToolHandler::new(skill.name.clone(), tool_def.clone(), security.clone()) {
+                Ok(handler) => {
+                    tracing::debug!(
+                        skill = %skill.name,
+                        tool = %tool_def.name,
+                        "Registered skill tool"
+                    );
+                    tools.push(Box::new(handler));
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        skill = %skill.name,
+                        tool = %tool_def.name,
+                        error = %e,
+                        "Failed to create skill tool handler"
+                    );
+                }
+            }
+        }
+    }
+
+    tools
 }
 
 /// Initialize the skills directory with a README
@@ -1504,19 +1827,32 @@ fn validate_artifact_url(
 // Zip contents follow the OpenClaw convention: `_meta.json` + `SKILL.md` + scripts.
 
 const CLAWHUB_DOMAIN: &str = "clawhub.ai";
+const CLAWHUB_WWW_DOMAIN: &str = "www.clawhub.ai";
 const CLAWHUB_DOWNLOAD_API: &str = "https://clawhub.ai/api/v1/download";
+
+fn is_clawhub_host(host: &str) -> bool {
+    host.eq_ignore_ascii_case(CLAWHUB_DOMAIN) || host.eq_ignore_ascii_case(CLAWHUB_WWW_DOMAIN)
+}
+
+fn parse_clawhub_url(source: &str) -> Option<reqwest::Url> {
+    let parsed = reqwest::Url::parse(source).ok()?;
+    match parsed.scheme() {
+        "https" | "http" => {}
+        _ => return None,
+    }
+    if !parsed.host_str().is_some_and(is_clawhub_host) {
+        return None;
+    }
+    Some(parsed)
+}
 
 /// Returns true if `source` is a ClawhHub skill reference.
 fn is_clawhub_source(source: &str) -> bool {
     if source.starts_with("clawhub:") {
         return true;
     }
-    // Auto-detect from domain: https://clawhub.ai/...
-    if let Some(rest) = source.strip_prefix("https://") {
-        let host = rest.split('/').next().unwrap_or("");
-        return host == CLAWHUB_DOMAIN;
-    }
-    false
+    // Auto-detect from URL host, supporting both clawhub.ai and www.clawhub.ai.
+    parse_clawhub_url(source).is_some()
 }
 
 /// Convert a ClawhHub source string into the zip download URL.
@@ -1539,14 +1875,16 @@ fn clawhub_download_url(source: &str) -> Result<String> {
         }
         return Ok(format!("{CLAWHUB_DOWNLOAD_API}?slug={slug}"));
     }
-    // Profile URL: https://clawhub.ai/<owner>/<slug>  or  https://clawhub.ai/<slug>
+    // Profile URL: https://clawhub.ai/<owner>/<slug> or https://www.clawhub.ai/<slug>.
     // Forward the full path as the slug so the API can resolve owner-namespaced skills.
-    if let Some(rest) = source.strip_prefix("https://") {
-        let path = rest
-            .strip_prefix(CLAWHUB_DOMAIN)
-            .unwrap_or("")
-            .trim_start_matches('/');
-        let path = path.trim_end_matches('/');
+    if let Some(parsed) = parse_clawhub_url(source) {
+        let path = parsed
+            .path_segments()
+            .into_iter()
+            .flatten()
+            .filter(|segment| !segment.is_empty())
+            .collect::<Vec<_>>()
+            .join("/");
         if path.is_empty() {
             anyhow::bail!("could not extract slug from ClawhHub URL: {source}");
         }
@@ -1616,7 +1954,7 @@ fn extract_zip_skill_meta(
         f.read_to_end(&mut buf).ok();
         if let Ok(meta) = serde_json::from_slice::<serde_json::Value>(&buf) {
             let slug_raw = meta.get("slug").and_then(|v| v.as_str()).unwrap_or("");
-            let base = slug_raw.split('/').last().unwrap_or(slug_raw);
+            let base = slug_raw.split('/').next_back().unwrap_or(slug_raw);
             let name = normalize_skill_name(base);
             if !name.is_empty() {
                 let version = meta
@@ -1953,7 +2291,7 @@ pub fn handle_command(command: crate::SkillCommands, config: &crate::config::Con
         }
 
         crate::SkillCommands::List => {
-            let skills = load_skills_with_config(workspace_dir, config);
+            let skills = load_skills_full_with_config(workspace_dir, config);
             if skills.is_empty() {
                 println!("No skills installed.");
                 println!();
@@ -2000,6 +2338,20 @@ pub fn handle_command(command: crate::SkillCommands, config: &crate::config::Con
 
             if !target.exists() {
                 anyhow::bail!("Skill source or installed skill not found: {source}");
+            }
+
+            let trusted_skill_roots =
+                resolve_trusted_skill_roots(workspace_dir, &config.skills.trusted_skill_roots);
+            if let Ok(metadata) = std::fs::symlink_metadata(&target) {
+                if metadata.file_type().is_symlink() {
+                    enforce_workspace_skill_symlink_trust(&target, &trusted_skill_roots)
+                        .with_context(|| {
+                            format!(
+                                "trusted-symlink policy rejected audit target {}",
+                                target.display()
+                            )
+                        })?;
+                }
             }
 
             let report = audit::audit_skill_directory_with_options(
@@ -2295,6 +2647,7 @@ command = "echo hello"
             tools: vec![],
             prompts: vec!["Do the thing.".to_string()],
             location: None,
+            always: false,
         }];
         let prompt = skills_to_prompt(&skills, Path::new("/tmp"));
         assert!(prompt.contains("<available_skills>"));
@@ -2319,6 +2672,7 @@ command = "echo hello"
             }],
             prompts: vec!["Do the thing.".to_string()],
             location: Some(PathBuf::from("/tmp/workspace/skills/test/SKILL.md")),
+            always: false,
         }];
         let prompt = skills_to_prompt_with_mode(
             &skills,
@@ -2333,6 +2687,71 @@ command = "echo hello"
         assert!(!prompt.contains("<instructions>"));
         assert!(!prompt.contains("<instruction>Do the thing.</instruction>"));
         assert!(!prompt.contains("<tools>"));
+    }
+
+    #[test]
+    fn skills_to_prompt_compact_mode_includes_always_skill_instructions_and_tools() {
+        let skills = vec![Skill {
+            name: "always-skill".to_string(),
+            description: "Must always inject".to_string(),
+            version: "1.0.0".to_string(),
+            author: None,
+            tags: vec![],
+            tools: vec![SkillTool {
+                name: "run".to_string(),
+                description: "Run task".to_string(),
+                kind: "shell".to_string(),
+                command: "echo hi".to_string(),
+                args: HashMap::new(),
+            }],
+            prompts: vec!["Do the thing every time.".to_string()],
+            location: Some(PathBuf::from("/tmp/workspace/skills/always-skill/SKILL.md")),
+            always: true,
+        }];
+        let prompt = skills_to_prompt_with_mode(
+            &skills,
+            Path::new("/tmp/workspace"),
+            crate::config::SkillsPromptInjectionMode::Compact,
+        );
+
+        assert!(prompt.contains("<available_skills>"));
+        assert!(prompt.contains("<name>always-skill</name>"));
+        assert!(prompt.contains("<instruction>Do the thing every time.</instruction>"));
+        assert!(prompt.contains("<tools>"));
+        assert!(prompt.contains("<name>run</name>"));
+        assert!(prompt.contains("<kind>shell</kind>"));
+    }
+
+    #[test]
+    fn load_skill_md_front_matter_overrides_metadata_and_description() {
+        let dir = tempfile::tempdir().unwrap();
+        let skill_dir = dir.path().join("fm-skill");
+        fs::create_dir_all(&skill_dir).unwrap();
+        let skill_md = skill_dir.join("SKILL.md");
+        fs::write(
+            &skill_md,
+            r#"---
+name: "overridden-name"
+version: "2.1.3"
+author: "alice"
+description: "Front-matter description"
+always: true
+---
+# Heading
+Body text that should be included.
+"#,
+        )
+        .unwrap();
+
+        let skill = load_skill_md(&skill_md, &skill_dir, SkillLoadMode::Full).unwrap();
+        assert_eq!(skill.name, "overridden-name");
+        assert_eq!(skill.version, "2.1.3");
+        assert_eq!(skill.author.as_deref(), Some("alice"));
+        assert_eq!(skill.description, "Front-matter description");
+        assert!(skill.always);
+        assert_eq!(skill.prompts.len(), 1);
+        assert!(!skill.prompts[0].contains("name: \"overridden-name\""));
+        assert!(skill.prompts[0].contains("# Heading"));
     }
 
     #[test]
@@ -2519,6 +2938,7 @@ description = "Bare minimum"
             }],
             prompts: vec![],
             location: None,
+            always: false,
         }];
         let prompt = skills_to_prompt(&skills, Path::new("/tmp"));
         assert!(prompt.contains("weather"));
@@ -2538,6 +2958,7 @@ description = "Bare minimum"
             tools: vec![],
             prompts: vec!["Use <tool> & check \"quotes\".".to_string()],
             location: None,
+            always: false,
         }];
 
         let prompt = skills_to_prompt(&skills, Path::new("/tmp"));
@@ -2689,6 +3110,65 @@ description = "Bare minimum"
         assert_eq!(skills.len(), 1);
         assert_eq!(skills[0].name, "http_request");
         assert_ne!(skills[0].name, "CONTRIBUTING");
+    }
+
+    #[test]
+    fn load_skills_with_config_compact_mode_uses_metadata_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace_dir = dir.path().join("workspace");
+        let skills_dir = workspace_dir.join("skills");
+        fs::create_dir_all(&skills_dir).unwrap();
+
+        let md_skill = skills_dir.join("md-meta");
+        fs::create_dir_all(&md_skill).unwrap();
+        fs::write(
+            md_skill.join("SKILL.md"),
+            "# Metadata\nMetadata summary line\nUse this only when needed.\n",
+        )
+        .unwrap();
+
+        let toml_skill = skills_dir.join("toml-meta");
+        fs::create_dir_all(&toml_skill).unwrap();
+        fs::write(
+            toml_skill.join("SKILL.toml"),
+            r#"
+[skill]
+name = "toml-meta"
+description = "Toml metadata description"
+version = "1.2.3"
+
+[[tools]]
+name = "dangerous-tool"
+description = "Should not preload"
+kind = "shell"
+command = "echo no"
+
+prompts = ["Do not preload me"]
+"#,
+        )
+        .unwrap();
+
+        let mut config = crate::config::Config::default();
+        config.workspace_dir = workspace_dir.clone();
+        config.skills.prompt_injection_mode = crate::config::SkillsPromptInjectionMode::Compact;
+
+        let mut skills = load_skills_with_config(&workspace_dir, &config);
+        skills.sort_by(|a, b| a.name.cmp(&b.name));
+
+        assert_eq!(skills.len(), 2);
+
+        let md = skills.iter().find(|skill| skill.name == "md-meta").unwrap();
+        assert_eq!(md.description, "Metadata summary line");
+        assert!(md.prompts.is_empty());
+        assert!(md.tools.is_empty());
+
+        let toml = skills
+            .iter()
+            .find(|skill| skill.name == "toml-meta")
+            .unwrap();
+        assert_eq!(toml.description, "Toml metadata description");
+        assert!(toml.prompts.is_empty());
+        assert!(toml.tools.is_empty());
     }
 
     // ── is_registry_source ────────────────────────────────────────────────────
@@ -2892,6 +3372,8 @@ description = "Bare minimum"
         assert!(is_clawhub_source("https://clawhub.ai/steipete/gog"));
         assert!(is_clawhub_source("https://clawhub.ai/gog"));
         assert!(is_clawhub_source("https://clawhub.ai/user/my-skill"));
+        assert!(is_clawhub_source("https://www.clawhub.ai/steipete/gog"));
+        assert!(is_clawhub_source("http://clawhub.ai/steipete/gog"));
     }
 
     #[test]
@@ -2911,6 +3393,12 @@ description = "Bare minimum"
     fn clawhub_download_url_from_profile_url() {
         // Owner-namespaced URL: full path forwarded as slug with literal slash
         let url = clawhub_download_url("https://clawhub.ai/steipete/gog").unwrap();
+        assert_eq!(url, "https://clawhub.ai/api/v1/download?slug=steipete/gog");
+    }
+
+    #[test]
+    fn clawhub_download_url_from_www_profile_url() {
+        let url = clawhub_download_url("https://www.clawhub.ai/steipete/gog").unwrap();
         assert_eq!(url, "https://clawhub.ai/api/v1/download?slug=steipete/gog");
     }
 

@@ -50,13 +50,19 @@ env:
 jobs:
     audit:
         name: CI Change Audit
-        runs-on: [self-hosted, aws-india]
+        runs-on: [self-hosted, Linux, X64, aws-india, light, cpu40]
         timeout-minutes: 15
         steps:
             - name: Checkout
               uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
               with:
                   fetch-depth: 0
+
+            - name: Setup Python
+              shell: bash
+              run: |
+                  set -euo pipefail
+                  python3 --version
 
             - name: Resolve base/head commits
               id: refs

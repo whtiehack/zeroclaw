@@ -67,10 +67,28 @@ def parse_args() -> argparse.Namespace:
         help="Also dedupe non-PR runs (push/manual). Default dedupe scope is PR-originated runs only.",
     )
     parser.add_argument(
+        "--non-pr-key",
+        default="sha",
+        choices=["sha", "branch"],
+        help=(
+            "Identity key mode for non-PR dedupe when --dedupe-include-non-pr is enabled: "
+            "'sha' keeps one run per commit (default), 'branch' keeps one run per branch."
+        ),
+    )
+    parser.add_argument(
         "--max-cancel",
         type=int,
         default=200,
         help="Maximum number of runs to cancel/apply in one execution.",
+    )
+    parser.add_argument(
+        "--priority-branch-prefix",
+        action="append",
+        default=[],
+        help=(
+            "Branch prefix to prioritize (repeatable). "
+            "When present in queue, non-matching runs of the same workflow become cancel candidates."
+        ),
     )
     parser.add_argument(
         "--apply",
@@ -165,7 +183,13 @@ def parse_timestamp(value: str | None) -> datetime:
         return datetime.fromtimestamp(0, tz=timezone.utc)
 
 
-def run_identity_key(run: dict[str, Any]) -> tuple[str, str, str, str]:
+def branch_has_prefix(branch: str, prefixes: set[str]) -> bool:
+    if not branch:
+        return False
+    return any(branch.startswith(prefix) for prefix in prefixes)
+
+
+def run_identity_key(run: dict[str, Any], *, non_pr_key: str) -> tuple[str, str, str, str]:
     name = str(run.get("name", ""))
     event = str(run.get("event", ""))
     head_branch = str(run.get("head_branch", ""))
@@ -179,7 +203,10 @@ def run_identity_key(run: dict[str, Any]) -> tuple[str, str, str, str]:
     if pr_number:
         # For PR traffic, cancel stale runs across synchronize updates for the same PR.
         return (name, event, f"pr:{pr_number}", "")
-    # For push/manual traffic, key by SHA to avoid collapsing distinct commits.
+    if non_pr_key == "branch":
+        # Branch-level supersedence for push/manual lanes.
+        return (name, event, head_branch, "")
+    # SHA-level supersedence for push/manual lanes.
     return (name, event, head_branch, head_sha)
 
 
@@ -189,6 +216,8 @@ def collect_candidates(
     dedupe_workflows: set[str],
     *,
     include_non_pr: bool,
+    non_pr_key: str,
+    priority_branch_prefixes: set[str],
 ) -> tuple[list[dict[str, Any]], Counter[str]]:
     reasons_by_id: dict[int, set[str]] = defaultdict(set)
     runs_by_id: dict[int, dict[str, Any]] = {}
@@ -205,6 +234,31 @@ def collect_candidates(
         if str(run.get("name", "")) in obsolete_workflows:
             reasons_by_id[run_id].add("obsolete-workflow")
 
+    if priority_branch_prefixes:
+        prioritized_workflows: set[str] = set()
+        for run in runs:
+            branch = str(run.get("head_branch", ""))
+            if branch_has_prefix(branch, priority_branch_prefixes):
+                workflow = str(run.get("name", ""))
+                if workflow:
+                    prioritized_workflows.add(workflow)
+
+        for run in runs:
+            run_id_raw = run.get("id")
+            if run_id_raw is None:
+                continue
+            try:
+                run_id = int(run_id_raw)
+            except (TypeError, ValueError):
+                continue
+            workflow = str(run.get("name", ""))
+            if workflow not in prioritized_workflows:
+                continue
+            branch = str(run.get("head_branch", ""))
+            if branch_has_prefix(branch, priority_branch_prefixes):
+                continue
+            reasons_by_id[run_id].add("priority-preempted-by-release")
+
     by_workflow: dict[str, dict[tuple[str, str, str, str], list[dict[str, Any]]]] = defaultdict(
         lambda: defaultdict(list)
     )
@@ -220,7 +274,7 @@ def collect_candidates(
         has_pr_context = isinstance(pull_requests, list) and len(pull_requests) > 0
         if is_pr_event and not has_pr_context and not include_non_pr:
             continue
-        key = run_identity_key(run)
+        key = run_identity_key(run, non_pr_key=non_pr_key)
         by_workflow[name][key].append(run)
 
     for groups in by_workflow.values():
@@ -299,15 +353,23 @@ def main() -> int:
 
     obsolete_workflows = normalize_values(args.obsolete_workflow)
     dedupe_workflows = normalize_values(args.dedupe_workflow)
-    if not obsolete_workflows and not dedupe_workflows:
+    priority_prefixes = normalize_values(args.priority_branch_prefix)
+    if not obsolete_workflows and not dedupe_workflows and not priority_prefixes:
         print(
-            "queue_hygiene: no policy configured. Provide --obsolete-workflow and/or --dedupe-workflow.",
+            "queue_hygiene: no policy configured. Provide --obsolete-workflow, --dedupe-workflow, and/or --priority-branch-prefix.",
             file=sys.stderr,
         )
         return 2
 
     owner, repo = split_repo(args.repo)
     token = resolve_token(args.token)
+    if args.apply and not token:
+        print(
+            "queue_hygiene: apply mode requires authentication token "
+            "(set GH_TOKEN/GITHUB_TOKEN, pass --token, or configure gh auth).",
+            file=sys.stderr,
+        )
+        return 2
     api = GitHubApi(args.api_url, token)
 
     if args.runs_json:
@@ -324,6 +386,8 @@ def main() -> int:
         obsolete_workflows,
         dedupe_workflows,
         include_non_pr=args.dedupe_include_non_pr,
+        non_pr_key=args.non_pr_key,
+        priority_branch_prefixes=priority_prefixes,
     )
 
     capped = selected[: max(0, args.max_cancel)]
@@ -338,6 +402,8 @@ def main() -> int:
             "obsolete_workflows": sorted(obsolete_workflows),
             "dedupe_workflows": sorted(dedupe_workflows),
             "dedupe_include_non_pr": args.dedupe_include_non_pr,
+            "non_pr_key": args.non_pr_key,
+            "priority_branch_prefixes": sorted(priority_prefixes),
             "max_cancel": args.max_cancel,
         },
         "counts": {

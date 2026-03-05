@@ -2,7 +2,7 @@
 
 This guide focuses on common setup/runtime failures and fast resolution paths.
 
-Last verified: **February 20, 2026**.
+Last verified: **March 2, 2026**.
 
 ## Installation / Bootstrap
 
@@ -141,6 +141,54 @@ which zeroclaw
 Persist in your shell profile if needed.
 
 ## Runtime / Gateway
+
+### Windows: shell tool unavailable or repeated shell failures
+
+Symptoms:
+
+- agent repeatedly fails shell calls and stops early
+- shell-based actions fail even though ZeroClaw starts
+- `zeroclaw doctor` reports runtime shell capability unavailable
+
+Why this happens:
+
+- Native Windows shell availability differs by machine setup.
+- Some environments do not have `sh` in `PATH`.
+- If both Git Bash and PowerShell are missing/misconfigured, shell tool execution will fail.
+
+What changed in ZeroClaw:
+
+- Native runtime now resolves shell with Windows fallbacks in this order:
+  - `bash` -> `sh` -> `pwsh` -> `powershell` -> `cmd`/`COMSPEC`
+- `zeroclaw doctor` now reports:
+  - selected native shell (kind + resolved executable path)
+  - candidate shell availability on Windows
+  - explicit warning when fallback is only `cmd`
+- WSL2 is optional, not required.
+
+Checks (PowerShell):
+
+```powershell
+where.exe bash
+where.exe pwsh
+where.exe powershell
+echo $env:COMSPEC
+zeroclaw doctor
+```
+
+Fix:
+
+1. Install at least one preferred shell:
+   - Git Bash (recommended for Unix-like command compatibility), or
+   - PowerShell 7 (`pwsh`)
+2. Confirm the shell executable is available in `PATH`.
+3. Ensure `COMSPEC` is set (normally points to `cmd.exe` on Windows).
+4. Reopen terminal and rerun `zeroclaw doctor`.
+
+Notes:
+
+- Running with only `cmd` fallback can work, but compatibility is lower than Git Bash or PowerShell.
+- If you already use WSL2, it can help with Unix-style workflows, but it is not mandatory for ZeroClaw shell tooling.
 
 ### Gateway unreachable
 
@@ -306,16 +354,61 @@ Linux logs:
 journalctl --user -u zeroclaw.service -f
 ```
 
+## macOS Catalina (10.15) Compatibility
+
+### Build or run fails on macOS Catalina
+
+Symptoms:
+
+- `cargo build` fails with linker errors referencing a minimum deployment target higher than 10.15
+- Binary exits immediately or crashes with `Illegal instruction: 4` on launch
+- Error message references `macOS 11.0` or `Big Sur` as a requirement
+
+Why this happens:
+
+- `wasmtime` (the WASM plugin engine used by the `wasm-tools` feature) uses Cranelift JIT
+  compilation, which has macOS version dependencies that may exceed Catalina (10.15).
+- If your Rust toolchain was installed or updated on a newer macOS host, the default
+  `MACOSX_DEPLOYMENT_TARGET` may be set higher than 10.15, producing binaries that refuse
+  to start on Catalina.
+
+Fix — build without the WASM plugin engine (recommended on Catalina):
+
+```bash
+cargo build --release --locked
+```
+
+The default feature set no longer includes `wasm-tools`, so the above command produces a
+Catalina-compatible binary without Cranelift/JIT dependencies.
+
+If you need WASM plugin support and are on a newer macOS (11.0+), opt in explicitly:
+
+```bash
+cargo build --release --locked --features wasm-tools
+```
+
+Fix — explicit deployment target (belt-and-suspenders):
+
+If you still see deployment-target linker errors, set the target explicitly before building:
+
+```bash
+MACOSX_DEPLOYMENT_TARGET=10.15 cargo build --release --locked
+```
+
+The `.cargo/config.toml` in this repository already pins `x86_64-apple-darwin` builds to
+`-mmacosx-version-min=10.15`, so the environment variable is usually not required.
+
 ## Legacy Installer Compatibility
 
 Both still work:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/main/scripts/bootstrap.sh | bash
+curl -fsSL https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/main/install.sh | bash
 curl -fsSL https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/main/scripts/install.sh | bash
 ```
 
-`install.sh` is a compatibility entry and forwards/falls back to bootstrap behavior.
+Root `install.sh` is the canonical remote entrypoint and defaults to TUI onboarding for no-arg interactive sessions.
+`scripts/install.sh` remains a compatibility entry and forwards/falls back to bootstrap behavior.
 
 ## Still Stuck?
 

@@ -2,7 +2,11 @@
 //!
 //! See `docs/hardware-peripherals-design.md` for the full design.
 
+pub mod device;
+pub mod gpio;
+pub mod protocol;
 pub mod registry;
+pub mod transport;
 
 #[cfg(all(
     feature = "hardware",
@@ -16,11 +20,44 @@ pub mod discover;
 ))]
 pub mod introspect;
 
+#[cfg(feature = "hardware")]
+pub mod serial;
+
+#[cfg(feature = "hardware")]
+pub mod uf2;
+
+#[cfg(feature = "hardware")]
+pub mod pico_flash;
+
+#[cfg(feature = "hardware")]
+pub mod pico_code;
+
 use crate::config::Config;
 use anyhow::Result;
 
 // Re-export config types so wizard can use `hardware::HardwareConfig` etc.
 pub use crate::config::{HardwareConfig, HardwareTransport};
+#[allow(unused_imports)]
+pub use device::{
+    Device, DeviceCapabilities, DeviceContext, DeviceKind, DeviceRegistry, DeviceRuntime,
+    NO_HW_DEVICES_SUMMARY,
+};
+#[allow(unused_imports)]
+pub use gpio::{gpio_tools, GpioReadTool, GpioWriteTool};
+#[allow(unused_imports)]
+pub use protocol::{ZcCommand, ZcResponse};
+#[allow(unused_imports)]
+pub use transport::{Transport, TransportError, TransportKind};
+
+#[cfg(feature = "hardware")]
+#[allow(unused_imports)]
+pub use pico_code::{device_code_tools, DeviceExecTool, DeviceReadCodeTool, DeviceWriteCodeTool};
+#[cfg(feature = "hardware")]
+#[allow(unused_imports)]
+pub use pico_flash::PicoFlashTool;
+#[cfg(feature = "hardware")]
+#[allow(unused_imports)]
+pub use serial::HardwareSerialTransport;
 
 /// A hardware device discovered during auto-scan.
 #[derive(Debug, Clone)]

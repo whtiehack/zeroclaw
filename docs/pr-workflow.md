@@ -96,15 +96,19 @@ Automation assists with triage and guardrails, but final merge accountability re
 Maintain these branch protection rules on `dev` and `main`:
 
 - Require status checks before merge.
-- Require check `CI Required Gate`.
+- Require checks `CI Required Gate` and `Security Required Gate`.
+- Consider also requiring `CI Change Audit` and `CodeQL Analysis` for stricter CI/CD governance.
 - Require pull request reviews before merge.
+- Require at least 1 approving review.
+- Require approval after the most recent push.
 - Require CODEOWNERS review for protected paths.
-- For `.github/workflows/**`, require owner approval via `CI Required Gate` (`WORKFLOW_OWNER_LOGINS`) and keep branch/ruleset bypass limited to org owners.
-- Default workflow-owner allowlist includes `theonlyhennygod`, `willsarg`, and `chumyin` (plus any comma-separated additions from `WORKFLOW_OWNER_LOGINS`).
-- Dismiss stale approvals when new commits are pushed.
+- For CI/CD-related paths (`.github/workflows/**`, `.github/codeql/**`, `.github/connectivity/**`, `.github/release/**`, `.github/security/**`, `.github/actionlint.yaml`, `.github/dependabot.yml`, `scripts/ci/**`, and CI governance docs), require CODEOWNERS review with `@chumyin` ownership.
+- Keep bypass allowances empty by default (use time-boxed break-glass only when absolutely required).
+- Enforce branch protection for admins.
+- Require conversation resolution before merge.
 - Restrict force-push on protected branches.
-- Route normal contributor PRs to `dev`.
-- Allow `main` merges only through a promotion PR from `dev` (enforced by `Main Promotion Gate`).
+- Route normal contributor PRs to `main` by default (`dev` is optional for dedicated integration batching).
+- Allow direct merges to `main` once required checks and review policy pass.
 
 ---
 
@@ -123,7 +127,7 @@ Maintain these branch protection rules on `dev` and `main`:
 
 ### 4.2 Step B: Validation
 
-- `CI Required Gate` is the merge gate.
+- `CI Required Gate` and `Security Required Gate` are the merge gates.
 - Docs-only PRs use fast-path and skip heavy Rust jobs.
 - Non-doc PRs must pass lint, tests, and release build smoke check.
 - Rust-impacting PRs use the same required gate set as `dev`/`main` pushes (no PR build-only shortcut).

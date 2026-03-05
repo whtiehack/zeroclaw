@@ -13,7 +13,10 @@ use tracing::{info, warn};
 use crate::config::PluginsConfig;
 
 use super::discovery::discover_plugins;
-use super::registry::*;
+use super::registry::{
+    DiagnosticLevel, PluginDiagnostic, PluginHookRegistration, PluginOrigin, PluginRecord,
+    PluginRegistry, PluginStatus, PluginToolRegistration,
+};
 use super::traits::{Plugin, PluginApi, PluginLogger};
 
 /// Resolve whether a discovered plugin should be enabled.
@@ -240,7 +243,6 @@ mod tests {
     use crate::config::PluginsConfig;
     use crate::plugins::manifest::PluginManifest;
     use crate::plugins::traits::{Plugin, PluginApi};
-    use async_trait::async_trait;
 
     struct OkPlugin {
         manifest: PluginManifest,
@@ -288,6 +290,11 @@ mod tests {
             version: Some("0.1.0".into()),
             description: None,
             config_schema: None,
+            capabilities: vec![],
+            module_path: String::new(),
+            wit_packages: vec![],
+            tools: vec![],
+            providers: vec![],
         }
     }
 

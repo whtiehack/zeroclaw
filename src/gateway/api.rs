@@ -2,7 +2,7 @@
 //!
 //! All `/api/*` routes require bearer token authentication (PairingGuard).
 
-use super::AppState;
+use super::{mock_dashboard, AppState};
 use axum::{
     extract::{Path, Query, State},
     http::{header, HeaderMap, StatusCode},
@@ -76,6 +76,9 @@ pub async fn handle_api_status(
     if let Err(e) = require_auth(&state, &headers) {
         return e.into_response();
     }
+    if mock_dashboard::is_enabled(&headers) {
+        return mock_dashboard::status();
+    }
 
     let config = state.config.lock().clone();
     let health = crate::health::snapshot();
@@ -110,6 +113,9 @@ pub async fn handle_api_config_get(
     if let Err(e) = require_auth(&state, &headers) {
         return e.into_response();
     }
+    if mock_dashboard::is_enabled(&headers) {
+        return mock_dashboard::config_get();
+    }
 
     let config = state.config.lock().clone();
 
@@ -141,6 +147,9 @@ pub async fn handle_api_config_put(
 ) -> impl IntoResponse {
     if let Err(e) = require_auth(&state, &headers) {
         return e.into_response();
+    }
+    if mock_dashboard::is_enabled(&headers) {
+        return mock_dashboard::config_put(body);
     }
 
     // Parse the incoming TOML and normalize known dashboard-masked edge cases.
@@ -200,6 +209,9 @@ pub async fn handle_api_tools(
     if let Err(e) = require_auth(&state, &headers) {
         return e.into_response();
     }
+    if mock_dashboard::is_enabled(&headers) {
+        return mock_dashboard::tools();
+    }
 
     let tools: Vec<serde_json::Value> = state
         .tools_registry
@@ -223,6 +235,9 @@ pub async fn handle_api_cron_list(
 ) -> impl IntoResponse {
     if let Err(e) = require_auth(&state, &headers) {
         return e.into_response();
+    }
+    if mock_dashboard::is_enabled(&headers) {
+        return mock_dashboard::cron_list();
     }
 
     let config = state.config.lock().clone();
@@ -261,6 +276,9 @@ pub async fn handle_api_cron_add(
     if let Err(e) = require_auth(&state, &headers) {
         return e.into_response();
     }
+    if mock_dashboard::is_enabled(&headers) {
+        return mock_dashboard::cron_add(body.name, body.schedule, body.command, None);
+    }
 
     let config = state.config.lock().clone();
     let schedule = crate::cron::Schedule::Cron {
@@ -268,7 +286,13 @@ pub async fn handle_api_cron_add(
         tz: None,
     };
 
-    match crate::cron::add_shell_job(&config, body.name, schedule, &body.command) {
+    match crate::cron::add_shell_job_with_approval(
+        &config,
+        body.name,
+        schedule,
+        &body.command,
+        false,
+    ) {
         Ok(job) => Json(serde_json::json!({
             "status": "ok",
             "job": {
@@ -296,6 +320,9 @@ pub async fn handle_api_cron_delete(
     if let Err(e) = require_auth(&state, &headers) {
         return e.into_response();
     }
+    if mock_dashboard::is_enabled(&headers) {
+        return mock_dashboard::cron_delete(&id);
+    }
 
     let config = state.config.lock().clone();
     match crate::cron::remove_job(&config, &id) {
@@ -315,6 +342,9 @@ pub async fn handle_api_integrations(
 ) -> impl IntoResponse {
     if let Err(e) = require_auth(&state, &headers) {
         return e.into_response();
+    }
+    if mock_dashboard::is_enabled(&headers) {
+        return mock_dashboard::integrations();
     }
 
     let config = state.config.lock().clone();
@@ -336,6 +366,342 @@ pub async fn handle_api_integrations(
     Json(serde_json::json!({"integrations": integrations})).into_response()
 }
 
+/// GET /api/integrations/settings — detailed settings for each integration
+pub async fn handle_api_integrations_settings(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+    if mock_dashboard::is_enabled(&headers) {
+        return mock_dashboard::integrations_settings();
+    }
+
+    let config = state.config.lock().clone();
+    let entries = crate::integrations::registry::all_integrations();
+
+    let active_default_provider_id = config
+        .default_provider
+        .as_ref()
+        .and_then(|p| integration_id_from_provider(p));
+
+    let integrations: Vec<serde_json::Value> = entries
+        .iter()
+        .map(|entry| {
+            let status = (entry.status_fn)(&config);
+            let (configured, fields) = integration_settings_fields(&config, entry.name);
+            let activates_default_provider = is_ai_provider(entry.name);
+
+            serde_json::json!({
+                "id": integration_name_to_id(entry.name),
+                "name": entry.name,
+                "description": entry.description,
+                "category": entry.category,
+                "status": status,
+                "configured": configured,
+                "activates_default_provider": activates_default_provider,
+                "fields": fields,
+            })
+        })
+        .collect();
+
+    Json(serde_json::json!({
+        "revision": "v1",
+        "active_default_provider_integration_id": active_default_provider_id,
+        "integrations": integrations,
+    }))
+    .into_response()
+}
+
+/// PUT /api/integrations/:id/credentials — update integration credentials
+pub async fn handle_api_integrations_credentials_put(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(body): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+    if mock_dashboard::is_enabled(&headers) {
+        return mock_dashboard::integrations_credentials_put(&id, &body);
+    }
+
+    let fields = body
+        .get("fields")
+        .and_then(|v| v.as_object())
+        .cloned()
+        .unwrap_or_default();
+
+    let mut config = state.config.lock().clone();
+    let Some(provider_key) = provider_key_from_integration_id(&id) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": format!(
+                    "Integration '{}' does not support credential updates via this endpoint",
+                    id
+                )
+            })),
+        )
+            .into_response();
+    };
+
+    // Apply credential updates based on integration
+    match provider_key {
+        "openrouter" | "anthropic" | "openai" | "google" | "deepseek" | "xai" | "mistral"
+        | "perplexity" | "vercel" | "bedrock" | "groq" | "together" | "cohere" | "fireworks"
+        | "venice" | "moonshot" | "stepfun" | "synthetic" | "opencode" | "zai" | "glm"
+        | "minimax" | "qwen" | "qianfan" | "doubao" | "volcengine" | "ark" | "siliconflow" => {
+            if let Some(api_key) = fields.get("api_key").and_then(|v| v.as_str()) {
+                if !api_key.is_empty() && api_key != MASKED_SECRET {
+                    config.api_key = Some(api_key.to_string());
+                }
+            }
+            if let Some(default_model) = fields.get("default_model").and_then(|v| v.as_str()) {
+                if !default_model.is_empty() {
+                    config.default_model = Some(default_model.to_string());
+                }
+            }
+            config.default_provider = Some(provider_key.to_string());
+        }
+        "ollama" => {
+            if let Some(default_model) = fields.get("default_model").and_then(|v| v.as_str()) {
+                if !default_model.is_empty() {
+                    config.default_model = Some(default_model.to_string());
+                }
+            }
+            config.default_provider = Some("ollama".to_string());
+        }
+        _ => {
+            // Channel integrations - not implemented for credentials update via this endpoint
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": format!("Integration '{}' does not support credential updates via this endpoint", id)
+                })),
+            )
+                .into_response();
+        }
+    }
+
+    // Save config
+    if let Err(e) = config.save().await {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("Failed to save config: {e}")})),
+        )
+            .into_response();
+    }
+
+    // Update in-memory config
+    *state.config.lock() = config;
+
+    Json(serde_json::json!({
+        "status": "ok",
+        "revision": "v1",
+    }))
+    .into_response()
+}
+
+fn integration_name_to_id(name: &str) -> String {
+    name.to_lowercase()
+        .replace(' ', "-")
+        .replace(['/', '.'], "-")
+}
+
+fn provider_key_from_integration_id(id: &str) -> Option<&'static str> {
+    match id {
+        "openrouter" => Some("openrouter"),
+        "anthropic" => Some("anthropic"),
+        "openai" => Some("openai"),
+        "google" => Some("google"),
+        "deepseek" => Some("deepseek"),
+        "xai" => Some("xai"),
+        "mistral" => Some("mistral"),
+        "perplexity" => Some("perplexity"),
+        "vercel-ai" => Some("vercel"),
+        "amazon-bedrock" => Some("bedrock"),
+        "groq" => Some("groq"),
+        "together-ai" => Some("together"),
+        "cohere" => Some("cohere"),
+        "fireworks-ai" => Some("fireworks"),
+        "venice" => Some("venice"),
+        "moonshot" => Some("moonshot"),
+        "stepfun" => Some("stepfun"),
+        "synthetic" => Some("synthetic"),
+        "opencode-zen" => Some("opencode"),
+        "z-ai" => Some("zai"),
+        "glm" => Some("glm"),
+        "minimax" => Some("minimax"),
+        "qwen" => Some("qwen"),
+        "qianfan" => Some("qianfan"),
+        "volcengine-ark" => Some("ark"),
+        "siliconflow" => Some("siliconflow"),
+        "ollama" => Some("ollama"),
+        _ => None,
+    }
+}
+
+fn is_ai_provider(name: &str) -> bool {
+    matches!(
+        name,
+        "OpenRouter"
+            | "Anthropic"
+            | "OpenAI"
+            | "Google"
+            | "DeepSeek"
+            | "xAI"
+            | "Mistral"
+            | "Perplexity"
+            | "Vercel AI"
+            | "Amazon Bedrock"
+            | "Groq"
+            | "Together AI"
+            | "Cohere"
+            | "Fireworks AI"
+            | "Venice"
+            | "Moonshot"
+            | "StepFun"
+            | "Synthetic"
+            | "OpenCode Zen"
+            | "Z.AI"
+            | "GLM"
+            | "MiniMax"
+            | "Qwen"
+            | "Qianfan"
+            | "Volcengine ARK"
+            | "SiliconFlow"
+            | "Ollama"
+    )
+}
+
+fn integration_id_from_provider(provider: &str) -> Option<String> {
+    let name = match provider {
+        "openrouter" => "OpenRouter",
+        "anthropic" => "Anthropic",
+        "openai" => "OpenAI",
+        "google" | "vertex" => "Google",
+        "deepseek" => "DeepSeek",
+        "xai" | "x-ai" => "xAI",
+        "mistral" => "Mistral",
+        "perplexity" => "Perplexity",
+        "vercel" => "Vercel AI",
+        "bedrock" => "Amazon Bedrock",
+        "groq" => "Groq",
+        "together" => "Together AI",
+        "cohere" => "Cohere",
+        "fireworks" => "Fireworks AI",
+        "venice" => "Venice",
+        "moonshot" | "moonshot-cn" | "moonshot-intl" => "Moonshot",
+        "stepfun" | "step-ai" => "StepFun",
+        "synthetic" => "Synthetic",
+        "opencode" => "OpenCode Zen",
+        "zai" | "zai-cn" | "zai-intl" => "Z.AI",
+        "glm" | "glm-cn" | "glm-intl" => "GLM",
+        "minimax" | "minimax-cn" | "minimax-intl" => "MiniMax",
+        "qwen" | "qwen-cn" | "qwen-intl" => "Qwen",
+        "qianfan" | "baidu" => "Qianfan",
+        "doubao" | "volcengine" | "ark" => "Volcengine ARK",
+        "siliconflow" | "silicon-cloud" => "SiliconFlow",
+        "ollama" => "Ollama",
+        _ => return None,
+    };
+    Some(integration_name_to_id(name))
+}
+
+#[allow(clippy::too_many_lines)]
+fn integration_settings_fields(
+    config: &crate::config::Config,
+    name: &str,
+) -> (bool, Vec<serde_json::Value>) {
+    match name {
+        "OpenRouter" => {
+            let has_key = config.api_key.is_some();
+            let fields = vec![
+                serde_json::json!({
+                    "key": "api_key",
+                    "label": "API Key",
+                    "required": true,
+                    "has_value": has_key,
+                    "input_type": "secret",
+                    "options": [],
+                    "masked_value": if has_key { Some(MASKED_SECRET) } else { None },
+                }),
+                serde_json::json!({
+                    "key": "default_model",
+                    "label": "Default Model",
+                    "required": false,
+                    "has_value": config.default_model.is_some(),
+                    "input_type": "select",
+                    "options": [
+                        "anthropic/claude-sonnet-4-6",
+                        "openai/gpt-5.2",
+                        "google/gemini-3.1-pro",
+                        "deepseek/deepseek-reasoner",
+                        "x-ai/grok-4",
+                    ],
+                    "current_value": config.default_model.as_deref().unwrap_or(""),
+                }),
+            ];
+            (has_key, fields)
+        }
+        "Anthropic" => {
+            let has_key = config.api_key.is_some();
+            let fields = vec![
+                serde_json::json!({
+                    "key": "api_key",
+                    "label": "API Key",
+                    "required": true,
+                    "has_value": has_key,
+                    "input_type": "secret",
+                    "options": [],
+                    "masked_value": if has_key { Some(MASKED_SECRET) } else { None },
+                }),
+                serde_json::json!({
+                    "key": "default_model",
+                    "label": "Default Model",
+                    "required": false,
+                    "has_value": config.default_model.is_some(),
+                    "input_type": "select",
+                    "options": ["claude-sonnet-4-6", "claude-opus-4-6"],
+                    "current_value": config.default_model.as_deref().unwrap_or(""),
+                }),
+            ];
+            (has_key, fields)
+        }
+        "OpenAI" => {
+            let has_key = config.api_key.is_some();
+            let fields = vec![
+                serde_json::json!({
+                    "key": "api_key",
+                    "label": "API Key",
+                    "required": true,
+                    "has_value": has_key,
+                    "input_type": "secret",
+                    "options": [],
+                    "masked_value": if has_key { Some(MASKED_SECRET) } else { None },
+                }),
+                serde_json::json!({
+                    "key": "default_model",
+                    "label": "Default Model",
+                    "required": false,
+                    "has_value": config.default_model.is_some(),
+                    "input_type": "select",
+                    "options": ["gpt-5.2", "gpt-5.2-codex", "gpt-4o"],
+                    "current_value": config.default_model.as_deref().unwrap_or(""),
+                }),
+            ];
+            (has_key, fields)
+        }
+        _ => {
+            // Default: no configurable fields
+            (false, vec![])
+        }
+    }
+}
+
 /// POST /api/doctor — run diagnostics
 pub async fn handle_api_doctor(
     State(state): State<AppState>,
@@ -343,6 +709,9 @@ pub async fn handle_api_doctor(
 ) -> impl IntoResponse {
     if let Err(e) = require_auth(&state, &headers) {
         return e.into_response();
+    }
+    if mock_dashboard::is_enabled(&headers) {
+        return mock_dashboard::doctor();
     }
 
     let config = state.config.lock().clone();
@@ -380,6 +749,9 @@ pub async fn handle_api_memory_list(
 ) -> impl IntoResponse {
     if let Err(e) = require_auth(&state, &headers) {
         return e.into_response();
+    }
+    if mock_dashboard::is_enabled(&headers) {
+        return mock_dashboard::memory_list(params.query, params.category);
     }
 
     if let Some(ref query) = params.query {
@@ -421,6 +793,9 @@ pub async fn handle_api_memory_store(
     if let Err(e) = require_auth(&state, &headers) {
         return e.into_response();
     }
+    if mock_dashboard::is_enabled(&headers) {
+        return mock_dashboard::memory_store(body.key, body.content, body.category);
+    }
 
     let category = body
         .category
@@ -456,6 +831,9 @@ pub async fn handle_api_memory_delete(
     if let Err(e) = require_auth(&state, &headers) {
         return e.into_response();
     }
+    if mock_dashboard::is_enabled(&headers) {
+        return mock_dashboard::memory_delete(&key);
+    }
 
     match state.mem.forget(&key).await {
         Ok(deleted) => {
@@ -476,6 +854,9 @@ pub async fn handle_api_cost(
 ) -> impl IntoResponse {
     if let Err(e) = require_auth(&state, &headers) {
         return e.into_response();
+    }
+    if mock_dashboard::is_enabled(&headers) {
+        return mock_dashboard::cost();
     }
 
     if let Some(ref tracker) = state.cost_tracker {
@@ -510,6 +891,9 @@ pub async fn handle_api_cli_tools(
     if let Err(e) = require_auth(&state, &headers) {
         return e.into_response();
     }
+    if mock_dashboard::is_enabled(&headers) {
+        return mock_dashboard::cli_tools();
+    }
 
     let tools = crate::tools::cli_discovery::discover_cli_tools(&[], &[]);
 
@@ -524,9 +908,60 @@ pub async fn handle_api_health(
     if let Err(e) = require_auth(&state, &headers) {
         return e.into_response();
     }
+    if mock_dashboard::is_enabled(&headers) {
+        return mock_dashboard::health();
+    }
 
     let snapshot = crate::health::snapshot();
     Json(serde_json::json!({"health": snapshot})).into_response()
+}
+
+/// GET /api/pairing/devices — list paired devices
+pub async fn handle_api_pairing_devices(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+    if mock_dashboard::is_enabled(&headers) {
+        return mock_dashboard::pairing_devices();
+    }
+
+    let devices = state.pairing.paired_devices();
+    Json(serde_json::json!({ "devices": devices })).into_response()
+}
+
+/// DELETE /api/pairing/devices/:id — revoke paired device
+pub async fn handle_api_pairing_device_revoke(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+    if mock_dashboard::is_enabled(&headers) {
+        return mock_dashboard::pairing_device_revoke(&id);
+    }
+
+    if !state.pairing.revoke_device(&id) {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "Paired device not found"})),
+        )
+            .into_response();
+    }
+
+    if let Err(e) = super::persist_pairing_tokens(state.config.clone(), &state.pairing).await {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("Failed to persist pairing state: {e}")})),
+        )
+            .into_response();
+    }
+
+    Json(serde_json::json!({"status": "ok", "revoked": true, "id": id})).into_response()
 }
 
 // ── Helpers ─────────────────────────────────────────────────────
@@ -612,6 +1047,9 @@ fn mask_sensitive_fields(config: &crate::config::Config) -> crate::config::Confi
     mask_optional_secret(&mut masked.web_fetch.api_key);
     mask_optional_secret(&mut masked.web_search.api_key);
     mask_optional_secret(&mut masked.web_search.brave_api_key);
+    mask_optional_secret(&mut masked.web_search.perplexity_api_key);
+    mask_optional_secret(&mut masked.web_search.exa_api_key);
+    mask_optional_secret(&mut masked.web_search.jina_api_key);
     mask_optional_secret(&mut masked.storage.provider.config.db_url);
     if let Some(cloudflare) = masked.tunnel.cloudflare.as_mut() {
         mask_required_secret(&mut cloudflare.token);
@@ -652,8 +1090,13 @@ fn mask_sensitive_fields(config: &crate::config::Config) -> crate::config::Confi
         mask_required_secret(&mut linq.api_token);
         mask_optional_secret(&mut linq.signing_secret);
     }
+    if let Some(github) = masked.channels_config.github.as_mut() {
+        mask_required_secret(&mut github.access_token);
+        mask_optional_secret(&mut github.webhook_secret);
+    }
     if let Some(wati) = masked.channels_config.wati.as_mut() {
         mask_required_secret(&mut wati.api_token);
+        mask_optional_secret(&mut wati.webhook_secret);
     }
     if let Some(nextcloud) = masked.channels_config.nextcloud_talk.as_mut() {
         mask_required_secret(&mut nextcloud.app_token);
@@ -679,6 +1122,9 @@ fn mask_sensitive_fields(config: &crate::config::Config) -> crate::config::Confi
     }
     if let Some(dingtalk) = masked.channels_config.dingtalk.as_mut() {
         mask_required_secret(&mut dingtalk.client_secret);
+    }
+    if let Some(napcat) = masked.channels_config.napcat.as_mut() {
+        mask_optional_secret(&mut napcat.access_token);
     }
     if let Some(qq) = masked.channels_config.qq.as_mut() {
         mask_required_secret(&mut qq.app_secret);
@@ -727,6 +1173,18 @@ fn restore_masked_sensitive_fields(
     restore_optional_secret(
         &mut incoming.web_search.brave_api_key,
         &current.web_search.brave_api_key,
+    );
+    restore_optional_secret(
+        &mut incoming.web_search.perplexity_api_key,
+        &current.web_search.perplexity_api_key,
+    );
+    restore_optional_secret(
+        &mut incoming.web_search.exa_api_key,
+        &current.web_search.exa_api_key,
+    );
+    restore_optional_secret(
+        &mut incoming.web_search.jina_api_key,
+        &current.web_search.jina_api_key,
     );
     restore_optional_secret(
         &mut incoming.storage.provider.config.db_url,
@@ -804,10 +1262,18 @@ fn restore_masked_sensitive_fields(
         restore_optional_secret(&mut incoming_ch.signing_secret, &current_ch.signing_secret);
     }
     if let (Some(incoming_ch), Some(current_ch)) = (
+        incoming.channels_config.github.as_mut(),
+        current.channels_config.github.as_ref(),
+    ) {
+        restore_required_secret(&mut incoming_ch.access_token, &current_ch.access_token);
+        restore_optional_secret(&mut incoming_ch.webhook_secret, &current_ch.webhook_secret);
+    }
+    if let (Some(incoming_ch), Some(current_ch)) = (
         incoming.channels_config.wati.as_mut(),
         current.channels_config.wati.as_ref(),
     ) {
         restore_required_secret(&mut incoming_ch.api_token, &current_ch.api_token);
+        restore_optional_secret(&mut incoming_ch.webhook_secret, &current_ch.webhook_secret);
     }
     if let (Some(incoming_ch), Some(current_ch)) = (
         incoming.channels_config.nextcloud_talk.as_mut(),
@@ -863,6 +1329,12 @@ fn restore_masked_sensitive_fields(
         current.channels_config.dingtalk.as_ref(),
     ) {
         restore_required_secret(&mut incoming_ch.client_secret, &current_ch.client_secret);
+    }
+    if let (Some(incoming_ch), Some(current_ch)) = (
+        incoming.channels_config.napcat.as_mut(),
+        current.channels_config.napcat.as_ref(),
+    ) {
+        restore_optional_secret(&mut incoming_ch.access_token, &current_ch.access_token);
     }
     if let (Some(incoming_ch), Some(current_ch)) = (
         incoming.channels_config.qq.as_mut(),
@@ -994,6 +1466,11 @@ mod tests {
         cfg.proxy.https_proxy = Some("https://user:pass@proxy.internal:8443".to_string());
         cfg.proxy.all_proxy = Some("socks5://user:pass@proxy.internal:1080".to_string());
         cfg.transcription.api_key = Some("transcription-real-key".to_string());
+        cfg.web_search.api_key = Some("web-search-generic-key".to_string());
+        cfg.web_search.brave_api_key = Some("web-search-brave-key".to_string());
+        cfg.web_search.perplexity_api_key = Some("web-search-perplexity-key".to_string());
+        cfg.web_search.exa_api_key = Some("web-search-exa-key".to_string());
+        cfg.web_search.jina_api_key = Some("web-search-jina-key".to_string());
         cfg.tunnel.cloudflare = Some(CloudflareTunnelConfig {
             token: "cloudflare-real-token".to_string(),
         });
@@ -1004,6 +1481,7 @@ mod tests {
         cfg.channels_config.wati = Some(WatiConfig {
             api_token: "wati-real-token".to_string(),
             api_url: "https://live-mt-server.wati.io".to_string(),
+            webhook_secret: Some("wati-hook-secret".to_string()),
             tenant_id: Some("tenant-1".to_string()),
             allowed_numbers: vec!["*".to_string()],
         });
@@ -1042,6 +1520,23 @@ mod tests {
         assert_eq!(masked.proxy.https_proxy.as_deref(), Some(MASKED_SECRET));
         assert_eq!(masked.proxy.all_proxy.as_deref(), Some(MASKED_SECRET));
         assert_eq!(masked.transcription.api_key.as_deref(), Some(MASKED_SECRET));
+        assert_eq!(masked.web_search.api_key.as_deref(), Some(MASKED_SECRET));
+        assert_eq!(
+            masked.web_search.brave_api_key.as_deref(),
+            Some(MASKED_SECRET)
+        );
+        assert_eq!(
+            masked.web_search.perplexity_api_key.as_deref(),
+            Some(MASKED_SECRET)
+        );
+        assert_eq!(
+            masked.web_search.exa_api_key.as_deref(),
+            Some(MASKED_SECRET)
+        );
+        assert_eq!(
+            masked.web_search.jina_api_key.as_deref(),
+            Some(MASKED_SECRET)
+        );
         assert_eq!(
             masked
                 .tunnel
@@ -1064,6 +1559,14 @@ mod tests {
                 .wati
                 .as_ref()
                 .map(|value| value.api_token.as_str()),
+            Some(MASKED_SECRET)
+        );
+        assert_eq!(
+            masked
+                .channels_config
+                .wati
+                .as_ref()
+                .and_then(|value| value.webhook_secret.as_deref()),
             Some(MASKED_SECRET)
         );
         assert_eq!(
@@ -1104,6 +1607,11 @@ mod tests {
         current.proxy.http_proxy = Some("http://user:pass@proxy.internal:8080".to_string());
         current.proxy.https_proxy = Some("https://user:pass@proxy.internal:8443".to_string());
         current.proxy.all_proxy = Some("socks5://user:pass@proxy.internal:1080".to_string());
+        current.web_search.api_key = Some("web-search-generic-key".to_string());
+        current.web_search.brave_api_key = Some("web-search-brave-key".to_string());
+        current.web_search.perplexity_api_key = Some("web-search-perplexity-key".to_string());
+        current.web_search.exa_api_key = Some("web-search-exa-key".to_string());
+        current.web_search.jina_api_key = Some("web-search-jina-key".to_string());
         current.tunnel.cloudflare = Some(CloudflareTunnelConfig {
             token: "cloudflare-real-token".to_string(),
         });
@@ -1114,6 +1622,7 @@ mod tests {
         current.channels_config.wati = Some(WatiConfig {
             api_token: "wati-real-token".to_string(),
             api_url: "https://live-mt-server.wati.io".to_string(),
+            webhook_secret: Some("wati-hook-secret".to_string()),
             tenant_id: Some("tenant-1".to_string()),
             allowed_numbers: vec!["*".to_string()],
         });
@@ -1163,6 +1672,26 @@ mod tests {
             Some("socks5://user:pass@proxy.internal:1080")
         );
         assert_eq!(
+            restored.web_search.api_key.as_deref(),
+            Some("web-search-generic-key")
+        );
+        assert_eq!(
+            restored.web_search.brave_api_key.as_deref(),
+            Some("web-search-brave-key")
+        );
+        assert_eq!(
+            restored.web_search.perplexity_api_key.as_deref(),
+            Some("web-search-perplexity-key")
+        );
+        assert_eq!(
+            restored.web_search.exa_api_key.as_deref(),
+            Some("web-search-exa-key")
+        );
+        assert_eq!(
+            restored.web_search.jina_api_key.as_deref(),
+            Some("web-search-jina-key")
+        );
+        assert_eq!(
             restored
                 .tunnel
                 .cloudflare
@@ -1185,6 +1714,14 @@ mod tests {
                 .as_ref()
                 .map(|value| value.api_token.as_str()),
             Some("wati-real-token")
+        );
+        assert_eq!(
+            restored
+                .channels_config
+                .wati
+                .as_ref()
+                .and_then(|value| value.webhook_secret.as_deref()),
+            Some("wati-hook-secret")
         );
         assert_eq!(
             restored
@@ -1222,5 +1759,70 @@ mod tests {
             restored_wecom.fallback_robot_webhook_url.as_deref(),
             Some("https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=test")
         );
+    }
+
+    #[test]
+    fn provider_key_from_integration_id_maps_dashboard_ids() {
+        assert_eq!(provider_key_from_integration_id("openai"), Some("openai"));
+        assert_eq!(
+            provider_key_from_integration_id("amazon-bedrock"),
+            Some("bedrock")
+        );
+        assert_eq!(
+            provider_key_from_integration_id("together-ai"),
+            Some("together")
+        );
+        assert_eq!(
+            provider_key_from_integration_id("opencode-zen"),
+            Some("opencode")
+        );
+        assert_eq!(
+            provider_key_from_integration_id("volcengine-ark"),
+            Some("ark")
+        );
+        assert_eq!(provider_key_from_integration_id("slack"), None);
+    }
+
+    #[test]
+    fn integration_provider_mapping_roundtrips_for_supported_providers() {
+        let cases = vec![
+            ("openrouter", "openrouter"),
+            ("anthropic", "anthropic"),
+            ("openai", "openai"),
+            ("google", "google"),
+            ("deepseek", "deepseek"),
+            ("xai", "xai"),
+            ("mistral", "mistral"),
+            ("perplexity", "perplexity"),
+            ("vercel", "vercel"),
+            ("bedrock", "bedrock"),
+            ("groq", "groq"),
+            ("together", "together"),
+            ("cohere", "cohere"),
+            ("fireworks", "fireworks"),
+            ("venice", "venice"),
+            ("moonshot", "moonshot"),
+            ("stepfun", "stepfun"),
+            ("synthetic", "synthetic"),
+            ("opencode", "opencode"),
+            ("zai", "zai"),
+            ("glm", "glm"),
+            ("minimax", "minimax"),
+            ("qwen", "qwen"),
+            ("qianfan", "qianfan"),
+            ("ark", "ark"),
+            ("siliconflow", "siliconflow"),
+            ("ollama", "ollama"),
+        ];
+
+        for (provider, expected_provider_key) in cases {
+            let id = integration_id_from_provider(provider)
+                .expect("provider should map to dashboard integration id");
+            assert_eq!(
+                provider_key_from_integration_id(&id),
+                Some(expected_provider_key),
+                "provider '{provider}' with id '{id}' should resolve to '{expected_provider_key}'",
+            );
+        }
     }
 }
