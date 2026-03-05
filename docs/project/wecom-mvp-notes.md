@@ -1,24 +1,43 @@
 # WeCom MVP Notes (wecom_cx)
 
-This document records the implementation decisions for the WeCom MVP gateway integration.
+This document records the implementation decisions for the WeCom integration.
+
+## Architecture
+
+All WeCom business logic lives in the **channel layer** (`src/channels/wecom.rs`).
+The gateway (`src/gateway/wecom.rs`) is a stateless HTTP relay (~91 lines) that forwards
+raw HTTP requests to the channel via mpsc and returns the oneshot response.
+
+```
+HTTP POST /wecom
+  → gateway: parse query params + body
+  → mpsc::send(WeComInboundRequest { query, body, reply_tx })
+  → channel.listen(): receive, decrypt, verify, route, process
+  → oneshot reply_tx.send(WeComInboundResponse { status_code, body })
+  → gateway: return HTTP response
+```
+
+This design follows the same pattern as Telegram (long-poll) and Discord (WebSocket):
+`listen()` is the true message entry point, conforming to Channel trait semantics.
 
 ## Scope
 
-- Added encrypted callback verification and message decrypt flow for `GET/POST /wecom`.
-- Added WeCom-specific runtime state in gateway layer (in-memory):
+- Encrypted callback verification and message decrypt flow for `GET/POST /wecom`.
+- All runtime state managed in channel layer (in-memory):
   - `conversation_scope` history
   - `execution_scope` in-flight lock
   - stream state / inflight task tracking / expiry cleanup
-- Added `response_url` cache and expiry cleanup in WeCom channel layer (`WeComChannel`).
-- Added attachment download/decrypt/save flow for `image` and `file` message types.
-- Added voice behavior:
+  - idempotency store
+- `response_url` cache and expiry cleanup.
+- Attachment download/decrypt/save flow for `image` and `file` message types.
+- Voice behavior:
   - with transcript: enters model chain
   - without transcript: immediate fixed reply + emoji, no model execution
-- Added fallback outbound chain when no valid `response_url` remains:
+- Fallback outbound chain when no valid `response_url` remains:
   1. scope-level push webhook URL from memory key `wecom_push_url::<conversation_scope>`
   2. global fallback robot webhook URL in config
-- Added scheduled-delivery integration:
-  - WeCom gateway now forwards `conversation_scope` as channel reply target into tool loop context.
+- Scheduled-delivery integration:
+  - Channel passes `conversation_scope` as reply target into tool loop context.
   - `cron_add` agent jobs can auto-fill `delivery={"mode":"announce","channel":"wecom","to":"<conversation_scope>"}`.
   - Scheduler delivery supports `channel="wecom"` and uses scope target for push.
 
@@ -35,7 +54,7 @@ This document records the implementation decisions for the WeCom MVP gateway int
 
 Clear-session commands allow users to reset conversation history without restarting the service:
 
-- Supported commands (exact match only): `新会话`, `清除历史`, `new session`, `clear history`
+- Supported commands (exact match, with optional @mentions): `/clear`, `/new`
 - Behavior: clears the in-memory conversation state for the current `conversation_scope` and returns a confirmation message.
 - The check runs before stop-command and execution-lock handling.
 
@@ -46,9 +65,9 @@ Clear-session commands allow users to reset conversation history without restart
 - Shared-group dynamic context (every turn): `WECOM_TURN_CONTEXT_V1` with `sender_userid`
 - Single chat does not repeat sender injection each turn.
 
-## Prompt / Delivery Instruction Handling (Current)
+## Prompt / Delivery Instruction Handling
 
-- Gateway passes channel identity (`wecom`) into the agent pipeline.
+- Channel passes channel identity (`wecom`) into the agent pipeline via `process_message_for_channel_with_history()`.
 - Agent injects WeCom delivery instructions into the **system prompt** (same layer as other channel system constraints).
 - Agent extracts `WECOM_STATIC_CONTEXT_V1` block from the composed user message and appends it to the system prompt as `## WeCom Context`.
 - User message payload after extraction contains only business context (quotes, current input). History is delivered as separate `ChatMessage` entries.
@@ -60,9 +79,29 @@ Clear-session commands allow users to reset conversation history without restart
   - normalized current user message / attachment markers.
 - Prior conversation history is passed as structured `ChatMessage` list via `process_message_for_channel_with_history()`, resulting in LLM seeing: `[system, user1, assistant1, ..., current_user]`.
 
-## Streaming Strategy in MVP
+## Gateway ↔ Channel Communication
 
-- Current MVP now uses native WeCom passive stream replies:
+```rust
+/// Gateway → Channel
+pub struct WeComInboundRequest {
+    pub query: WeComCallbackQuery,  // HTTP query params (signature, timestamp, nonce, echostr)
+    pub body: Bytes,                // raw HTTP body
+    pub reply_tx: oneshot::Sender<WeComInboundResponse>,
+}
+
+/// Channel → Gateway
+pub struct WeComInboundResponse {
+    pub status_code: u16,
+    pub body: String,
+}
+```
+
+Both GET (URL verification) and POST (encrypted callbacks) use the same path.
+The channel distinguishes them by checking `query.echostr`.
+
+## Streaming Strategy
+
+- Current implementation uses native WeCom passive stream replies:
   - callback response returns encrypted `msgtype=stream` payload
   - first reply uses `finish=false`
   - subsequent `msgtype=stream` refresh callbacks return latest content with same `stream.id`
