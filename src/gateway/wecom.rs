@@ -2513,6 +2513,10 @@ async fn process_inbound_message(
                     while let Some(delta) = delta_rx.recv().await {
                         if delta == DRAFT_CLEAR_SENTINEL {
                             cleared = true;
+                            // Replace initial "🤔 Thinking...\n" with "✅ Done\n"
+                            if progress.starts_with("🤔 Thinking...\n") {
+                                progress = progress.replacen("🤔 Thinking...\n", "✅ Done\n", 1);
+                            }
                             continue;
                         }
                         if cleared {
