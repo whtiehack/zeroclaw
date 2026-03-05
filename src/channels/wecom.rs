@@ -5,7 +5,13 @@ use crate::providers::ChatMessage;
 use aes::Aes256;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
-use axum::body::Bytes;
+use axum::{
+    body::Bytes,
+    extract::Query,
+    http::StatusCode,
+    routing::{get, post},
+    Router,
+};
 use base64::Engine as _;
 use cbc::cipher::{block_padding::NoPadding, BlockDecryptMut, BlockEncryptMut, KeyIvInit};
 use md5 as md5_crate;
@@ -15,6 +21,7 @@ use serde::Deserialize;
 use serde_json::Value;
 use sha1::{Digest, Sha1};
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -35,25 +42,25 @@ const WECOM_STREAM_BOOTSTRAP_CONTENT: &str = "\u{6b63}\u{5728}\u{5904}\u{7406}\u
 const WECOM_STREAM_MAX_IMAGES: usize = 10;
 const WECOM_IMAGE_MAX_BYTES: usize = 10 * 1024 * 1024;
 
-// ── Communication types (gateway <-> channel) ────────────────────────
+// ── Communication types (internal, for axum handler → handle_callback bridge) ──
 
 #[derive(Debug, Deserialize)]
-pub struct WeComCallbackQuery {
+pub(crate) struct WeComCallbackQuery {
     pub msg_signature: String,
     pub timestamp: String,
     pub nonce: String,
     pub echostr: Option<String>,
 }
 
-/// Gateway -> Channel request
-pub struct WeComInboundRequest {
+/// Internal request envelope for handler → callback bridge.
+struct WeComInboundRequest {
     pub query: WeComCallbackQuery,
     pub body: Bytes,
     pub reply_tx: tokio::sync::oneshot::Sender<WeComInboundResponse>,
 }
 
-/// Channel -> Gateway response
-pub struct WeComInboundResponse {
+/// Internal response envelope from callback → handler bridge.
+struct WeComInboundResponse {
     pub status_code: u16,
     pub body: String,
 }
@@ -372,26 +379,26 @@ impl WeComCrypto {
 
 // ── WeComChannel struct ──────────────────────────────────────────────
 
-/// WeCom (企业微信) channel — absorbs all business logic from gateway.
+/// WeCom (企业微信) channel — independent HTTP listener.
 ///
-/// Inbound messages arrive via mpsc from the gateway HTTP relay.
-/// `listen()` processes them (crypto, routing, LLM calls) and replies
-/// via oneshot back to the gateway for the HTTP response.
+/// Runs its own axum HTTP server on a dedicated port.
+/// `listen()` binds the port, receives HTTP callbacks directly, and
+/// processes them (crypto, routing, LLM calls) without gateway dependency.
 ///
 /// Outbound messages use a 3-layer fallback:
 /// 1. response_url (cached from incoming messages, TTL 1 hour)
 /// 2. scope-specific push webhook (looked up from memory)
 /// 3. fallback push webhook (from config)
+#[derive(Clone)]
 pub struct WeComChannel {
-    // mpsc pair for gateway -> channel communication
-    inbound_tx: tokio::sync::mpsc::Sender<WeComInboundRequest>,
-    inbound_rx: tokio::sync::Mutex<Option<tokio::sync::mpsc::Receiver<WeComInboundRequest>>>,
-
     // Crypto
     crypto: WeComCrypto,
 
     // Runtime config
     cfg: WeComRuntimeConfig,
+
+    // Listening port for independent HTTP server
+    port: u16,
 
     // Agent config for calling process_message_for_channel_with_history
     agent_config: Arc<Mutex<Config>>,
@@ -441,11 +448,7 @@ impl WeComChannel {
 
         let fingerprint = format!("{}|{}", config.token, config.encoding_aes_key);
 
-        let (inbound_tx, inbound_rx) = tokio::sync::mpsc::channel(64);
-
         Ok(Self {
-            inbound_tx,
-            inbound_rx: tokio::sync::Mutex::new(Some(inbound_rx)),
             crypto,
             cfg: WeComRuntimeConfig {
                 workspace_dir: workspace_dir.to_path_buf(),
@@ -454,6 +457,7 @@ impl WeComChannel {
                 lock_timeout_secs: config.lock_timeout_secs.max(30),
                 history_max_turns: config.history_max_turns.max(2),
             },
+            port: config.port,
             agent_config: Arc::new(Mutex::new(agent_config)),
             client,
             send_client,
@@ -474,9 +478,38 @@ impl WeComChannel {
         })
     }
 
-    /// Get a sender for the gateway to forward HTTP requests.
-    pub fn inbound_sender(&self) -> tokio::sync::mpsc::Sender<WeComInboundRequest> {
-        self.inbound_tx.clone()
+    // ── HTTP request handler (axum → handle_callback bridge) ────────
+
+    /// Process an HTTP request from the independent listener.
+    /// Internally bridges to `handle_callback` via oneshot for minimal refactor risk.
+    async fn handle_http_request(&self, query: WeComCallbackQuery, body: Bytes) -> (StatusCode, String) {
+        tracing::info!(
+            "[wecom] HTTP request received: msg_signature={} timestamp={} echostr={}",
+            query.msg_signature,
+            query.timestamp,
+            if query.echostr.is_some() { "present(verify)" } else { "absent(callback)" }
+        );
+
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        let req = WeComInboundRequest {
+            query,
+            body,
+            reply_tx,
+        };
+
+        self.handle_callback(req).await;
+
+        match reply_rx.await {
+            Ok(resp) => {
+                let status = StatusCode::from_u16(resp.status_code).unwrap_or(StatusCode::OK);
+                tracing::info!("[wecom] HTTP response: status={}", status.as_u16());
+                (status, resp.body)
+            }
+            Err(_) => {
+                tracing::error!("[wecom] HTTP handler: reply channel dropped unexpectedly");
+                (StatusCode::INTERNAL_SERVER_ERROR, "internal error".to_string())
+            }
+        }
     }
 
     // ── response_url cache ───────────────────────────────────────────
@@ -487,7 +520,7 @@ impl WeComChannel {
             return;
         };
 
-        tracing::debug!(
+        tracing::info!(
             "WeCom: caching response_url for scope={} msg_id={}",
             scope,
             msg_id
@@ -680,7 +713,7 @@ impl WeComChannel {
                 expires_at: Instant::now() + Duration::from_secs(WECOM_STREAM_STATE_TTL_SECS),
             },
         );
-        tracing::debug!(
+        tracing::info!(
             "WeCom: upsert stream state stream_id={} finish={}",
             stream_id, finish
         );
@@ -1127,7 +1160,7 @@ impl WeComChannel {
         let started = Instant::now();
         let chat_id = inbound.chat_id.as_deref().unwrap_or("single");
         let url_target = summarize_attachment_url_for_log(url);
-        tracing::debug!(
+        tracing::info!(
             msg_id = %inbound.msg_id,
             msg_type = %inbound.msg_type,
             chat_type = %inbound.chat_type,
@@ -1292,7 +1325,7 @@ impl WeComChannel {
         self.maybe_cleanup_files().await;
 
         let abs = path.canonicalize().unwrap_or(path);
-        tracing::debug!(
+        tracing::info!(
             msg_id = %inbound.msg_id,
             msg_type = %inbound.msg_type,
             chat_type = %inbound.chat_type,
@@ -1474,9 +1507,11 @@ impl WeComChannel {
         let body = req.body;
         let reply_tx = req.reply_tx;
 
+        tracing::info!("[wecom] handle_callback: body_len={} echostr={}", body.len(), query.echostr.is_some());
+
         // Verification request (echostr present)
         if let Some(echostr) = query.echostr.as_deref() {
-            tracing::info!("WeCom: received URL verification request");
+            tracing::info!("[wecom] URL verification request received");
             if !self.crypto.verify_signature(
                 &query.msg_signature,
                 &query.timestamp,
@@ -1534,7 +1569,7 @@ impl WeComChannel {
             });
             return;
         }
-        tracing::debug!("WeCom: callback signature verified");
+        tracing::info!("WeCom: callback signature verified");
 
         // Decrypt
         let plaintext = match self
@@ -1551,7 +1586,7 @@ impl WeComChannel {
                 return;
             }
         };
-        tracing::debug!("WeCom: callback decrypted successfully");
+        tracing::info!("WeCom: callback decrypted successfully");
 
         // Parse JSON payload
         let payload: Value = match serde_json::from_str(&plaintext) {
@@ -1623,11 +1658,11 @@ impl WeComChannel {
 
         // Stream refresh
         if parsed.msg_type == "stream" {
-            tracing::debug!("WeCom: routing as stream refresh callback");
+            tracing::info!("WeCom: routing as stream refresh callback");
             let stream_id = parse_stream_id(&parsed.raw_payload).unwrap_or_else(next_stream_id);
             let state_snapshot = self.get_stream_state(&stream_id);
             let (content, finish, images) = if let Some(snapshot) = state_snapshot {
-                tracing::debug!(
+                tracing::info!(
                     "WeCom stream refresh hit: stream_id={} scope={} exec_scope={} finish={} owner={}",
                     stream_id,
                     snapshot.conversation_scope,
@@ -1652,7 +1687,7 @@ impl WeComChannel {
 
         // Event handling
         if parsed.msg_type == "event" {
-            tracing::debug!("WeCom: routing as event callback");
+            tracing::info!("WeCom: routing as event callback");
             let event_type =
                 parse_event_type(&parsed.raw_payload).unwrap_or_else(|| "unknown".to_string());
             if event_type == "enter_chat" {
@@ -2341,7 +2376,7 @@ impl ChannelRef {
         let started = Instant::now();
         let chat_id = inbound.chat_id.as_deref().unwrap_or("single");
         let url_target = summarize_attachment_url_for_log(url);
-        tracing::debug!(
+        tracing::info!(
             msg_id = %inbound.msg_id, msg_type = %inbound.msg_type,
             chat_type = %inbound.chat_type, chat_id = %chat_id,
             sender_userid = %inbound.sender_userid,
@@ -2389,7 +2424,7 @@ impl ChannelRef {
         })?;
         self.maybe_cleanup_files().await;
         let abs = path.canonicalize().unwrap_or(path);
-        tracing::debug!(
+        tracing::info!(
             msg_id = %inbound.msg_id, attachment_kind = %kind.as_str(),
             encrypted_bytes = bytes.len(), decrypted_bytes = decrypted_len,
             local_path = %abs.display(), elapsed_ms = started.elapsed().as_millis(),
@@ -2835,24 +2870,58 @@ impl Channel for WeComChannel {
     }
 
     async fn listen(&self, _tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> Result<()> {
-        let mut rx = self
-            .inbound_rx
-            .lock()
-            .await
-            .take()
-            .ok_or_else(|| anyhow::anyhow!("WeCom listen() can only be called once"))?;
-
         tracing::info!(
-            "WeCom channel listen() started (mpsc mode, fingerprint={})",
-            self.fingerprint
+            "[wecom] starting independent HTTP listener on port {} (fingerprint={})",
+            self.port, self.fingerprint
         );
 
-        while let Some(req) = rx.recv().await {
-            tracing::debug!("WeCom: received inbound request from gateway");
-            self.handle_callback(req).await;
-        }
+        let channel = Arc::new(self.clone());
 
-        tracing::info!("WeCom channel listen() exiting: inbound sender dropped");
+        // Axum route handlers as closures capturing the Arc<WeComChannel>
+        let verify_channel = Arc::clone(&channel);
+        let callback_channel = Arc::clone(&channel);
+
+        let app = Router::new()
+            .route(
+                "/wecom",
+                get(move |Query(query): Query<WeComCallbackQuery>| {
+                    let ch = Arc::clone(&verify_channel);
+                    async move {
+                        tracing::info!("[wecom] GET /wecom — URL verification request");
+                        ch.handle_http_request(query, Bytes::new()).await
+                    }
+                }),
+            )
+            .route(
+                "/wecom",
+                post(
+                    move |Query(query): Query<WeComCallbackQuery>, body: Bytes| {
+                        let ch = Arc::clone(&callback_channel);
+                        async move {
+                            tracing::info!("[wecom] POST /wecom — encrypted callback");
+                            ch.handle_http_request(query, body).await
+                        }
+                    },
+                ),
+            );
+
+        let addr = SocketAddr::from(([0, 0, 0, 0], self.port));
+        tracing::info!("[wecom] binding HTTP listener to {}", addr);
+
+        let listener = tokio::net::TcpListener::bind(addr)
+            .await
+            .with_context(|| format!("WeCom: failed to bind HTTP listener on port {}", self.port))?;
+
+        tracing::info!(
+            "[wecom] HTTP listener started successfully on {} — ready to receive callbacks",
+            listener.local_addr().unwrap_or(addr)
+        );
+        println!("  GET  /wecom     — WeCom callback URL verification (port {})", self.port);
+        println!("  POST /wecom     — WeCom encrypted callback (port {})", self.port);
+
+        axum::serve(listener, app).await?;
+
+        tracing::info!("[wecom] HTTP listener exiting");
         Ok(())
     }
 
@@ -2861,7 +2930,7 @@ impl Channel for WeComChannel {
             Some(url) => {
                 let valid = is_valid_robot_webhook_url(url);
                 if !valid {
-                    tracing::debug!("WeCom: health check failed \u{2014} invalid fallback webhook URL");
+                    tracing::info!("WeCom: health check failed \u{2014} invalid fallback webhook URL");
                 }
                 valid
             }

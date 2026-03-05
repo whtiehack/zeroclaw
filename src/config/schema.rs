@@ -6535,6 +6535,10 @@ fn default_wecom_history_max_turns() -> usize {
     50
 }
 
+fn default_wecom_port() -> u16 {
+    9898
+}
+
 /// WeCom AI Bot callback configuration.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct WeComConfig {
@@ -6542,6 +6546,9 @@ pub struct WeComConfig {
     pub token: String,
     /// EncodingAESKey configured in WeCom callback settings (43 chars base64 body).
     pub encoding_aes_key: String,
+    /// Port for the independent WeCom HTTP callback listener.
+    #[serde(default = "default_wecom_port")]
+    pub port: u16,
     /// File retention days for downloaded WeCom attachments under workspace cache.
     #[serde(default = "default_wecom_file_retention_days")]
     pub file_retention_days: u32,
@@ -14721,6 +14728,7 @@ use_feishu = true
         let json =
             r#"{"token":"token","encoding_aes_key":"abcdefghijklmnopqrstuvwxyz0123456789ABCDEFG"}"#;
         let parsed: WeComConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.port, 9898);
         assert_eq!(parsed.file_retention_days, 3);
         assert_eq!(parsed.max_file_size_mb, 20);
         assert_eq!(parsed.response_url_cache_per_scope, 50);
@@ -14734,6 +14742,7 @@ use_feishu = true
         let wc = WeComConfig {
             token: "token".into(),
             encoding_aes_key: "abcdefghijklmnopqrstuvwxyz0123456789ABCDEFG".into(),
+            port: 9898,
             file_retention_days: 5,
             max_file_size_mb: 30,
             response_url_cache_per_scope: 80,
