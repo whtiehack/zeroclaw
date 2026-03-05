@@ -454,23 +454,6 @@ fn split_stream_content_and_overflow(input: &str) -> (String, Option<String>) {
     }
 }
 
-fn append_final_answer_to_stream_content(existing_content: &str, final_answer: &str) -> String {
-    if existing_content.trim().is_empty() {
-        return final_answer.to_string();
-    }
-    if final_answer.trim().is_empty() {
-        return existing_content.to_string();
-    }
-    if existing_content.ends_with(final_answer) {
-        return existing_content.to_string();
-    }
-    if existing_content.ends_with('\n') {
-        format!("{existing_content}---\n{final_answer}")
-    } else {
-        format!("{existing_content}\n---\n{final_answer}")
-    }
-}
-
 fn parse_image_markers(text: &str) -> (String, Vec<String>) {
     let mut cleaned = String::new();
     let mut paths = Vec::new();
@@ -2521,25 +2504,46 @@ async fn process_inbound_message(
             let (delta_tx, mut delta_rx) = tokio::sync::mpsc::channel::<String>(64);
             let progress_runtime = runtime.clone();
             let progress_stream_id = stream_id.clone();
-            let progress_consumer: tokio::task::JoinHandle<String> = tokio::spawn(async move {
-                use crate::agent::loop_::{DRAFT_CLEAR_SENTINEL, DRAFT_PROGRESS_SENTINEL};
-                let mut accumulated = String::new();
-                while let Some(delta) = delta_rx.recv().await {
-                    if delta == DRAFT_CLEAR_SENTINEL {
-                        break;
+            let progress_consumer: tokio::task::JoinHandle<(String, String)> =
+                tokio::spawn(async move {
+                    use crate::agent::loop_::{DRAFT_CLEAR_SENTINEL, DRAFT_PROGRESS_SENTINEL};
+                    let mut progress = String::new();
+                    let mut final_answer = String::new();
+                    let mut cleared = false;
+                    while let Some(delta) = delta_rx.recv().await {
+                        if delta == DRAFT_CLEAR_SENTINEL {
+                            cleared = true;
+                            continue;
+                        }
+                        if cleared {
+                            // After CLEAR: accumulate final answer chunks
+                            final_answer.push_str(&delta);
+                            // Show progress + final answer in real-time
+                            let display = if progress.is_empty() {
+                                final_answer.clone()
+                            } else {
+                                format!("{progress}\n---\n{final_answer}")
+                            };
+                            progress_runtime.update_stream_state_content(
+                                &progress_stream_id,
+                                &display,
+                                false,
+                            );
+                        } else {
+                            // Before CLEAR: accumulate progress (strip sentinel prefix)
+                            let visible = delta
+                                .strip_prefix(DRAFT_PROGRESS_SENTINEL)
+                                .unwrap_or(&delta);
+                            progress.push_str(visible);
+                            progress_runtime.update_stream_state_content(
+                                &progress_stream_id,
+                                &progress,
+                                false,
+                            );
+                        }
                     }
-                    let visible = delta
-                        .strip_prefix(DRAFT_PROGRESS_SENTINEL)
-                        .unwrap_or(&delta);
-                    accumulated.push_str(visible);
-                    progress_runtime.update_stream_state_content(
-                        &progress_stream_id,
-                        &accumulated,
-                        false,
-                    );
-                }
-                accumulated
-            });
+                    (progress, final_answer)
+                });
 
             let llm_response = match Box::pin(run_gateway_chat_with_history(
                 &state,
@@ -2558,8 +2562,8 @@ async fn process_inbound_message(
                 }
             };
 
-            // Wait for progress consumer to finish (it exits on CLEAR sentinel or sender drop)
-            let progress_text = progress_consumer.await.unwrap_or_default();
+            // Wait for progress consumer to finish (it exits on sender drop)
+            let (progress_text, streamed_final) = progress_consumer.await.unwrap_or_default();
             tracing::info!(
                 "🤖 [wecom] model reply in {}: {} (len={}, stream_id={}, msg_id={})",
                 scopes.conversation_scope,
@@ -2572,16 +2576,17 @@ async fn process_inbound_message(
             let (text_without_images, image_paths) = parse_image_markers(&llm_response);
             let images = prepare_stream_images(&image_paths).await;
 
-            // Keep the already displayed stream content intact, then append final answer.
-            // This avoids losing intermediate progress lines at finish time.
-            let persisted_progress = runtime
-                .get_stream_state(&stream_id)
-                .map(|snapshot| snapshot.content)
-                .unwrap_or_default();
-            let display_text = if persisted_progress.trim().is_empty() {
-                append_final_answer_to_stream_content(&progress_text, &text_without_images)
+            // Use streamed final answer if available, otherwise fall back to parsed LLM response.
+            let final_text = if streamed_final.trim().is_empty() {
+                text_without_images.clone()
             } else {
-                append_final_answer_to_stream_content(&persisted_progress, &text_without_images)
+                streamed_final
+            };
+
+            let display_text = if progress_text.trim().is_empty() {
+                final_text
+            } else {
+                format!("{progress_text}\n---\n{final_text}")
             };
 
             let (stream_content, overflow) = split_stream_content_and_overflow(&display_text);
@@ -2947,36 +2952,6 @@ mod tests {
         let (cleaned, paths) = parse_image_markers(input);
         assert_eq!(cleaned, "No images here.");
         assert!(paths.is_empty());
-    }
-
-    #[test]
-    fn append_final_answer_to_stream_content_preserves_progress() {
-        let existing = "🤔 Thinking...\n💬 Got 1 tool call(s) (1s)\n✅ shell (0s)\n";
-        let final_answer = "workspace 里有这些...";
-        let merged = append_final_answer_to_stream_content(existing, final_answer);
-        assert_eq!(
-            merged,
-            "🤔 Thinking...\n💬 Got 1 tool call(s) (1s)\n✅ shell (0s)\n---\nworkspace 里有这些..."
-        );
-    }
-
-    #[test]
-    fn append_final_answer_to_stream_content_uses_final_when_existing_empty() {
-        let merged = append_final_answer_to_stream_content("", "最终回复");
-        assert_eq!(merged, "最终回复");
-    }
-
-    #[test]
-    fn append_final_answer_to_stream_content_keeps_existing_when_final_empty() {
-        let merged = append_final_answer_to_stream_content("中间过程", "   ");
-        assert_eq!(merged, "中间过程");
-    }
-
-    #[test]
-    fn append_final_answer_to_stream_content_avoids_duplicate_suffix() {
-        let existing = "中间过程\n---\n最终回复";
-        let merged = append_final_answer_to_stream_content(existing, "最终回复");
-        assert_eq!(merged, existing);
     }
 
     #[test]
