@@ -152,6 +152,15 @@ enum AttachmentKind {
     File,
 }
 
+impl AttachmentKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Image => "image",
+            Self::File => "file",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct ComposedInput {
     user_message_for_model: String,
@@ -184,6 +193,58 @@ fn normalize_scope_component(raw: &str) -> String {
             }
         })
         .collect()
+}
+
+fn summarize_attachment_url_for_log(url: &str) -> String {
+    let trimmed = url.trim();
+    if trimmed.is_empty() {
+        return "empty-url".to_string();
+    }
+    match reqwest::Url::parse(trimmed) {
+        Ok(parsed) => {
+            let host = parsed.host_str().unwrap_or("unknown-host");
+            let query_state = if parsed.query().is_some() {
+                "query=present"
+            } else {
+                "query=none"
+            };
+            format!(
+                "{}://{}{} ({query_state})",
+                parsed.scheme(),
+                host,
+                parsed.path()
+            )
+        }
+        Err(_) => format!("invalid-url(len={})", trimmed.len()),
+    }
+}
+
+fn truncate_for_log(input: &str, max_chars: usize) -> String {
+    if input.chars().count() <= max_chars {
+        return input.to_string();
+    }
+    let prefix: String = input.chars().take(max_chars).collect();
+    format!("{prefix}...(truncated)")
+}
+
+fn log_attachment_processing_failure(
+    stage: &str,
+    err: &anyhow::Error,
+    inbound: &ParsedInbound,
+    kind: AttachmentKind,
+    url: &str,
+) {
+    tracing::warn!(
+        msg_id = %inbound.msg_id,
+        msg_type = %inbound.msg_type,
+        chat_type = %inbound.chat_type,
+        chat_id = %inbound.chat_id.as_deref().unwrap_or("single"),
+        sender_userid = %inbound.sender_userid,
+        attachment_kind = %kind.as_str(),
+        url_target = %summarize_attachment_url_for_log(url),
+        error = %format_args!("{err:#}"),
+        "{stage}"
+    );
 }
 
 fn random_emoji() -> &'static str {
@@ -1370,7 +1431,13 @@ impl WeComRuntime {
                 {
                     Ok(value) => value,
                     Err(err) => {
-                        tracing::warn!("WeCom quote image processing failed: {err}");
+                        log_attachment_processing_failure(
+                            "WeCom quote image processing failed",
+                            &err,
+                            inbound,
+                            AttachmentKind::Image,
+                            &url,
+                        );
                         "[引用图片下载失败]".to_string()
                     }
                 };
@@ -1398,7 +1465,13 @@ impl WeComRuntime {
                 {
                     Ok(value) => value,
                     Err(err) => {
-                        tracing::warn!("WeCom quote file processing failed: {err}");
+                        log_attachment_processing_failure(
+                            "WeCom quote file processing failed",
+                            &err,
+                            inbound,
+                            AttachmentKind::File,
+                            &url,
+                        );
                         "[引用文件下载失败]".to_string()
                     }
                 };
@@ -1451,7 +1524,13 @@ impl WeComRuntime {
                 {
                     Ok(value) => value,
                     Err(err) => {
-                        tracing::warn!("WeCom quote mixed image processing failed: {err}");
+                        log_attachment_processing_failure(
+                            "WeCom quote mixed image processing failed",
+                            &err,
+                            inbound,
+                            AttachmentKind::Image,
+                            &url,
+                        );
                         "[引用图片下载失败]".to_string()
                     }
                 };
@@ -1527,7 +1606,13 @@ impl WeComRuntime {
                 {
                     Ok(marker) => NormalizedMessage::Ready(marker),
                     Err(err) => {
-                        tracing::warn!("WeCom image processing failed: {err}");
+                        log_attachment_processing_failure(
+                            "WeCom image processing failed",
+                            &err,
+                            inbound,
+                            AttachmentKind::Image,
+                            url,
+                        );
                         NormalizedMessage::Ready(
                             "[Image attachment processing failed; please continue without this image.]"
                                 .to_string(),
@@ -1554,7 +1639,13 @@ impl WeComRuntime {
                 {
                     Ok(marker) => NormalizedMessage::Ready(marker),
                     Err(err) => {
-                        tracing::warn!("WeCom file processing failed: {err}");
+                        log_attachment_processing_failure(
+                            "WeCom file processing failed",
+                            &err,
+                            inbound,
+                            AttachmentKind::File,
+                            url,
+                        );
                         NormalizedMessage::Ready(
                             "[File attachment processing failed; please continue without this file.]"
                                 .to_string(),
@@ -1602,8 +1693,12 @@ impl WeComRuntime {
                                 {
                                     Ok(marker) => text_parts.push(marker),
                                     Err(err) => {
-                                        tracing::warn!(
-                                            "WeCom mixed image processing failed: {err}"
+                                        log_attachment_processing_failure(
+                                            "WeCom mixed image processing failed",
+                                            &err,
+                                            inbound,
+                                            AttachmentKind::Image,
+                                            url,
                                         );
                                         text_parts.push(
                                             "[Image attachment processing failed in mixed message.]"
@@ -1642,23 +1737,74 @@ impl WeComRuntime {
             anyhow::bail!("WeCom max_file_size_bytes is zero");
         }
 
+        let started = Instant::now();
+        let chat_id = inbound.chat_id.as_deref().unwrap_or("single");
+        let url_target = summarize_attachment_url_for_log(url);
+        tracing::debug!(
+            msg_id = %inbound.msg_id,
+            msg_type = %inbound.msg_type,
+            chat_type = %inbound.chat_type,
+            chat_id = %chat_id,
+            sender_userid = %inbound.sender_userid,
+            attachment_kind = %kind.as_str(),
+            url_target = %url_target,
+            timeout_secs = WECOM_HTTP_TIMEOUT_SECS,
+            "WeCom attachment download started"
+        );
+
         let response = self
             .client
             .get(url)
             .send()
             .await
-            .context("failed to download WeCom attachment")?;
+            .with_context(|| {
+                format!(
+                    "failed to download WeCom attachment: kind={} msg_id={} msg_type={} chat_type={} chat_id={} sender_userid={} url_target={} elapsed_ms={} timeout_secs={}",
+                    kind.as_str(),
+                    inbound.msg_id,
+                    inbound.msg_type,
+                    inbound.chat_type,
+                    chat_id,
+                    inbound.sender_userid,
+                    url_target,
+                    started.elapsed().as_millis(),
+                    WECOM_HTTP_TIMEOUT_SECS
+                )
+            })?;
         let status = response.status();
         if !status.is_success() {
             let body = response.text().await.unwrap_or_default();
+            let body_preview = truncate_for_log(&body, 512);
             anyhow::bail!(
-                "WeCom attachment download failed: status={} body={body}",
-                status
+                "WeCom attachment download failed: kind={} msg_id={} msg_type={} chat_type={} chat_id={} sender_userid={} url_target={} status={} elapsed_ms={} body_preview={}",
+                kind.as_str(),
+                inbound.msg_id,
+                inbound.msg_type,
+                inbound.chat_type,
+                chat_id,
+                inbound.sender_userid,
+                url_target,
+                status,
+                started.elapsed().as_millis(),
+                body_preview
             );
         }
 
         if let Some(len) = response.content_length() {
             if len > self.cfg.max_file_size_bytes {
+                tracing::warn!(
+                    msg_id = %inbound.msg_id,
+                    msg_type = %inbound.msg_type,
+                    chat_type = %inbound.chat_type,
+                    chat_id = %chat_id,
+                    sender_userid = %inbound.sender_userid,
+                    attachment_kind = %kind.as_str(),
+                    url_target = %url_target,
+                    declared_bytes = len,
+                    max_file_size_bytes = self.cfg.max_file_size_bytes,
+                    elapsed_ms = started.elapsed().as_millis(),
+                    "WeCom attachment skipped: declared size exceeds configured limit"
+                );
                 return Ok(format!(
                     "[AttachmentTooLarge kind={:?} size={}B limit={}B]",
                     kind, len, self.cfg.max_file_size_bytes
@@ -1669,9 +1815,34 @@ impl WeComRuntime {
         let bytes = response
             .bytes()
             .await
-            .context("failed to read WeCom attachment bytes")?;
+            .with_context(|| {
+                format!(
+                    "failed to read WeCom attachment bytes: kind={} msg_id={} msg_type={} chat_type={} chat_id={} sender_userid={} url_target={} elapsed_ms={}",
+                    kind.as_str(),
+                    inbound.msg_id,
+                    inbound.msg_type,
+                    inbound.chat_type,
+                    chat_id,
+                    inbound.sender_userid,
+                    url_target,
+                    started.elapsed().as_millis()
+                )
+            })?;
 
         if bytes.len() as u64 > self.cfg.max_file_size_bytes {
+            tracing::warn!(
+                msg_id = %inbound.msg_id,
+                msg_type = %inbound.msg_type,
+                chat_type = %inbound.chat_type,
+                chat_id = %chat_id,
+                sender_userid = %inbound.sender_userid,
+                attachment_kind = %kind.as_str(),
+                url_target = %url_target,
+                actual_bytes = bytes.len(),
+                max_file_size_bytes = self.cfg.max_file_size_bytes,
+                elapsed_ms = started.elapsed().as_millis(),
+                "WeCom attachment skipped: payload exceeds configured limit"
+            );
             return Ok(format!(
                 "[AttachmentTooLarge kind={:?} size={}B limit={}B]",
                 kind,
@@ -1680,7 +1851,20 @@ impl WeComRuntime {
             ));
         }
 
-        let decrypted = self.crypto.decrypt_file_payload(&bytes)?;
+        let decrypted = self.crypto.decrypt_file_payload(&bytes).with_context(|| {
+            format!(
+                "failed to decrypt WeCom attachment payload: kind={} msg_id={} msg_type={} chat_type={} chat_id={} sender_userid={} url_target={} encrypted_bytes={}",
+                kind.as_str(),
+                inbound.msg_id,
+                inbound.msg_type,
+                inbound.chat_type,
+                chat_id,
+                inbound.sender_userid,
+                url_target,
+                bytes.len()
+            )
+        })?;
+        let decrypted_len = decrypted.len();
 
         let ext = match kind {
             AttachmentKind::Image => "png",
@@ -1700,18 +1884,41 @@ impl WeComRuntime {
         );
 
         let dir = self.cfg.workspace_dir.join("wecom_files");
-        tokio::fs::create_dir_all(&dir)
-            .await
-            .context("failed to create WeCom inbox directory")?;
+        tokio::fs::create_dir_all(&dir).await.with_context(|| {
+            format!(
+                "failed to create WeCom inbox directory: msg_id={} path={}",
+                inbound.msg_id,
+                dir.display()
+            )
+        })?;
         let path = dir.join(file_name);
 
-        tokio::fs::write(&path, decrypted)
-            .await
-            .context("failed to persist WeCom attachment")?;
+        tokio::fs::write(&path, decrypted).await.with_context(|| {
+            format!(
+                "failed to persist WeCom attachment: kind={} msg_id={} path={}",
+                kind.as_str(),
+                inbound.msg_id,
+                path.display()
+            )
+        })?;
 
         self.maybe_cleanup_files().await;
 
         let abs = path.canonicalize().unwrap_or(path);
+        tracing::debug!(
+            msg_id = %inbound.msg_id,
+            msg_type = %inbound.msg_type,
+            chat_type = %inbound.chat_type,
+            chat_id = %chat_id,
+            sender_userid = %inbound.sender_userid,
+            attachment_kind = %kind.as_str(),
+            url_target = %url_target,
+            encrypted_bytes = bytes.len(),
+            decrypted_bytes = decrypted_len,
+            local_path = %abs.display(),
+            elapsed_ms = started.elapsed().as_millis(),
+            "WeCom attachment download completed"
+        );
         match kind {
             AttachmentKind::Image => Ok(format!("[IMAGE:{}]", abs.display())),
             AttachmentKind::File => Ok(format!("[Document: {}]", abs.display())),
@@ -2532,6 +2739,23 @@ mod tests {
         assert!(!is_valid_robot_webhook_url(
             "https://qyapi.weixin.qq.com/cgi-bin/message/send"
         ));
+    }
+
+    #[test]
+    fn summarize_attachment_url_for_log_redacts_query_string() {
+        let url = "https://wework.qpic.cn/wwpic/123456/0?auth=secret_token&expires=123";
+        let summary = summarize_attachment_url_for_log(url);
+        assert_eq!(
+            summary,
+            "https://wework.qpic.cn/wwpic/123456/0 (query=present)"
+        );
+        assert!(!summary.contains("secret_token"));
+    }
+
+    #[test]
+    fn summarize_attachment_url_for_log_handles_invalid_input() {
+        let summary = summarize_attachment_url_for_log("not a url");
+        assert_eq!(summary, "invalid-url(len=9)");
     }
 
     #[test]
