@@ -2585,6 +2585,11 @@ pub struct AutonomyConfig {
     #[serde(default)]
     pub non_cli_approval_approvers: Vec<String>,
 
+    /// Disable all shell command policy checks (allowlist, dangerous operators,
+    /// forbidden paths, risk gates). Only use in trusted environments.
+    #[serde(default)]
+    pub disable_shell_policy: bool,
+
     /// Natural-language handling mode for non-CLI approval-management commands.
     ///
     /// Values:
@@ -2703,6 +2708,7 @@ impl Default for AutonomyConfig {
             allowed_roots: Vec::new(),
             non_cli_excluded_tools: default_non_cli_excluded_tools(),
             non_cli_approval_approvers: Vec::new(),
+            disable_shell_policy: false,
             non_cli_natural_language_approval_mode: NonCliNaturalLanguageApprovalMode::default(),
             non_cli_natural_language_approval_mode_by_channel: HashMap::new(),
         }
@@ -7742,6 +7748,7 @@ default_temperature = 0.7
                 max_cost_per_day_cents: 1000,
                 require_approval_for_medium_risk: false,
                 block_high_risk_commands: true,
+                disable_shell_policy: false,
                 shell_env_passthrough: vec!["DATABASE_URL".into()],
                 auto_approve: vec!["file_read".into()],
                 always_ask: vec![],
