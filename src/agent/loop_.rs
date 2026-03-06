@@ -3759,6 +3759,12 @@ async fn process_message_with_channel_context(
         .map(str::trim)
         .filter(|value| !value.is_empty());
 
+    let progress_mode = if on_delta.is_some() {
+        ProgressMode::Verbose
+    } else {
+        ProgressMode::Off
+    };
+
     let response = if channel_name.is_some() || tool_loop_reply_target.is_some() || on_delta.is_some() {
         run_tool_call_loop_with_reply_target(
             provider.as_ref(),
@@ -3778,7 +3784,7 @@ async fn process_message_with_channel_context(
             on_delta,
             None,
             &[],
-            ProgressMode::Off,
+            progress_mode,
         )
         .await?
     } else {

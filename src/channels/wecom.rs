@@ -502,7 +502,7 @@ impl WeComChannel {
         match reply_rx.await {
             Ok(resp) => {
                 let status = StatusCode::from_u16(resp.status_code).unwrap_or(StatusCode::OK);
-                tracing::info!("[wecom] HTTP response: status={}", status.as_u16());
+                tracing::debug!("[wecom] HTTP response: status={}", status.as_u16());
                 (status, resp.body)
             }
             Err(_) => {
@@ -1569,7 +1569,7 @@ impl WeComChannel {
             });
             return;
         }
-        tracing::info!("WeCom: callback signature verified");
+        tracing::debug!("WeCom: callback signature verified");
 
         // Decrypt
         let plaintext = match self
@@ -1586,7 +1586,7 @@ impl WeComChannel {
                 return;
             }
         };
-        tracing::info!("WeCom: callback decrypted successfully");
+        tracing::debug!("WeCom: callback decrypted successfully");
 
         // Parse JSON payload
         let payload: Value = match serde_json::from_str(&plaintext) {
@@ -1658,7 +1658,7 @@ impl WeComChannel {
 
         // Stream refresh
         if parsed.msg_type == "stream" {
-            tracing::info!("WeCom: routing as stream refresh callback");
+            tracing::debug!("WeCom: routing as stream refresh callback");
             let stream_id = parse_stream_id(&parsed.raw_payload).unwrap_or_else(next_stream_id);
             let state_snapshot = self.get_stream_state(&stream_id);
             let (content, finish, images) = if let Some(snapshot) = state_snapshot {
@@ -2647,20 +2647,26 @@ impl ChannelRef {
                 let progress_stream_id = stream_id.clone();
                 let progress_consumer: tokio::task::JoinHandle<(String, String)> =
                     tokio::spawn(async move {
-                        use crate::agent::loop_::{DRAFT_CLEAR_SENTINEL, DRAFT_PROGRESS_SENTINEL};
-                        let mut progress = String::new();
+                        use crate::agent::loop_::{DRAFT_CLEAR_SENTINEL, DRAFT_PROGRESS_SENTINEL, DRAFT_PROGRESS_BLOCK_SENTINEL};
+                        let mut progress_header = String::new(); // thinking, tool call counts
+                        let mut progress_block = String::new();  // tool execution block (replaced wholesale)
                         let mut final_answer = String::new();
                         let mut cleared = false;
                         while let Some(delta) = delta_rx.recv().await {
                             if delta == DRAFT_CLEAR_SENTINEL {
                                 cleared = true;
-                                if progress.starts_with("\u{1F914} Thinking...\n") {
-                                    progress = progress.replacen("\u{1F914} Thinking...\n", "\u{2705} Done\n", 1);
+                                if progress_header.starts_with("\u{1F914} Thinking...\n") {
+                                    progress_header = progress_header.replacen("\u{1F914} Thinking...\n", "\u{2705} Done\n", 1);
                                 }
                                 continue;
                             }
                             if cleared {
                                 final_answer.push_str(&delta);
+                                let progress = if progress_block.is_empty() {
+                                    progress_header.clone()
+                                } else {
+                                    format!("{progress_header}{progress_block}")
+                                };
                                 let display = if progress.is_empty() {
                                     final_answer.clone()
                                 } else {
@@ -2673,20 +2679,41 @@ impl ChannelRef {
                                     state.images = Vec::new();
                                     state.expires_at = Instant::now() + Duration::from_secs(WECOM_STREAM_STATE_TTL_SECS);
                                 }
+                            } else if let Some(block) = delta.strip_prefix(DRAFT_PROGRESS_BLOCK_SENTINEL) {
+                                // Tool execution progress block: replace wholesale
+                                progress_block = block.to_string();
+                                let full_progress = format!("{progress_header}{progress_block}");
+                                let mut states = progress_stream_states.lock();
+                                if let Some(state) = states.get_mut(&progress_stream_id) {
+                                    state.content = normalize_stream_content(&full_progress);
+                                    state.finish = false;
+                                    state.images = Vec::new();
+                                    state.expires_at = Instant::now() + Duration::from_secs(WECOM_STREAM_STATE_TTL_SECS);
+                                }
                             } else {
                                 let visible = delta
                                     .strip_prefix(DRAFT_PROGRESS_SENTINEL)
                                     .unwrap_or(&delta);
-                                progress.push_str(visible);
+                                progress_header.push_str(visible);
+                                let full_progress = if progress_block.is_empty() {
+                                    progress_header.clone()
+                                } else {
+                                    format!("{progress_header}{progress_block}")
+                                };
                                 let mut states = progress_stream_states.lock();
                                 if let Some(state) = states.get_mut(&progress_stream_id) {
-                                    state.content = normalize_stream_content(&progress);
+                                    state.content = normalize_stream_content(&full_progress);
                                     state.finish = false;
                                     state.images = Vec::new();
                                     state.expires_at = Instant::now() + Duration::from_secs(WECOM_STREAM_STATE_TTL_SECS);
                                 }
                             }
                         }
+                        let progress = if progress_block.is_empty() {
+                            progress_header
+                        } else {
+                            format!("{progress_header}{progress_block}")
+                        };
                         (progress, final_answer)
                     });
 
@@ -2898,7 +2925,7 @@ impl Channel for WeComChannel {
                     move |Query(query): Query<WeComCallbackQuery>, body: Bytes| {
                         let ch = Arc::clone(&callback_channel);
                         async move {
-                            tracing::info!("[wecom] POST /wecom — encrypted callback");
+                            tracing::debug!("[wecom] POST /wecom — encrypted callback");
                             ch.handle_http_request(query, body).await
                         }
                     },
