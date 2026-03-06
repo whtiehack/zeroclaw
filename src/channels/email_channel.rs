@@ -540,6 +540,9 @@ impl EmailChannel {
                 channel: "email".to_string(),
                 timestamp: email.timestamp,
                 thread_ts: None,
+                conversation_key: None,
+                llm_input: None,
+                control_action: None,
             };
 
             if tx.send(msg).await.is_err() {

@@ -440,12 +440,8 @@ pub(crate) async fn deliver_announcement(
                     &config.workspace_dir,
                     config.api_key.as_deref(),
                 )?);
-                let channel = WeComChannel::new(
-                    wecom,
-                    &config.workspace_dir,
-                    memory,
-                    config.clone(),
-                )?;
+                let channel =
+                    WeComChannel::new(wecom, &config.workspace_dir, memory, config.clone())?;
                 channel.send(&SendMessage::new(output, target)).await?;
             }
         }

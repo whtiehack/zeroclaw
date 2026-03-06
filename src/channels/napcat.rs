@@ -334,6 +334,9 @@ impl NapcatChannel {
             timestamp: extract_timestamp(event),
             // This is a message id for passive reply, not a thread id.
             thread_ts: Some(message_id),
+            conversation_key: None,
+            llm_input: None,
+            control_action: None,
         })
     }
 

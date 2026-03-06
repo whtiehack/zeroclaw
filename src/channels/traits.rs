@@ -1,5 +1,11 @@
 use async_trait::async_trait;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChannelControlAction {
+    CancelActive,
+    ClearConversation,
+}
+
 /// A message received from or sent to a channel
 #[derive(Debug, Clone)]
 pub struct ChannelMessage {
@@ -12,6 +18,12 @@ pub struct ChannelMessage {
     /// Platform thread identifier (e.g. Slack `ts`, Discord thread ID).
     /// When set, replies should be posted as threaded responses.
     pub thread_ts: Option<String>,
+    /// Optional explicit conversation scope key for history/session/control.
+    pub conversation_key: Option<String>,
+    /// Optional model-facing input override when persisted history should differ.
+    pub llm_input: Option<String>,
+    /// Optional control action handled by the shared channel runtime.
+    pub control_action: Option<ChannelControlAction>,
 }
 
 /// Message to send through a channel
@@ -201,6 +213,9 @@ mod tests {
                 channel: "dummy".into(),
                 timestamp: 123,
                 thread_ts: None,
+                conversation_key: None,
+                llm_input: None,
+                control_action: None,
             })
             .await
             .map_err(|e| anyhow::anyhow!(e.to_string()))
@@ -217,6 +232,9 @@ mod tests {
             channel: "dummy".into(),
             timestamp: 999,
             thread_ts: None,
+            conversation_key: None,
+            llm_input: None,
+            control_action: None,
         };
 
         let cloned = message.clone();

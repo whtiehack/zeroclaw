@@ -679,6 +679,9 @@ impl Channel for WhatsAppWebChannel {
                                         content,
                                         timestamp: chrono::Utc::now().timestamp() as u64,
                                         thread_ts: None,
+                                    conversation_key: None,
+                                    llm_input: None,
+                                    control_action: None,
                                     })
                                     .await
                                 {

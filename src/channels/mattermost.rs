@@ -344,6 +344,9 @@ impl MattermostChannel {
             #[allow(clippy::cast_sign_loss)]
             timestamp: (create_at / 1000) as u64,
             thread_ts: None,
+            conversation_key: None,
+            llm_input: None,
+            control_action: None,
         })
     }
 }

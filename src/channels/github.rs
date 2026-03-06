@@ -305,6 +305,9 @@ author={sender}\nurl={comment_url}\n\n{comment_body}"
             channel: "github".to_string(),
             timestamp,
             thread_ts: comment_id,
+            conversation_key: None,
+            llm_input: None,
+            control_action: None,
         });
 
         out
@@ -418,6 +421,9 @@ author={sender}\nfile={file_path}\nurl={comment_url}\n\n{comment_body}"
             channel: "github".to_string(),
             timestamp,
             thread_ts: comment_id,
+            conversation_key: None,
+            llm_input: None,
+            control_action: None,
         });
 
         out

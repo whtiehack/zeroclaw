@@ -1901,10 +1901,9 @@ pub async fn run_tool_call_loop(
         }
 
         if tool_calls.is_empty() {
-            let missing_tool_call_signal =
-                parse_issue_detected
-                    || (!use_native_tools
-                        && looks_like_deferred_action_without_tool_call(&display_text));
+            let missing_tool_call_signal = parse_issue_detected
+                || (!use_native_tools
+                    && looks_like_deferred_action_without_tool_call(&display_text));
             let missing_tool_call_followthrough = !missing_tool_call_retry_used
                 && iteration + 1 < max_iterations
                 && !tool_specs.is_empty()
@@ -3453,8 +3452,16 @@ pub async fn process_message_for_channel_with_reply_target(
     channel_name: Option<&str>,
     reply_target: Option<&str>,
 ) -> Result<String> {
-    process_message_with_channel_context(config, message, channel_name, reply_target, None, None, None)
-        .await
+    process_message_with_channel_context(
+        config,
+        message,
+        channel_name,
+        reply_target,
+        None,
+        None,
+        None,
+    )
+    .await
 }
 
 pub async fn process_message_with_session(
@@ -3765,49 +3772,50 @@ async fn process_message_with_channel_context(
         ProgressMode::Off
     };
 
-    let response = if channel_name.is_some() || tool_loop_reply_target.is_some() || on_delta.is_some() {
-        run_tool_call_loop_with_reply_target(
-            provider.as_ref(),
-            &mut history,
-            &tools_registry,
-            observer.as_ref(),
-            provider_name,
-            &model_name,
-            config.default_temperature,
-            true,
-            None,
-            tool_loop_channel_name,
-            tool_loop_reply_target,
-            &config.multimodal,
-            config.agent.max_tool_iterations,
-            None,
-            on_delta,
-            None,
-            &[],
-            progress_mode,
-        )
-        .await?
-    } else {
-        scope_cost_enforcement_context(
-            cost_enforcement_context,
-            SAFETY_HEARTBEAT_CONFIG.scope(
-                hb_cfg,
-                agent_turn(
-                    provider.as_ref(),
-                    &mut history,
-                    &tools_registry,
-                    observer.as_ref(),
-                    provider_name,
-                    &model_name,
-                    config.default_temperature,
-                    true,
-                    &config.multimodal,
-                    config.agent.max_tool_iterations,
+    let response =
+        if channel_name.is_some() || tool_loop_reply_target.is_some() || on_delta.is_some() {
+            run_tool_call_loop_with_reply_target(
+                provider.as_ref(),
+                &mut history,
+                &tools_registry,
+                observer.as_ref(),
+                provider_name,
+                &model_name,
+                config.default_temperature,
+                true,
+                None,
+                tool_loop_channel_name,
+                tool_loop_reply_target,
+                &config.multimodal,
+                config.agent.max_tool_iterations,
+                None,
+                on_delta,
+                None,
+                &[],
+                progress_mode,
+            )
+            .await?
+        } else {
+            scope_cost_enforcement_context(
+                cost_enforcement_context,
+                SAFETY_HEARTBEAT_CONFIG.scope(
+                    hb_cfg,
+                    agent_turn(
+                        provider.as_ref(),
+                        &mut history,
+                        &tools_registry,
+                        observer.as_ref(),
+                        provider_name,
+                        &model_name,
+                        config.default_temperature,
+                        true,
+                        &config.multimodal,
+                        config.agent.max_tool_iterations,
+                    ),
                 ),
-            ),
-        )
-        .await?
-    };
+            )
+            .await?
+        };
 
     // ── Post-turn fact extraction (channel / single-message-with-session) ──
     if config.memory.auto_save {
@@ -3984,7 +3992,14 @@ mod tests {
             }
         });
 
-        maybe_inject_cron_add_delivery("cron_add", &mut args, "wecom", Some("user--hanxiao"));
+        maybe_inject_cron_add_delivery(
+            "cron_add",
+            &mut args,
+            "wecom",
+            Some("user--hanxiao"),
+            "openrouter",
+            "anthropic/claude-sonnet-4.6",
+        );
 
         assert_eq!(args["delivery"]["channel"], "wecom");
         assert_eq!(args["delivery"]["to"], "user--hanxiao");
@@ -3996,7 +4011,14 @@ mod tests {
             "job_type": "agent",
             "prompt": "daily summary"
         });
-        maybe_inject_cron_add_delivery("cron_add", &mut wecom_args, "wecom", Some("group--chatid"));
+        maybe_inject_cron_add_delivery(
+            "cron_add",
+            &mut wecom_args,
+            "wecom",
+            Some("group--chatid"),
+            "openrouter",
+            "anthropic/claude-sonnet-4.6",
+        );
         assert_eq!(wecom_args["delivery"]["channel"], "wecom");
         assert_eq!(wecom_args["delivery"]["to"], "group--chatid");
 

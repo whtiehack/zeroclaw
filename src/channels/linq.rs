@@ -250,6 +250,9 @@ impl LinqChannel {
             channel: "linq".to_string(),
             timestamp,
             thread_ts: None,
+            conversation_key: None,
+            llm_input: None,
+            control_action: None,
         });
 
         messages
