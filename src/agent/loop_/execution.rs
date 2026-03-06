@@ -10,6 +10,12 @@ use tokio_util::sync::CancellationToken;
 fn find_tool<'a>(tools: &'a [Box<dyn Tool>], name: &str) -> Option<&'a dyn Tool> {
     tools.iter().find(|t| t.name() == name).map(|t| t.as_ref())
 }
+
+fn brief(s: &str, max_chars: usize) -> String {
+    let truncated: String = s.chars().take(max_chars).collect();
+    if s.chars().count() > max_chars { format!("{truncated}...") } else { truncated }
+}
+
 async fn execute_one_tool(
     call_name: &str,
     call_arguments: serde_json::Value,
@@ -20,11 +26,13 @@ async fn execute_one_tool(
     observer.record_event(&ObserverEvent::ToolCallStart {
         tool: call_name.to_string(),
     });
+    tracing::info!(tool = %call_name, args = %scrub_credentials(&call_arguments.to_string()), "tool call started");
     let start = Instant::now();
 
     let Some(tool) = find_tool(tools_registry, call_name) else {
         let reason = format!("Unknown tool: {call_name}");
         let duration = start.elapsed();
+        tracing::info!(tool = %call_name, "tool call failed: unknown tool");
         observer.record_event(&ObserverEvent::ToolCall {
             tool: call_name.to_string(),
             duration,
@@ -57,6 +65,7 @@ async fn execute_one_tool(
                 success: r.success,
             });
             if r.success {
+                tracing::info!(tool = %call_name, duration_ms = duration.as_millis(), output = %brief(&scrub_credentials(&r.output), 200), "tool call succeeded");
                 Ok(ToolExecutionOutcome {
                     output: scrub_credentials(&r.output),
                     success: true,
@@ -65,6 +74,7 @@ async fn execute_one_tool(
                 })
             } else {
                 let reason = r.error.unwrap_or(r.output);
+                tracing::info!(tool = %call_name, duration_ms = duration.as_millis(), reason = %brief(&scrub_credentials(&reason), 300), "tool call failed");
                 Ok(ToolExecutionOutcome {
                     output: format!("Error: {reason}"),
                     success: false,
@@ -75,6 +85,7 @@ async fn execute_one_tool(
         }
         Err(e) => {
             let duration = start.elapsed();
+            tracing::info!(tool = %call_name, duration_ms = duration.as_millis(), error = %e, "tool call error");
             observer.record_event(&ObserverEvent::ToolCall {
                 tool: call_name.to_string(),
                 duration,
