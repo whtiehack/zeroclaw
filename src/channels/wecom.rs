@@ -483,7 +483,7 @@ impl WeComChannel {
     /// Process an HTTP request from the independent listener.
     /// Internally bridges to `handle_callback` via oneshot for minimal refactor risk.
     async fn handle_http_request(&self, query: WeComCallbackQuery, body: Bytes) -> (StatusCode, String) {
-        tracing::info!(
+        tracing::debug!(
             "[wecom] HTTP request received: msg_signature={} timestamp={} echostr={}",
             query.msg_signature,
             query.timestamp,
@@ -1507,7 +1507,7 @@ impl WeComChannel {
         let body = req.body;
         let reply_tx = req.reply_tx;
 
-        tracing::info!("[wecom] handle_callback: body_len={} echostr={}", body.len(), query.echostr.is_some());
+        tracing::debug!("[wecom] handle_callback: body_len={} echostr={}", body.len(), query.echostr.is_some());
 
         // Verification request (echostr present)
         if let Some(echostr) = query.echostr.as_deref() {
@@ -1662,7 +1662,7 @@ impl WeComChannel {
             let stream_id = parse_stream_id(&parsed.raw_payload).unwrap_or_else(next_stream_id);
             let state_snapshot = self.get_stream_state(&stream_id);
             let (content, finish, images) = if let Some(snapshot) = state_snapshot {
-                tracing::info!(
+                tracing::debug!(
                     "WeCom stream refresh hit: stream_id={} scope={} exec_scope={} finish={} owner={}",
                     stream_id,
                     snapshot.conversation_scope,
