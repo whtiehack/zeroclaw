@@ -46,10 +46,7 @@ use execution::{
 };
 #[cfg(test)]
 use history::{apply_compaction_summary, build_compaction_transcript};
-use history::{
-    auto_compact_history, estimate_history_tokens, extract_facts_from_turns, trim_history,
-    TurnBuffer,
-};
+use history::{auto_compact_history, extract_facts_from_turns, trim_history, TurnBuffer};
 #[allow(unused_imports)]
 use parsing::{
     default_param_for_tool, detect_tool_call_parse_issue, extract_json_values, map_tool_name_alias,
@@ -1901,10 +1898,9 @@ pub async fn run_tool_call_loop(
         }
 
         if tool_calls.is_empty() {
-            let missing_tool_call_signal =
-                parse_issue_detected
-                    || (!use_native_tools
-                        && looks_like_deferred_action_without_tool_call(&display_text));
+            let missing_tool_call_signal = parse_issue_detected
+                || (!use_native_tools
+                    && looks_like_deferred_action_without_tool_call(&display_text));
             let missing_tool_call_followthrough = !missing_tool_call_retry_used
                 && iteration + 1 < max_iterations
                 && !tool_specs.is_empty()
@@ -3378,124 +3374,16 @@ pub async fn run(
     Ok(final_output)
 }
 
-/// Extract `[WECOM_STATIC_CONTEXT_V1]...[/WECOM_STATIC_CONTEXT_V1]` from a user message,
-/// append it to the system prompt as `## WeCom Context`, and return the cleaned message.
-/// If the block is not found, returns the original message unchanged.
-fn extract_wecom_static_context_to_system(system_prompt: &mut String, message: &str) -> String {
-    const OPEN: &str = "[WECOM_STATIC_CONTEXT_V1]";
-    const CLOSE: &str = "[/WECOM_STATIC_CONTEXT_V1]";
-
-    let Some(start) = message.find(OPEN) else {
-        return message.to_string();
-    };
-    let Some(end) = message.find(CLOSE) else {
-        return message.to_string();
-    };
-
-    let block_end = end + CLOSE.len();
-    let inner = &message[start + OPEN.len()..end].trim();
-
-    system_prompt.push_str("\n\n## WeCom Context\n\n");
-    system_prompt.push_str(inner);
-    system_prompt.push('\n');
-
-    let mut cleaned = String::with_capacity(message.len());
-    cleaned.push_str(&message[..start]);
-    cleaned.push_str(&message[block_end..]);
-    // Collapse any leftover double-blank-lines from removal
-    while cleaned.contains("\n\n\n") {
-        cleaned = cleaned.replace("\n\n\n", "\n\n");
-    }
-    cleaned.trim().to_string()
-}
-
-fn append_channel_delivery_system_instructions(
-    mut system_prompt: String,
-    channel_name: Option<&str>,
-) -> String {
-    let Some(channel_name) = channel_name
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    else {
-        return system_prompt;
-    };
-
-    if let Some(instructions) = crate::channels::get_channel_delivery_instructions(channel_name) {
-        system_prompt.push_str("\n\n## Channel Delivery\n\n");
-        system_prompt.push_str(instructions);
-        system_prompt.push('\n');
-    }
-
-    system_prompt
-}
-
 /// Process a single message through the full agent (with tools, peripherals, memory).
 /// Used by channels (Telegram, Discord, etc.) to enable hardware and tool use.
 pub async fn process_message(config: Config, message: &str) -> Result<String> {
     process_message_with_session(config, message, None).await
 }
 
-/// Process a single message with optional channel-scoped delivery instructions
-/// injected into the system prompt.
-pub async fn process_message_for_channel(
-    config: Config,
-    message: &str,
-    channel_name: Option<&str>,
-) -> Result<String> {
-    process_message_for_channel_with_reply_target(config, message, channel_name, None).await
-}
-
-/// Process a single message with optional channel-scoped delivery instructions
-/// and optional channel reply target for auto-populating scheduled delivery routes.
-pub async fn process_message_for_channel_with_reply_target(
-    config: Config,
-    message: &str,
-    channel_name: Option<&str>,
-    reply_target: Option<&str>,
-) -> Result<String> {
-    process_message_with_channel_context(config, message, channel_name, reply_target, None, None, None)
-        .await
-}
-
 pub async fn process_message_with_session(
     config: Config,
     message: &str,
     session_id: Option<&str>,
-) -> Result<String> {
-    process_message_with_channel_context(config, message, None, None, session_id, None, None).await
-}
-
-/// Process a single message with prior conversation history passed as structured
-/// `ChatMessage` entries (user/assistant pairs), aligning WeCom with
-/// Telegram/Discord's multi-turn conversation model.
-pub async fn process_message_for_channel_with_history(
-    config: Config,
-    message: &str,
-    channel_name: Option<&str>,
-    reply_target: Option<&str>,
-    prior_history: Vec<ChatMessage>,
-    on_delta: Option<tokio::sync::mpsc::Sender<String>>,
-) -> Result<String> {
-    process_message_with_channel_context(
-        config,
-        message,
-        channel_name,
-        reply_target,
-        None,
-        Some(prior_history),
-        on_delta,
-    )
-    .await
-}
-
-async fn process_message_with_channel_context(
-    config: Config,
-    message: &str,
-    channel_name: Option<&str>,
-    reply_target: Option<&str>,
-    session_id: Option<&str>,
-    prior_history: Option<Vec<ChatMessage>>,
-    on_delta: Option<tokio::sync::mpsc::Sender<String>>,
 ) -> Result<String> {
     if let Err(error) = crate::plugins::runtime::initialize_from_config(&config.plugins) {
         tracing::warn!("plugin registry initialization skipped: {error}");
@@ -3668,21 +3556,10 @@ async fn process_message_with_channel_context(
         system_prompt.push_str(&build_tool_instructions(&tools_registry));
     }
     system_prompt.push_str(&build_shell_policy_instructions(&config.autonomy));
-    system_prompt = append_channel_delivery_system_instructions(system_prompt, channel_name);
-
-    // For WeCom: extract static context block from user message into system prompt
-    let message = if channel_name.map(str::trim) == Some("wecom") {
-        std::borrow::Cow::Owned(extract_wecom_static_context_to_system(
-            &mut system_prompt,
-            message,
-        ))
-    } else {
-        std::borrow::Cow::Borrowed(message)
-    };
 
     let mem_context = build_context(
         mem.as_ref(),
-        &message,
+        message,
         config.memory.min_relevance_score,
         session_id,
     )
@@ -3690,7 +3567,7 @@ async fn process_message_with_channel_context(
     let rag_limit = if config.agent.compact_context { 2 } else { 5 };
     let hw_context = hardware_rag
         .as_ref()
-        .map(|r| build_hardware_context(r, &message, &board_names, rag_limit))
+        .map(|r| build_hardware_context(r, message, &board_names, rag_limit))
         .unwrap_or_default();
     let context = format!("{mem_context}{hw_context}");
     let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S %Z");
@@ -3705,42 +3582,6 @@ async fn process_message_with_channel_context(
         ChatMessage::user(&enriched),
     ];
 
-    // If prior_history is provided (e.g. WeCom multi-turn), inject it before the enriched user message
-    if let Some(prior) = prior_history {
-        // history = [system, user(enriched)] -> [system, ...prior, user(enriched)]
-        let enriched_msg = history.pop().unwrap();
-        history.extend(prior);
-        history.push(enriched_msg);
-
-        // Token-aware auto-compaction for WeCom multi-turn history
-        if channel_name.map(str::trim) == Some("wecom") {
-            const DEFAULT_COMPRESS_TOKEN_THRESHOLD: u64 = 150_000;
-            let compress_threshold: u64 = match mem.get("wecom_config_compress_token").await {
-                Ok(Some(entry)) => entry
-                    .content
-                    .trim()
-                    .parse()
-                    .unwrap_or(DEFAULT_COMPRESS_TOKEN_THRESHOLD),
-                _ => DEFAULT_COMPRESS_TOKEN_THRESHOLD,
-            };
-            let estimated_tokens = estimate_history_tokens(&history);
-            if estimated_tokens > compress_threshold {
-                let _ = auto_compact_history(
-                    &mut history,
-                    provider.as_ref(),
-                    &model_name,
-                    config.agent.max_history_messages,
-                    None,
-                    None,
-                    session_id,
-                    false,
-                )
-                .await;
-                trim_history(&mut history, config.agent.max_history_messages);
-            }
-        }
-    }
-
     let cost_enforcement_context =
         create_cost_enforcement_context(&config.cost, &config.workspace_dir);
     let hb_cfg = if config.agent.safety_heartbeat_interval > 0 {
@@ -3751,67 +3592,29 @@ async fn process_message_with_channel_context(
     } else {
         None
     };
-    let tool_loop_channel_name = channel_name
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .unwrap_or("channel");
-    let tool_loop_reply_target = reply_target
-        .map(str::trim)
-        .filter(|value| !value.is_empty());
-
-    let progress_mode = if on_delta.is_some() {
-        ProgressMode::Verbose
-    } else {
-        ProgressMode::Off
-    };
-
-    let response = if channel_name.is_some() || tool_loop_reply_target.is_some() || on_delta.is_some() {
-        run_tool_call_loop_with_reply_target(
-            provider.as_ref(),
-            &mut history,
-            &tools_registry,
-            observer.as_ref(),
-            provider_name,
-            &model_name,
-            config.default_temperature,
-            true,
-            None,
-            tool_loop_channel_name,
-            tool_loop_reply_target,
-            &config.multimodal,
-            config.agent.max_tool_iterations,
-            None,
-            on_delta,
-            None,
-            &[],
-            progress_mode,
-        )
-        .await?
-    } else {
-        scope_cost_enforcement_context(
-            cost_enforcement_context,
-            SAFETY_HEARTBEAT_CONFIG.scope(
-                hb_cfg,
-                agent_turn(
-                    provider.as_ref(),
-                    &mut history,
-                    &tools_registry,
-                    observer.as_ref(),
-                    provider_name,
-                    &model_name,
-                    config.default_temperature,
-                    true,
-                    &config.multimodal,
-                    config.agent.max_tool_iterations,
-                ),
+    let response = scope_cost_enforcement_context(
+        cost_enforcement_context,
+        SAFETY_HEARTBEAT_CONFIG.scope(
+            hb_cfg,
+            agent_turn(
+                provider.as_ref(),
+                &mut history,
+                &tools_registry,
+                observer.as_ref(),
+                provider_name,
+                &model_name,
+                config.default_temperature,
+                true,
+                &config.multimodal,
+                config.agent.max_tool_iterations,
             ),
-        )
-        .await?
-    };
+        ),
+    )
+    .await?;
 
     // ── Post-turn fact extraction (channel / single-message-with-session) ──
     if config.memory.auto_save {
-        let turns = vec![(message.to_string(), response.clone())];
+        let turns = vec![(message.to_owned(), response.clone())];
         let _ = extract_facts_from_turns(
             provider.as_ref(),
             &model_name,
@@ -3834,58 +3637,6 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
-
-    #[test]
-    fn append_channel_delivery_system_instructions_injects_known_channel_guidance() {
-        let prompt = append_channel_delivery_system_instructions(
-            "base system prompt".to_string(),
-            Some("wecom"),
-        );
-
-        assert!(prompt.contains("base system prompt"));
-        assert!(prompt.contains("## Channel Delivery"));
-        assert!(prompt.contains("When responding on WeCom"));
-    }
-
-    #[test]
-    fn append_channel_delivery_system_instructions_skips_unknown_or_empty_channel() {
-        let unchanged =
-            append_channel_delivery_system_instructions("base".to_string(), Some("unknown"));
-        assert_eq!(unchanged, "base");
-
-        let unchanged =
-            append_channel_delivery_system_instructions("base".to_string(), Some("   "));
-        assert_eq!(unchanged, "base");
-
-        let unchanged = append_channel_delivery_system_instructions("base".to_string(), None);
-        assert_eq!(unchanged, "base");
-    }
-
-    #[test]
-    fn extract_wecom_static_context_moves_block_to_system_prompt() {
-        let mut system_prompt = "base system".to_string();
-        let message = "[WECOM_STATIC_CONTEXT_V1]\nchat_type=group\nconversation_scope=group--g1\n[/WECOM_STATIC_CONTEXT_V1]\n\n[WECOM_HISTORY]\nUser: hello\n[/WECOM_HISTORY]\n\nWhat is up?";
-
-        let cleaned = extract_wecom_static_context_to_system(&mut system_prompt, message);
-
-        assert!(system_prompt.contains("## WeCom Context"));
-        assert!(system_prompt.contains("chat_type=group"));
-        assert!(system_prompt.contains("conversation_scope=group--g1"));
-        assert!(!cleaned.contains("WECOM_STATIC_CONTEXT_V1"));
-        assert!(cleaned.contains("WECOM_HISTORY"));
-        assert!(cleaned.contains("What is up?"));
-    }
-
-    #[test]
-    fn extract_wecom_static_context_noop_without_block() {
-        let mut system_prompt = "base system".to_string();
-        let message = "Just a normal message without static block";
-
-        let cleaned = extract_wecom_static_context_to_system(&mut system_prompt, message);
-
-        assert_eq!(system_prompt, "base system");
-        assert_eq!(cleaned, message);
-    }
 
     #[test]
     fn test_scrub_credentials() {
@@ -3984,7 +3735,14 @@ mod tests {
             }
         });
 
-        maybe_inject_cron_add_delivery("cron_add", &mut args, "wecom", Some("user--hanxiao"));
+        maybe_inject_cron_add_delivery(
+            "cron_add",
+            &mut args,
+            "wecom",
+            Some("user--hanxiao"),
+            "openrouter",
+            "anthropic/claude-sonnet-4.6",
+        );
 
         assert_eq!(args["delivery"]["channel"], "wecom");
         assert_eq!(args["delivery"]["to"], "user--hanxiao");
@@ -3996,7 +3754,14 @@ mod tests {
             "job_type": "agent",
             "prompt": "daily summary"
         });
-        maybe_inject_cron_add_delivery("cron_add", &mut wecom_args, "wecom", Some("group--chatid"));
+        maybe_inject_cron_add_delivery(
+            "cron_add",
+            &mut wecom_args,
+            "wecom",
+            Some("group--chatid"),
+            "openrouter",
+            "anthropic/claude-sonnet-4.6",
+        );
         assert_eq!(wecom_args["delivery"]["channel"], "wecom");
         assert_eq!(wecom_args["delivery"]["to"], "group--chatid");
 

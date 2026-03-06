@@ -1133,26 +1133,8 @@ pub(super) async fn run_gateway_chat_with_tools(
     message: &str,
     session_id: Option<&str>,
 ) -> anyhow::Result<String> {
-    run_gateway_chat_with_tools_for_channel(state, message, None).await
-}
-
-pub(super) async fn run_gateway_chat_with_tools_for_channel(
-    state: &AppState,
-    message: &str,
-    channel_name: Option<&str>,
-) -> anyhow::Result<String> {
-    run_gateway_chat_with_tools_for_channel_with_reply_target(state, message, channel_name, None)
-        .await
-}
-
-pub(super) async fn run_gateway_chat_with_tools_for_channel_with_reply_target(
-    state: &AppState,
-    message: &str,
-    channel_name: Option<&str>,
-    reply_target: Option<&str>,
-) -> anyhow::Result<String> {
     let config = state.config.lock().clone();
-    crate::agent::process_message_with_session(config, message, None).await
+    crate::agent::process_message_with_session(config, message, session_id).await
 }
 
 fn gateway_outbound_leak_guard_snapshot(

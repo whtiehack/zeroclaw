@@ -13,7 +13,11 @@ fn find_tool<'a>(tools: &'a [Box<dyn Tool>], name: &str) -> Option<&'a dyn Tool>
 
 fn brief(s: &str, max_chars: usize) -> String {
     let truncated: String = s.chars().take(max_chars).collect();
-    if s.chars().count() > max_chars { format!("{truncated}...") } else { truncated }
+    if s.chars().count() > max_chars {
+        format!("{truncated}...")
+    } else {
+        truncated
+    }
 }
 
 async fn execute_one_tool(

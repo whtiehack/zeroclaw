@@ -101,11 +101,7 @@ async fn compare_recall_quality() {
             "Previous project was a web scraper in Python",
             MemoryCategory::Daily,
         ),
-        (
-            "deploy",
-            "Deploys to VPS via Docker",
-            MemoryCategory::Core,
-        ),
+        ("deploy", "Deploys to VPS via Docker", MemoryCategory::Core),
         (
             "model",
             "Prefers Claude Sonnet for coding tasks",

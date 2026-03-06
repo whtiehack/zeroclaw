@@ -49,7 +49,7 @@ const SECRET_SHELL_PATTERNS: &[&str] = &[
 
 /// Trim conversation history to prevent unbounded growth.
 /// Preserves the system prompt (first message if role=system) and the most recent messages.
-pub(crate) fn trim_history(history: &mut Vec<ChatMessage>, max_history: usize) {
+pub(super) fn trim_history(history: &mut Vec<ChatMessage>, max_history: usize) {
     // Nothing to trim if within limit
     let has_system = history.first().map_or(false, |m| m.role == "system");
     let non_system_count = if has_system {
@@ -94,14 +94,6 @@ pub(super) fn apply_compaction_summary(
 ) {
     let summary_msg = ChatMessage::assistant(format!("[Compaction summary]\n{}", summary.trim()));
     history.splice(start..compact_end, std::iter::once(summary_msg));
-}
-
-/// Estimate total token count for a history slice using ~4 chars/token heuristic.
-pub(crate) fn estimate_history_tokens(history: &[ChatMessage]) -> u64 {
-    history
-        .iter()
-        .map(|m| m.content.len().div_ceil(4) as u64)
-        .sum()
 }
 
 /// Returns `(compacted, flush_ok)`:

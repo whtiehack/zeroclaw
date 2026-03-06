@@ -440,12 +440,7 @@ pub(crate) async fn deliver_announcement(
                     &config.workspace_dir,
                     config.api_key.as_deref(),
                 )?);
-                let channel = WeComChannel::new(
-                    wecom,
-                    &config.workspace_dir,
-                    memory,
-                    config.clone(),
-                )?;
+                let channel = WeComChannel::new(wecom, &config.workspace_dir, memory)?;
                 channel.send(&SendMessage::new(output, target)).await?;
             }
         }
@@ -1315,7 +1310,7 @@ mod tests {
         let mut config = test_config(&tmp).await;
         config.channels_config.wecom = Some(crate::config::schema::WeComConfig {
             token: "test-token".to_string(),
-            encoding_aes_key: "abcdefghijklmnopqrstuvwxyz0123456789ABCDE".to_string(),
+            encoding_aes_key: "QUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUE".to_string(),
             port: 9898,
             file_retention_days: 3,
             max_file_size_mb: 20,

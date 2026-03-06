@@ -413,6 +413,12 @@ fn conversation_history_key(msg: &traits::ChannelMessage) -> String {
         return format!("{}_{}", msg.channel, msg.sender);
     }
 
+    // WeCom uses reply_target as conversation scope (group--xxx or user--xxx).
+    // Group chats share history across all members; single chats isolate by user.
+    if msg.channel == "wecom" {
+        return format!("wecom_{}", msg.reply_target);
+    }
+
     // Include thread_ts for per-topic session isolation in forum groups
     let channel = msg.channel.as_str();
     match msg.thread_ts.as_deref().filter(|_| channel != "qq") {
@@ -427,6 +433,11 @@ fn interruption_scope_key(msg: &traits::ChannelMessage) -> String {
 }
 
 fn should_prefix_sender_identity(msg: &traits::ChannelMessage) -> bool {
+    // WeCom group chats: prefix sender identity for multi-user disambiguation.
+    if msg.channel == "wecom" && msg.reply_target.starts_with("group--") {
+        return true;
+    }
+
     if msg.channel != "telegram" {
         return false;
     }
@@ -572,10 +583,6 @@ fn strip_tool_call_tags(message: &str) -> String {
     }
 
     result.trim().to_string()
-}
-
-pub fn get_channel_delivery_instructions(channel_name: &str) -> Option<&'static str> {
-    channel_delivery_instructions(channel_name)
 }
 
 fn channel_delivery_instructions(channel_name: &str) -> Option<&'static str> {
@@ -889,6 +896,30 @@ fn build_channel_system_prompt(
              reaches the user."
         );
         prompt.push_str(&context);
+    }
+
+    // WeCom static context injection: provides chat type, conversation scope, and
+    // push URL memory key so the LLM can schedule cron deliveries and store
+    // webhook URLs correctly.
+    if channel_name == "wecom" && !reply_target.is_empty() {
+        let (chat_type, conversation_scope) = if reply_target.starts_with("group--") {
+            ("group", reply_target.to_string())
+        } else {
+            ("single", reply_target.to_string())
+        };
+        let push_url_key = format!("wecom_push_url::{conversation_scope}");
+        let mut lines = vec![
+            "\n\n[WECOM_STATIC_CONTEXT_V1]".to_string(),
+            format!("chat_type={chat_type}"),
+            format!("conversation_scope={conversation_scope}"),
+            format!("push_url_memory_key={push_url_key}"),
+        ];
+        // Single chat: include sender_userid derived from reply_target (user--xxx).
+        if let Some(userid) = reply_target.strip_prefix("user--") {
+            lines.push(format!("sender_userid={userid}"));
+        }
+        lines.push("[/WECOM_STATIC_CONTEXT_V1]".to_string());
+        prompt.push_str(&lines.join("\n"));
     }
 
     prompt
@@ -4599,8 +4630,8 @@ async fn run_message_dispatch_loop(
         workers.spawn(async move {
             let _permit = permit;
             let runtime_defaults = runtime_defaults_snapshot(worker_ctx.as_ref());
-            let interrupt_enabled =
-                runtime_defaults.interrupt_on_new_message && msg.channel == "telegram";
+            let interrupt_enabled = runtime_defaults.interrupt_on_new_message
+                && (msg.channel == "telegram" || msg.channel == "wecom");
             let sender_scope_key = interruption_scope_key(&msg);
             let cancellation_token = CancellationToken::new();
             let completion = Arc::new(InFlightTaskCompletion::new());
@@ -5626,12 +5657,7 @@ fn collect_configured_channels(
             ..Default::default()
         };
         if let Ok(mem) = crate::memory::create_memory(&mem_cfg, &config.workspace_dir, None) {
-            if let Ok(ch) = WeComChannel::new(
-                wecom_cfg,
-                &config.workspace_dir,
-                Arc::from(mem),
-                config.clone(),
-            ) {
+            if let Ok(ch) = WeComChannel::new(wecom_cfg, &config.workspace_dir, Arc::from(mem)) {
                 channels.push(ConfiguredChannel {
                     display_name: "WeCom",
                     channel: Arc::new(ch),
