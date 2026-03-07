@@ -1782,9 +1782,42 @@ pub(super) fn parse_structured_tool_calls(
     result
 }
 
+/// Strip `<tool_result …>…</tool_result>` blocks (and the optional
+/// `[Tool results]` prefix) that non-native-tool providers echo back in their
+/// responses.  Also strips `<thinking>…</thinking>` blocks that some models
+/// leak into visible output.
+///
+/// This is intentionally applied to **display text only** — the raw
+/// `response_text` stored in conversation history is left intact so the LLM
+/// can still reference prior tool results.
+pub(super) fn strip_tool_result_blocks(text: &str) -> String {
+    static TOOL_RESULT_RE: LazyLock<Regex> = LazyLock::new(|| {
+        // Match <tool_result …>…</tool_result> (with optional attributes)
+        Regex::new(r"(?s)<tool_result[^>]*>.*?</tool_result>").unwrap()
+    });
+    static THINKING_RE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"(?s)<thinking>.*?</thinking>").unwrap()
+    });
+    static TOOL_RESULTS_PREFIX_RE: LazyLock<Regex> = LazyLock::new(|| {
+        // The "[Tool results]" line that XmlToolDispatcher prepends
+        Regex::new(r"(?m)^\[Tool results\]\s*\n?").unwrap()
+    });
+
+    let result = TOOL_RESULT_RE.replace_all(text, "");
+    let result = THINKING_RE.replace_all(&result, "");
+    let result = TOOL_RESULTS_PREFIX_RE.replace_all(&result, "");
+
+    // Collapse runs of blank lines left behind by stripping
+    let trimmed = result.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    trimmed.to_string()
+}
+
 #[cfg(test)]
 mod tests {
-    use super::parse_tool_calls;
+    use super::{parse_tool_calls, strip_tool_result_blocks};
 
     #[test]
     fn parse_tool_calls_accepts_shorthand_object_in_tag_body() {
@@ -1800,5 +1833,53 @@ mod tests {
         let response = r#"<tool_call>shell["echo hi"]</tool_call>"#;
         let (_text, calls) = parse_tool_calls(response);
         assert!(calls.is_empty());
+    }
+
+    #[test]
+    fn strip_tool_result_blocks_removes_single_block() {
+        let input = r#"<tool_result name="memory_recall" status="ok">
+{"matches":["hello"]}
+</tool_result>
+Here is my answer."#;
+        assert_eq!(strip_tool_result_blocks(input), "Here is my answer.");
+    }
+
+    #[test]
+    fn strip_tool_result_blocks_removes_multiple_blocks() {
+        let input = r#"<tool_result name="memory_recall" status="ok">
+{"matches":[]}
+</tool_result>
+<tool_result name="shell" status="ok">
+done
+</tool_result>
+Final answer."#;
+        assert_eq!(strip_tool_result_blocks(input), "Final answer.");
+    }
+
+    #[test]
+    fn strip_tool_result_blocks_removes_prefix() {
+        let input = "[Tool results]\n<tool_result name=\"shell\" status=\"ok\">\nok\n</tool_result>\nDone.";
+        assert_eq!(strip_tool_result_blocks(input), "Done.");
+    }
+
+    #[test]
+    fn strip_tool_result_blocks_removes_thinking() {
+        let input = "<thinking>\nLet me think...\n</thinking>\nHere is the answer.";
+        assert_eq!(
+            strip_tool_result_blocks(input),
+            "Here is the answer."
+        );
+    }
+
+    #[test]
+    fn strip_tool_result_blocks_preserves_clean_text() {
+        let input = "Hello, this is a normal response.";
+        assert_eq!(strip_tool_result_blocks(input), input);
+    }
+
+    #[test]
+    fn strip_tool_result_blocks_returns_empty_for_only_tags() {
+        let input = "<tool_result name=\"memory_recall\" status=\"ok\">\n{}\n</tool_result>";
+        assert_eq!(strip_tool_result_blocks(input), "");
     }
 }

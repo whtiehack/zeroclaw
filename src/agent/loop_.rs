@@ -52,7 +52,8 @@ use parsing::{
     default_param_for_tool, detect_tool_call_parse_issue, extract_json_values, map_tool_name_alias,
     parse_arguments_value, parse_glm_shortened_body, parse_glm_style_tool_calls,
     parse_perl_style_tool_calls, parse_structured_tool_calls, parse_tool_call_value,
-    parse_tool_calls, parse_tool_calls_from_json_value, tool_call_signature, ParsedToolCall,
+    parse_tool_calls, parse_tool_calls_from_json_value, strip_tool_result_blocks,
+    tool_call_signature, ParsedToolCall,
 };
 
 /// Minimum characters per chunk when relaying LLM text to a streaming draft.
@@ -1854,6 +1855,9 @@ pub async fn run_tool_call_loop(
         } else {
             parsed_text
         };
+        // Strip <tool_result> / <thinking> blocks that non-native-tool
+        // providers may echo back — keep raw response_text intact for history.
+        let display_text = strip_tool_result_blocks(&display_text);
 
         let canary_exfiltration_detected = canary_guard
             .response_contains_canary(&response_text, turn_canary_token.as_deref())
