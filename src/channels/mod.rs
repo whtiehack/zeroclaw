@@ -5652,11 +5652,12 @@ fn collect_configured_channels(
     }
 
     if let Some(ref wecom_cfg) = config.channels_config.wecom {
-        let mem_cfg = crate::config::MemoryConfig {
-            backend: "markdown".into(),
-            ..Default::default()
-        };
-        if let Ok(mem) = crate::memory::create_memory(&mem_cfg, &config.workspace_dir, None) {
+        if let Ok(mem) = crate::memory::create_memory_with_storage(
+            &config.memory,
+            Some(&config.storage.provider.config),
+            &config.workspace_dir,
+            config.api_key.as_deref(),
+        ) {
             if let Ok(ch) = WeComChannel::new(wecom_cfg, &config.workspace_dir, Arc::from(mem)) {
                 channels.push(ConfiguredChannel {
                     display_name: "WeCom",
