@@ -635,7 +635,7 @@ fn channel_delivery_instructions(channel_name: &str) -> Option<&'static str> {
              - Keep responses concise and well-structured for enterprise chat contexts.\n\
              - Image/file attachments are automatically downloaded and provided as local paths like [IMAGE:/path/to/file.png] or [Document: /path/to/file.bin].\n\
              - Quoted messages (when user replies to a specific message) are injected as [WECOM_QUOTE]...[/WECOM_QUOTE] blocks containing msgtype and content.\n\
-             - In shared group chats, each turn includes a [sender_userid=xxx] prefix to identify who is speaking.\n\
+             - In shared group chats, each turn includes a [sender: xxx] prefix to identify who is speaking.\n\
              - If user asks to enable proactive push notifications, call memory_store with key=push_url_memory_key, content=<raw webhook URL>, and category='wecom_push'.\n\
              - Use tool results silently: answer the user's question directly without narrating internal execution steps.",
         ),
