@@ -1364,17 +1364,22 @@ impl WeComChannel {
 
         // Stream refresh
         if parsed.msg_type == "stream" {
-            tracing::debug!("WeCom: routing as stream refresh callback");
             let stream_id = parse_stream_id(&parsed.raw_payload).unwrap_or_else(next_stream_id);
             let state_snapshot = self.get_stream_state(&stream_id);
             let (content, finish, images) = if let Some(snapshot) = state_snapshot {
-                tracing::debug!(
-                    "WeCom stream refresh hit: stream_id={} finish={}",
+                tracing::info!(
+                    "[wecom] stream poll: scope={} stream_id={} finish={}",
+                    scopes.conversation_scope,
                     stream_id,
                     snapshot.finish
                 );
                 (snapshot.content, snapshot.finish, snapshot.images)
             } else {
+                tracing::info!(
+                    "[wecom] stream poll: scope={} stream_id={} (no active stream)",
+                    scopes.conversation_scope,
+                    stream_id
+                );
                 ("\u{4efb}\u{52a1}\u{5df2}\u{7ed3}\u{675f}\u{6216}\u{4e0d}\u{5b58}\u{5728}\u{3002}".to_string(), true, Vec::new())
             };
             let resp = match self
