@@ -2027,30 +2027,6 @@ impl WeComChannel {
 
 // ── Helper functions ─────────────────────────────────────────────────
 
-/// Strip `<tool_result ...>...</tool_result>` blocks from text.
-/// Used to clean up streaming progress display — tool results are internal
-/// protocol and should not be shown to end users.
-fn strip_tool_result_blocks(input: &str) -> String {
-    let mut out = String::with_capacity(input.len());
-    let mut remaining = input;
-    while let Some(start) = remaining.find("<tool_result") {
-        out.push_str(&remaining[..start]);
-        let after = &remaining[start..];
-        if let Some(end) = after.find("</tool_result>") {
-            remaining = &after[end + "</tool_result>".len()..];
-        } else {
-            // Unclosed tag — strip to end
-            remaining = "";
-        }
-    }
-    out.push_str(remaining);
-    // Collapse excessive blank lines left behind
-    while out.contains("\n\n\n") {
-        out = out.replace("\n\n\n", "\n\n");
-    }
-    out
-}
-
 fn strip_wecom_padding(input: &[u8]) -> Result<&[u8]> {
     let Some(last) = input.last() else {
         anyhow::bail!("invalid WeCom padding: empty payload");
@@ -3203,34 +3179,5 @@ mod tests {
         let s = "Hello";
         let boundary = floor_char_boundary(s, 100);
         assert_eq!(boundary, s.len());
-    }
-
-    #[test]
-    fn strip_tool_result_blocks_removes_all() {
-        let input = "before\n<tool_result name=\"shell\">\n{\"status\":0}\n</tool_result>\nafter";
-        let result = strip_tool_result_blocks(input);
-        assert_eq!(result, "before\n\nafter");
-        assert!(!result.contains("<tool_result"));
-    }
-
-    #[test]
-    fn strip_tool_result_blocks_multiple() {
-        let input = "<tool_result name=\"a\">\n{\"results\":[]}\n</tool_result>\n<tool_result name=\"b\">\n{\"matches\":[]}\n</tool_result>\ntext";
-        let result = strip_tool_result_blocks(input);
-        assert_eq!(result.trim(), "text");
-    }
-
-    #[test]
-    fn strip_tool_result_blocks_preserves_tool_call() {
-        let input = "<tool_call>\n{\"name\":\"shell\"}\n</tool_call>\n<tool_result name=\"shell\">\nok\n</tool_result>";
-        let result = strip_tool_result_blocks(input);
-        assert!(result.contains("<tool_call>"));
-        assert!(!result.contains("<tool_result"));
-    }
-
-    #[test]
-    fn strip_tool_result_blocks_no_match() {
-        let input = "plain text without any tags";
-        assert_eq!(strip_tool_result_blocks(input), input);
     }
 }
