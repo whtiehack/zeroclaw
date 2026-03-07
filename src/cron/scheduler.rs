@@ -1312,6 +1312,7 @@ mod tests {
             token: "test-token".to_string(),
             encoding_aes_key: "QUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUE".to_string(),
             port: 9898,
+            progress_mode: crate::config::schema::ProgressMode::Off,
             file_retention_days: 3,
             max_file_size_mb: 20,
             response_url_cache_per_scope: 50,

@@ -128,6 +128,7 @@ The channel distinguishes them by checking `query.echostr`.
 
 - `[channels_config.wecom] token`
 - `[channels_config.wecom] encoding_aes_key`
+- `[channels_config.wecom] progress_mode` (`off` by default; configurable to `compact` or `verbose`)
 - `[channels_config.wecom] file_retention_days`
 - `[channels_config.wecom] max_file_size_mb`
 - `[channels_config.wecom] response_url_cache_per_scope`

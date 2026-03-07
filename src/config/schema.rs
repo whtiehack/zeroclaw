@@ -6539,6 +6539,10 @@ fn default_wecom_port() -> u16 {
     9898
 }
 
+fn default_wecom_progress_mode() -> ProgressMode {
+    ProgressMode::Off
+}
+
 /// WeCom AI Bot callback configuration.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct WeComConfig {
@@ -6549,6 +6553,9 @@ pub struct WeComConfig {
     /// Port for the independent WeCom HTTP callback listener.
     #[serde(default = "default_wecom_port")]
     pub port: u16,
+    /// Draft progress verbosity for passive stream updates.
+    #[serde(default = "default_wecom_progress_mode")]
+    pub progress_mode: ProgressMode,
     /// File retention days for downloaded WeCom attachments under workspace cache.
     #[serde(default = "default_wecom_file_retention_days")]
     pub file_retention_days: u32,
@@ -11343,6 +11350,21 @@ denied_tools = ["shell"]
     }
 
     #[test]
+    async fn wecom_config_defaults_progress_mode_off() {
+        let json =
+            r#"{"token":"tok","encoding_aes_key":"abcdefghijklmnopqrstuvwxyz0123456789ABCDEFG"}"#;
+        let parsed: WeComConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.progress_mode, ProgressMode::Off);
+    }
+
+    #[test]
+    async fn wecom_config_deserializes_progress_mode_verbose() {
+        let json = r#"{"token":"tok","encoding_aes_key":"abcdefghijklmnopqrstuvwxyz0123456789ABCDEFG","progress_mode":"verbose"}"#;
+        let parsed: WeComConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.progress_mode, ProgressMode::Verbose);
+    }
+
+    #[test]
     async fn telegram_group_reply_config_overrides_legacy_mention_only() {
         let json = r#"{
             "bot_token":"tok",
@@ -14729,6 +14751,7 @@ use_feishu = true
             r#"{"token":"token","encoding_aes_key":"abcdefghijklmnopqrstuvwxyz0123456789ABCDEFG"}"#;
         let parsed: WeComConfig = serde_json::from_str(json).unwrap();
         assert_eq!(parsed.port, 9898);
+        assert_eq!(parsed.progress_mode, ProgressMode::Off);
         assert_eq!(parsed.file_retention_days, 3);
         assert_eq!(parsed.max_file_size_mb, 20);
         assert_eq!(parsed.response_url_cache_per_scope, 50);
@@ -14743,6 +14766,7 @@ use_feishu = true
             token: "token".into(),
             encoding_aes_key: "abcdefghijklmnopqrstuvwxyz0123456789ABCDEFG".into(),
             port: 9898,
+            progress_mode: ProgressMode::Verbose,
             file_retention_days: 5,
             max_file_size_mb: 30,
             response_url_cache_per_scope: 80,
