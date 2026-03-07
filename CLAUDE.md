@@ -218,6 +218,7 @@ When uncertain, classify as higher risk.
 
 1. **Read before write**
     - Inspect existing module, factory wiring, and adjacent tests before editing.
+    - Before analyzing or changing WeCom-related code, read `docs/project/wecom-mvp-notes.md` first.
 2. **Define scope boundary**
     - One concern per PR; avoid mixed feature+refactor+infra patches.
 3. **Implement minimal patch**
