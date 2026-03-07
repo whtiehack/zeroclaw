@@ -1125,34 +1125,6 @@ impl WeComChannel {
 
     // ── outbound send helpers ────────────────────────────────────────
 
-    async fn send_markdown_to_url(&self, url: &str, content: &str) -> Result<()> {
-        let payload = serde_json::json!({
-            "msgtype": "markdown",
-            "markdown": {
-                "content": content,
-            }
-        });
-
-        let response = self
-            .send_client
-            .post(url)
-            .json(&payload)
-            .send()
-            .await
-            .context("failed to send WeCom markdown")?;
-
-        let status = response.status();
-        let body = response.text().await.unwrap_or_default();
-        if !status.is_success() {
-            anyhow::bail!("WeCom markdown send failed: status={} body={body}", status);
-        }
-        if let Err(err) = parse_wecom_business_response(&body) {
-            anyhow::bail!("WeCom markdown send business failed: {err}; body={body}");
-        }
-
-        Ok(())
-    }
-
     /// Look up a scope-specific push webhook URL from memory.
     async fn lookup_scope_webhook(&self, scope: &str) -> Option<String> {
         let key = format!("wecom_push_url::{scope}");
@@ -2334,15 +2306,6 @@ fn inbound_content_preview(inbound: &ParsedInbound) -> String {
         "stream" => "[Stream refresh callback]".to_string(),
         "event" => "[Event callback]".to_string(),
         other => format!("[{other} message]"),
-    }
-}
-
-fn outbound_content_preview(content: &str) -> String {
-    let trimmed = content.trim();
-    if trimmed.is_empty() {
-        "[Empty reply]".to_string()
-    } else {
-        crate::util::truncate_with_ellipsis(trimmed, 120)
     }
 }
 
