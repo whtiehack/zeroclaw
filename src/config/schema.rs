@@ -6570,6 +6570,9 @@ pub struct WeComConfig {
     /// Optional fallback group-bot webhook URL when no valid response_url is available.
     #[serde(default)]
     pub fallback_robot_webhook_url: Option<String>,
+    /// Draft progress verbosity for streaming updates.
+    #[serde(default)]
+    pub progress_mode: ProgressMode,
 }
 
 impl ChannelConfig for WeComConfig {
@@ -14735,6 +14738,7 @@ use_feishu = true
         assert_eq!(parsed.lock_timeout_secs, 900);
         assert_eq!(parsed.history_max_turns, 50);
         assert!(parsed.fallback_robot_webhook_url.is_none());
+        assert_eq!(parsed.progress_mode, ProgressMode::Compact);
     }
 
     #[test]
@@ -14752,6 +14756,7 @@ use_feishu = true
             fallback_robot_webhook_url: Some(
                 "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=test".into(),
             ),
+            progress_mode: ProgressMode::Verbose,
         };
 
         let toml_str = toml::to_string(&wc).unwrap();
@@ -14765,6 +14770,21 @@ use_feishu = true
             parsed.fallback_robot_webhook_url.as_deref(),
             Some("https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=test")
         );
+        assert_eq!(parsed.progress_mode, ProgressMode::Verbose);
+    }
+
+    #[test]
+    async fn wecom_config_deserializes_progress_mode_verbose() {
+        let json = r#"{"token":"t","encoding_aes_key":"abcdefghijklmnopqrstuvwxyz0123456789ABCDEFG","progress_mode":"verbose"}"#;
+        let parsed: WeComConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.progress_mode, ProgressMode::Verbose);
+    }
+
+    #[test]
+    async fn wecom_config_deserializes_progress_mode_off() {
+        let json = r#"{"token":"t","encoding_aes_key":"abcdefghijklmnopqrstuvwxyz0123456789ABCDEFG","progress_mode":"off"}"#;
+        let parsed: WeComConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.progress_mode, ProgressMode::Off);
     }
 
     #[test]

@@ -1319,6 +1319,7 @@ mod tests {
             lock_timeout_secs: 900,
             history_max_turns: 30,
             fallback_robot_webhook_url: None,
+            progress_mode: crate::config::schema::ProgressMode::default(),
         });
 
         let mut job = test_job("echo ok");

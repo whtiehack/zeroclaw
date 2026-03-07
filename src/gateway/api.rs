@@ -1386,7 +1386,7 @@ fn hydrate_config_for_save(
 mod tests {
     use super::*;
     use crate::config::schema::{
-        CloudflareTunnelConfig, LarkReceiveMode, NgrokTunnelConfig, WatiConfig,
+        CloudflareTunnelConfig, LarkReceiveMode, NgrokTunnelConfig, ProgressMode, WatiConfig,
     };
 
     #[test]
@@ -1514,6 +1514,7 @@ mod tests {
             fallback_robot_webhook_url: Some(
                 "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=test".to_string(),
             ),
+            progress_mode: ProgressMode::default(),
         });
 
         let masked = mask_sensitive_fields(&cfg);
@@ -1656,6 +1657,7 @@ mod tests {
             fallback_robot_webhook_url: Some(
                 "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=test".to_string(),
             ),
+            progress_mode: ProgressMode::default(),
         });
 
         let incoming = mask_sensitive_fields(&current);
