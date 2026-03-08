@@ -270,12 +270,13 @@ All contributors (human or agent) must follow the same collaboration flow:
 - Do not start triage/review/implementation/merge work before assignee assignment is confirmed.
 - Queue safety rule: assign only the currently active target; do not pre-assign future queued targets.
 
-### 6.2 Worktree Workflow (Required for All Task Streams)
+### 6.2 Worktree Workflow (Required for Feature Development and Major Changes)
 
-Use Git worktrees to isolate every active task stream safely and predictably:
+Use Git worktrees to isolate feature development and major changes; small fixes and routine tasks can work directly on a clean branch:
 
-- Use one dedicated worktree per active branch/PR stream; do not implement directly in a shared default workspace.
-- Keep each worktree on a single branch and a single concern; do not mix unrelated edits in one worktree.
+- **When to use worktrees**: new feature development, major refactors, multi-file changes with high blast radius, or parallel task streams that need isolation.
+- **When worktrees are optional**: small bug fixes, docs edits, config tweaks, single-file changes, and routine maintenance.
+- When using a worktree, keep it on a single branch and a single concern; do not mix unrelated edits in one worktree.
 - Before each commit/push, verify commit hygiene in that worktree (`git status --short` and `git diff --cached`) so only scoped files are included.
 - Run validation commands inside the corresponding worktree before commit/PR.
 - Name worktrees clearly by scope (for example: `wt/ci-hardening`, `wt/provider-fix`).
