@@ -2595,7 +2595,7 @@ pub(crate) fn build_shell_policy_instructions(autonomy: &crate::config::Autonomy
 
     if normalized.contains("*") {
         instructions.push_str(
-            "- Allowed commands: wildcard `*` is configured (any command name/path may be allowlisted).\n",
+            "- Allowed commands: all commands are permitted (wildcard * configured).\n",
         );
     } else if normalized.is_empty() {
         instructions
