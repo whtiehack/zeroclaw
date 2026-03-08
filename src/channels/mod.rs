@@ -1424,6 +1424,12 @@ fn build_runtime_tool_visibility_prompt(
     excluded_tools: &[String],
     native_tools: bool,
 ) -> String {
+    // Native tool calling: the provider API already communicates available
+    // tools via function schemas — skip the redundant text summary.
+    if native_tools {
+        return String::new();
+    }
+
     let mut prompt = String::new();
     let mut specs = filtered_tool_specs_for_runtime(tools_registry, excluded_tools);
     specs.sort_by(|a, b| a.name.cmp(&b.name));
@@ -1437,6 +1443,12 @@ fn build_runtime_tool_visibility_prompt(
 
     if specs.is_empty() {
         prompt.push_str("- Allowed tools: (none)\n");
+    } else if excluded_tools.is_empty() {
+        let _ = writeln!(
+            prompt,
+            "All {} registered tools are available for this turn.\n",
+            specs.len()
+        );
     } else {
         let _ = writeln!(prompt, "- Allowed tools ({}):", specs.len());
         for spec in &specs {
@@ -1444,9 +1456,7 @@ fn build_runtime_tool_visibility_prompt(
         }
     }
 
-    if excluded_tools.is_empty() {
-        prompt.push_str("- Excluded by runtime policy: (none)\n\n");
-    } else {
+    if !excluded_tools.is_empty() {
         let mut excluded_sorted = excluded_tools.to_vec();
         excluded_sorted.sort();
         let _ = writeln!(
@@ -1456,18 +1466,11 @@ fn build_runtime_tool_visibility_prompt(
         );
     }
 
-    if native_tools {
-        prompt.push_str(
-            "Tool calling for this turn uses native provider function-calling. \
-             Do not emit `<tool_call>` XML tags.\n",
-        );
-    } else {
-        prompt.push_str(
-            "Tool calling for this turn uses XML tool protocol below. \
-             This protocol block is generated from the same runtime policy snapshot.\n",
-        );
-        prompt.push_str(&build_tool_instructions_from_specs(&specs));
-    }
+    prompt.push_str(
+        "Tool calling for this turn uses XML tool protocol below. \
+         This protocol block is generated from the same runtime policy snapshot.\n",
+    );
+    prompt.push_str(&build_tool_instructions_from_specs(&specs));
 
     prompt
 }
