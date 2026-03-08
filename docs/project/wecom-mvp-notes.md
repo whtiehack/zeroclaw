@@ -177,7 +177,7 @@ WeCom-specific prompt wiring currently happens in [`src/channels/mod.rs`](../../
 
 Additional per-turn behavior:
 
-- in shared group chats, current user content is prefixed with `[sender: <userid>]`
+- in shared group chats, current user content is prefixed with `[sender_userid=<userid>]`
 - prior conversation history is passed as structured `Vec<ChatMessage>`
 - quote context stays in the user content payload as `WECOM_QUOTE`
 
