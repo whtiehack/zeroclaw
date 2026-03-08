@@ -5014,9 +5014,9 @@ pub fn build_system_prompt_with_mode(
     let now = chrono::Local::now();
     let _ = writeln!(
         prompt,
-        "## Current Date & Time\n\n{} ({})\n",
-        now.format("%Y-%m-%d %H:%M:%S"),
-        now.format("%Z")
+        "## Current Date\n\n{} ({})\n",
+        now.format("%Y-%m-%d"),
+        now.format("%:z")
     );
 
     // ── 7. Runtime ──────────────────────────────────────────────
