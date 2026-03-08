@@ -4827,7 +4827,9 @@ pub fn build_system_prompt_with_mode(
     let mut prompt = String::with_capacity(8192);
 
     // ── 1. Tooling ──────────────────────────────────────────────
-    if !tools.is_empty() {
+    // When native tools are enabled, the provider already sends tool schemas
+    // via the API `tools` parameter — skip the redundant ## Tools summary.
+    if !tools.is_empty() && !native_tools {
         prompt.push_str("## Tools\n\n");
         prompt.push_str("You have access to the following tools:\n\n");
         for (name, desc) in tools {
