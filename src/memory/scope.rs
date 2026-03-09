@@ -10,6 +10,8 @@ const SCOPE_SEP: char = ':';
 /// Backends that cannot support scoped memory isolation.
 const UNSUPPORTED_BACKENDS: &[&str] = &["markdown", "lucid", "cortex-mem"];
 
+const RECALL_OVER_FETCH: usize = 2;
+
 // ---------------------------------------------------------------------------
 // MemoryScope — key encoding / decoding
 // ---------------------------------------------------------------------------
@@ -135,14 +137,12 @@ impl Memory for ScopedMemory {
     }
 
     async fn get(&self, key: &str) -> Result<Option<MemoryEntry>> {
-        let storage_key = if MemoryScope::is_scoped_key(key) {
-            key.to_string()
-        } else {
-            self.scope.encode_key(key)
-        };
+        if MemoryScope::is_scoped_key(key) {
+            bail!("refusing to get an already-scoped key: {key}");
+        }
+        let storage_key = self.scope.encode_key(key);
         match self.inner.get(&storage_key).await? {
             Some(mut entry) => {
-                // Decode the storage key back to a logical key for the caller.
                 if let Some(logical) = self.scope.decode_key_for_current_scope(&entry.key) {
                     entry.key = logical.to_string();
                 }
@@ -153,11 +153,10 @@ impl Memory for ScopedMemory {
     }
 
     async fn forget(&self, key: &str) -> Result<bool> {
-        let storage_key = if MemoryScope::is_scoped_key(key) {
-            key.to_string()
-        } else {
-            self.scope.encode_key(key)
-        };
+        if MemoryScope::is_scoped_key(key) {
+            bail!("refusing to forget an already-scoped key: {key}");
+        }
+        let storage_key = self.scope.encode_key(key);
         self.inner.forget(&storage_key).await
     }
 
@@ -167,9 +166,11 @@ impl Memory for ScopedMemory {
         limit: usize,
         _session_id: Option<&str>, // ignored — we inject our own scope_id
     ) -> Result<Vec<MemoryEntry>> {
+        // Over-fetch to compensate for non-scoped entries that will be filtered out.
+        let fetch_limit = limit.saturating_mul(RECALL_OVER_FETCH).max(limit);
         let mut entries = self
             .inner
-            .recall(query, limit, Some(self.scope.scope_id()))
+            .recall(query, fetch_limit, Some(self.scope.scope_id()))
             .await?;
 
         // Filter to current scope prefix and decode keys.
@@ -183,6 +184,7 @@ impl Memory for ScopedMemory {
             },
         );
 
+        entries.truncate(limit);
         Ok(entries)
     }
 
@@ -439,6 +441,26 @@ mod tests {
             .store(&already_encoded, "val", MemoryCategory::Core, None)
             .await
             .unwrap_err();
+        assert!(err.to_string().contains("already-scoped"));
+    }
+
+    #[tokio::test]
+    async fn scoped_memory_get_rejects_already_scoped_key() {
+        use crate::memory::none::NoneMemory;
+        let inner: Arc<dyn Memory> = Arc::new(NoneMemory::new());
+        let scoped = ScopedMemory::new(inner, "scope").unwrap();
+        let encoded = MemoryScope::new("other").encode_key("foo");
+        let err = scoped.get(&encoded).await.unwrap_err();
+        assert!(err.to_string().contains("already-scoped"));
+    }
+
+    #[tokio::test]
+    async fn scoped_memory_forget_rejects_already_scoped_key() {
+        use crate::memory::none::NoneMemory;
+        let inner: Arc<dyn Memory> = Arc::new(NoneMemory::new());
+        let scoped = ScopedMemory::new(inner, "scope").unwrap();
+        let encoded = MemoryScope::new("other").encode_key("foo");
+        let err = scoped.forget(&encoded).await.unwrap_err();
         assert!(err.to_string().contains("already-scoped"));
     }
 }
