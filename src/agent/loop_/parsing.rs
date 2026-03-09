@@ -1795,9 +1795,8 @@ pub(super) fn strip_tool_result_blocks(text: &str) -> String {
         // Match <tool_result …>…</tool_result> (with optional attributes)
         Regex::new(r"(?s)<tool_result[^>]*>.*?</tool_result>").unwrap()
     });
-    static THINKING_RE: LazyLock<Regex> = LazyLock::new(|| {
-        Regex::new(r"(?s)<thinking>.*?</thinking>").unwrap()
-    });
+    static THINKING_RE: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"(?s)<thinking>.*?</thinking>").unwrap());
     static TOOL_RESULTS_PREFIX_RE: LazyLock<Regex> = LazyLock::new(|| {
         // The "[Tool results]" line that XmlToolDispatcher prepends
         Regex::new(r"(?m)^\[Tool results\]\s*\n?").unwrap()
@@ -1858,17 +1857,15 @@ Final answer."#;
 
     #[test]
     fn strip_tool_result_blocks_removes_prefix() {
-        let input = "[Tool results]\n<tool_result name=\"shell\" status=\"ok\">\nok\n</tool_result>\nDone.";
+        let input =
+            "[Tool results]\n<tool_result name=\"shell\" status=\"ok\">\nok\n</tool_result>\nDone.";
         assert_eq!(strip_tool_result_blocks(input), "Done.");
     }
 
     #[test]
     fn strip_tool_result_blocks_removes_thinking() {
         let input = "<thinking>\nLet me think...\n</thinking>\nHere is the answer.";
-        assert_eq!(
-            strip_tool_result_blocks(input),
-            "Here is the answer."
-        );
+        assert_eq!(strip_tool_result_blocks(input), "Here is the answer.");
     }
 
     #[test]
