@@ -2594,9 +2594,8 @@ pub(crate) fn build_shell_policy_instructions(autonomy: &crate::config::Autonomy
         .collect();
 
     if normalized.contains("*") {
-        instructions.push_str(
-            "- Allowed commands: all commands are permitted (wildcard * configured).\n",
-        );
+        instructions
+            .push_str("- Allowed commands: all commands are permitted (wildcard * configured).\n");
     } else if normalized.is_empty() {
         instructions
             .push_str("- Allowed commands: none configured. Any shell command will be rejected.\n");
@@ -3409,6 +3408,20 @@ pub async fn process_message_with_session(
         &config.workspace_dir,
         config.api_key.as_deref(),
     )?);
+
+    // Wrap with ScopedMemory when a session_id is provided, so all memory
+    // tools automatically get scope isolation without signature changes.
+    let mem: Arc<dyn Memory> = if let Some(sid) = session_id {
+        match memory::ScopedMemory::new(mem.clone(), sid) {
+            Ok(scoped) => Arc::new(scoped),
+            Err(e) => {
+                tracing::warn!("ScopedMemory unavailable ({e}); using unscoped memory");
+                mem
+            }
+        }
+    } else {
+        mem
+    };
 
     let (composio_key, composio_entity_id) = if config.composio.enabled {
         (

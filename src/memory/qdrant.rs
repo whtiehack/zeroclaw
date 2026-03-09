@@ -235,8 +235,13 @@ impl Memory for QdrantMemory {
     ) -> Result<()> {
         self.ensure_initialized().await?;
 
-        // Generate embedding for the content
-        let combined_text = format!("{}\n{}", key, content);
+        // Generate embedding for the content.
+        // Strip scoped key prefix to avoid polluting the embedding vector
+        // with opaque hash bytes (ScopedMemory encodes keys as
+        // "__zc__{hash}:{logical_key}").
+        let embed_key =
+            crate::memory::scope::MemoryScope::decode_any_scoped_key(key).unwrap_or(key);
+        let combined_text = format!("{}\n{}", embed_key, content);
         let embedding = self.embedder.embed_one(&combined_text).await?;
 
         if embedding.is_empty() {
