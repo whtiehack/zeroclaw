@@ -115,6 +115,26 @@ pub fn load_skills_with_config(workspace_dir: &Path, config: &crate::config::Con
     )
 }
 
+/// Load skills from an explicit local directory using the active `[skills]` settings.
+///
+/// This is used for workspace-adjacent skill overlays (for example channel- or
+/// scope-specific skill directories) without changing the shared workspace
+/// `skills/` loading behavior.
+pub fn load_skills_from_directory_with_config(
+    workspace_dir: &Path,
+    skills_dir: &Path,
+    config: &crate::config::SkillsConfig,
+) -> Vec<Skill> {
+    let trusted_skill_roots =
+        resolve_trusted_skill_roots(workspace_dir, &config.trusted_skill_roots);
+    load_skills_from_directory(
+        skills_dir,
+        config.allow_scripts,
+        &trusted_skill_roots,
+        SkillLoadMode::from_prompt_mode(config.prompt_injection_mode),
+    )
+}
+
 fn load_skills_full_with_config(
     workspace_dir: &Path,
     config: &crate::config::Config,
@@ -3110,6 +3130,33 @@ description = "Bare minimum"
         assert_eq!(skills.len(), 1);
         assert_eq!(skills[0].name, "http_request");
         assert_ne!(skills[0].name, "CONTRIBUTING");
+    }
+
+    #[test]
+    fn load_skills_from_directory_with_config_reads_split_skill_overlay() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace_dir = dir.path().join("workspace");
+        let overlay_dir = workspace_dir.join("split_skill").join("group--ops");
+        let skill_dir = overlay_dir.join("release-helper");
+        fs::create_dir_all(&skill_dir).unwrap();
+        fs::write(
+            skill_dir.join("SKILL.md"),
+            "# release-helper\nDeployment checklist and release notes helper.\n",
+        )
+        .unwrap();
+
+        let skills = load_skills_from_directory_with_config(
+            &workspace_dir,
+            &overlay_dir,
+            &crate::config::SkillsConfig::default(),
+        );
+
+        assert_eq!(skills.len(), 1);
+        assert_eq!(skills[0].name, "release-helper");
+        assert_eq!(
+            skills[0].location.as_ref(),
+            Some(&skill_dir.join("SKILL.md"))
+        );
     }
 
     #[test]

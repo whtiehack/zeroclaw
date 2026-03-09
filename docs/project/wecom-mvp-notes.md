@@ -166,6 +166,8 @@ WeCom-specific prompt wiring currently happens in [`src/channels/mod.rs`](../../
 
 - `channel_delivery_instructions("wecom")` are appended directly to the system prompt
 - `build_channel_system_prompt()` appends `[WECOM_STATIC_CONTEXT_V1]` directly to the system prompt
+- shared workspace skills still load from `<workspace>/skills/`
+- additional scope-specific skills are loaded from `<workspace>/split_skill/<conversation_scope>/` when that directory exists
 - there is no current "inject into user message, then extract later" step
 
 `WECOM_STATIC_CONTEXT_V1` currently contains:
@@ -180,6 +182,7 @@ Additional per-turn behavior:
 - in shared group chats, current user content is prefixed with `[sender_userid=<userid>]`
 - prior conversation history is passed as structured `Vec<ChatMessage>`
 - quote context stays in the user content payload as `WECOM_QUOTE`
+- scope-specific skill overlays are WeCom-only; other channels do not read `split_skill/`
 
 ## Session Reset and Stop Handling
 
@@ -265,6 +268,12 @@ Current defaults from `src/config/schema.rs`:
 - `lock_timeout_secs = 900`
 - `history_max_turns = 50`
 - `progress_mode = compact`
+
+Additional fixed workspace behavior:
+
+- There is no config key for scope-specific skill overlays.
+- When present, WeCom loads extra skills from `<workspace>/split_skill/<conversation_scope>/`.
+- The shared workspace skill directory remains `<workspace>/skills/`.
 
 ## Gaps and Sharp Edges
 

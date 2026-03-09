@@ -143,6 +143,7 @@ const CHANNEL_CONTEXT_TOKEN_ESTIMATE_TARGET: usize = 80_000;
 const CHANNEL_CONTEXT_MIN_KEEP_NON_SYSTEM_MESSAGES: usize = 10;
 /// Guardrail for hook-modified outbound channel content.
 const CHANNEL_HOOK_MAX_OUTBOUND_CHARS: usize = 20_000;
+const WECOM_SPLIT_SKILLS_DIR: &str = "split_skill";
 
 type ProviderCacheMap = Arc<Mutex<HashMap<String, Arc<dyn Provider>>>>;
 type RouteSelectionMap = Arc<Mutex<HashMap<String, ChannelRouteSelection>>>;
@@ -275,6 +276,7 @@ struct ChannelRuntimeDefaults {
     min_relevance_score: f64,
     message_timeout_secs: u64,
     interrupt_on_new_message: bool,
+    skills: crate::config::SkillsConfig,
     multimodal: crate::config::MultimodalConfig,
     query_classification: crate::config::QueryClassificationConfig,
     model_routes: Vec<crate::config::ModelRouteConfig>,
@@ -948,6 +950,60 @@ fn build_channel_system_prompt(
     prompt
 }
 
+fn is_safe_scope_dir_name(scope: &str) -> bool {
+    if scope.trim().is_empty() || scope.contains('\\') {
+        return false;
+    }
+
+    let mut components = Path::new(scope).components();
+    matches!(
+        (components.next(), components.next()),
+        (Some(std::path::Component::Normal(_)), None)
+    )
+}
+
+fn load_wecom_scope_skills(
+    workspace_dir: &Path,
+    conversation_scope: &str,
+    skills_config: &crate::config::SkillsConfig,
+) -> Vec<crate::skills::Skill> {
+    if !is_safe_scope_dir_name(conversation_scope) {
+        tracing::warn!(
+            scope = %conversation_scope,
+            "Skipping WeCom split-skill lookup because conversation scope is not a safe directory name"
+        );
+        return Vec::new();
+    }
+
+    let scope_dir = workspace_dir
+        .join(WECOM_SPLIT_SKILLS_DIR)
+        .join(conversation_scope);
+    crate::skills::load_skills_from_directory_with_config(workspace_dir, &scope_dir, skills_config)
+}
+
+fn build_wecom_scope_skills_prompt(
+    skills: &[crate::skills::Skill],
+    workspace_dir: &Path,
+    conversation_scope: &str,
+    mode: crate::config::SkillsPromptInjectionMode,
+) -> String {
+    if skills.is_empty() {
+        return String::new();
+    }
+
+    let rendered = crate::skills::skills_to_prompt_with_mode(skills, workspace_dir, mode);
+    let body = rendered
+        .strip_prefix("## Available Skills\n\n")
+        .unwrap_or(rendered.as_str());
+
+    format!(
+        "## WeCom Scope Skills\n\n\
+         Additional skills are loaded from `{WECOM_SPLIT_SKILLS_DIR}/{conversation_scope}/` for the current WeCom conversation scope.\n\
+         These skills are available on top of the shared workspace skills.\n\n\
+         {body}"
+    )
+}
+
 fn normalize_cached_channel_turns(turns: Vec<ChatMessage>) -> Vec<ChatMessage> {
     let mut normalized = Vec::with_capacity(turns.len());
     let mut expecting_user = true;
@@ -1222,6 +1278,7 @@ fn runtime_defaults_from_config(config: &Config) -> ChannelRuntimeDefaults {
         min_relevance_score: config.memory.min_relevance_score,
         message_timeout_secs,
         interrupt_on_new_message,
+        skills: config.skills.clone(),
         multimodal: config.multimodal.clone(),
         query_classification: config.query_classification.clone(),
         model_routes: config.model_routes.clone(),
@@ -1288,6 +1345,7 @@ fn runtime_defaults_snapshot(ctx: &ChannelRuntimeContext) -> ChannelRuntimeDefau
         min_relevance_score: ctx.min_relevance_score,
         message_timeout_secs: ctx.message_timeout_secs,
         interrupt_on_new_message: ctx.interrupt_on_new_message,
+        skills: crate::config::SkillsConfig::default(),
         multimodal: ctx.multimodal.clone(),
         query_classification: ctx.query_classification.clone(),
         model_routes: ctx.model_routes.clone(),
@@ -3987,6 +4045,22 @@ If this input is legitimate, rephrase the request and avoid instruction-override
         &msg.reply_target,
         expose_internal_tool_details,
     );
+    if msg.channel == "wecom" {
+        let scope_skills = load_wecom_scope_skills(
+            ctx.workspace_dir.as_ref(),
+            &msg.reply_target,
+            &runtime_defaults.skills,
+        );
+        if !scope_skills.is_empty() {
+            system_prompt.push_str("\n\n");
+            system_prompt.push_str(&build_wecom_scope_skills_prompt(
+                &scope_skills,
+                ctx.workspace_dir.as_ref(),
+                &msg.reply_target,
+                runtime_defaults.skills.prompt_injection_mode,
+            ));
+        }
+    }
     system_prompt.push_str(&build_runtime_tool_visibility_prompt(
         ctx.tools_registry.as_ref(),
         &excluded_tools_snapshot,
@@ -7335,6 +7409,16 @@ BTC is currently around $65,000 based on latest tool output."#
         assert!(prompt.contains("`mock_echo`"));
     }
 
+    #[test]
+    fn wecom_split_skill_scope_names_reject_unsafe_paths() {
+        assert!(is_safe_scope_dir_name("group--finance"));
+        assert!(is_safe_scope_dir_name("user--alice"));
+        assert!(!is_safe_scope_dir_name(""));
+        assert!(!is_safe_scope_dir_name("../finance"));
+        assert!(!is_safe_scope_dir_name("group--finance/extra"));
+        assert!(!is_safe_scope_dir_name(r"group--finance\extra"));
+    }
+
     #[tokio::test]
     async fn process_channel_message_injects_runtime_tool_visibility_prompt() {
         let channel_impl = Arc::new(RecordingChannel::default());
@@ -7418,6 +7502,90 @@ BTC is currently around $65,000 based on latest tool output."#
         let sent = channel_impl.sent_messages.lock().await;
         assert_eq!(sent.len(), 1);
         assert!(sent[0].contains("response-1"));
+    }
+
+    #[tokio::test]
+    async fn process_wecom_message_includes_scope_split_skills_prompt() {
+        let provider_impl = Arc::new(HistoryCaptureProvider::default());
+        let provider: Arc<dyn Provider> = provider_impl.clone();
+        let mut provider_cache_seed: HashMap<String, Arc<dyn Provider>> = HashMap::new();
+        provider_cache_seed.insert("test-provider".to_string(), Arc::clone(&provider));
+
+        let temp = tempfile::tempdir().unwrap();
+        let workspace_dir = temp.path().join("workspace");
+        let skill_dir = workspace_dir
+            .join(WECOM_SPLIT_SKILLS_DIR)
+            .join("group--finance")
+            .join("finance-helper");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "# finance-helper\nSummarize finance chat actions.\n",
+        )
+        .unwrap();
+
+        let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            channels_by_name: Arc::new(HashMap::new()),
+            provider: Arc::clone(&provider),
+            default_provider: Arc::new("test-provider".to_string()),
+            memory: Arc::new(NoopMemory),
+            tools_registry: Arc::new(vec![Box::new(MockEchoTool)]),
+            observer: Arc::new(NoopObserver),
+            system_prompt: Arc::new("test-system-prompt".to_string()),
+            model: Arc::new("default-model".to_string()),
+            temperature: 0.0,
+            auto_save_memory: false,
+            max_tool_iterations: 5,
+            min_relevance_score: 0.0,
+            conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            conversation_locks: Default::default(),
+            session_config: crate::config::AgentSessionConfig::default(),
+            session_manager: None,
+            provider_cache: Arc::new(Mutex::new(provider_cache_seed)),
+            route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            api_key: None,
+            api_url: None,
+            reliability: Arc::new(crate::config::ReliabilityConfig::default()),
+            provider_runtime_options: providers::ProviderRuntimeOptions::default(),
+            workspace_dir: Arc::new(workspace_dir),
+            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            interrupt_on_new_message: false,
+            multimodal: crate::config::MultimodalConfig::default(),
+            hooks: None,
+            non_cli_excluded_tools: Arc::new(Mutex::new(Vec::new())),
+            query_classification: crate::config::QueryClassificationConfig::default(),
+            model_routes: Vec::new(),
+            approval_manager: mock_price_approved_manager(),
+            safety_heartbeat: None,
+            startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
+        });
+
+        process_channel_message(
+            runtime_ctx,
+            traits::ChannelMessage {
+                id: "msg-wecom-scope-skills-1".to_string(),
+                sender: "alice".to_string(),
+                reply_target: "group--finance".to_string(),
+                content: "hello finance scope".to_string(),
+                channel: "wecom".to_string(),
+                timestamp: 1,
+                thread_ts: None,
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+        let calls = provider_impl
+            .calls
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        assert_eq!(calls.len(), 1);
+        let system_prompt = &calls[0][0].1;
+        assert!(system_prompt.contains("## WeCom Scope Skills"));
+        assert!(system_prompt.contains("conversation_scope=group--finance"));
+        assert!(system_prompt.contains("<name>finance-helper</name>"));
+        assert!(system_prompt
+            .contains("<location>split_skill/group--finance/finance-helper/SKILL.md</location>"));
     }
 
     #[tokio::test]
@@ -10031,6 +10199,7 @@ BTC is currently around $65,000 based on latest tool output."#
                         min_relevance_score: 0.0,
                         message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
                         interrupt_on_new_message: false,
+                        skills: crate::config::SkillsConfig::default(),
                         multimodal: crate::config::MultimodalConfig::default(),
                         query_classification: crate::config::QueryClassificationConfig::default(),
                         model_routes: Vec::new(),
