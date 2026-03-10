@@ -5680,18 +5680,14 @@ fn collect_configured_channels(
     }
 
     if let Some(ref wecom_cfg) = config.channels_config.wecom {
-        if let Ok(mem) = crate::memory::create_memory_with_storage(
-            &config.memory,
-            Some(&config.storage.provider.config),
-            &config.workspace_dir,
-            config.api_key.as_deref(),
-        ) {
-            if let Ok(ch) = WeComChannel::new(wecom_cfg, &config.workspace_dir, Arc::from(mem)) {
+        match WeComChannel::new(wecom_cfg, &config.workspace_dir) {
+            Ok(ch) => {
                 channels.push(ConfiguredChannel {
                     display_name: "WeCom",
                     channel: Arc::new(ch),
                 });
             }
+            Err(err) => tracing::warn!("WeCom channel initialization failed: {err}"),
         }
     }
 

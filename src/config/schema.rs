@@ -6519,57 +6519,26 @@ fn default_wecom_max_file_size_mb() -> u64 {
     20
 }
 
-fn default_wecom_response_url_cache_per_scope() -> usize {
-    50
-}
-
-fn default_wecom_response_url_ttl_secs() -> u64 {
-    3600
-}
-
-fn default_wecom_lock_timeout_secs() -> u64 {
-    900
-}
-
 fn default_wecom_history_max_turns() -> usize {
     50
 }
 
-fn default_wecom_port() -> u16 {
-    9898
-}
-
-/// WeCom AI Bot callback configuration.
+/// WeCom AI Bot WebSocket channel configuration.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct WeComConfig {
-    /// Signature token configured in WeCom callback settings.
-    pub token: String,
-    /// EncodingAESKey configured in WeCom callback settings (43 chars base64 body).
-    pub encoding_aes_key: String,
-    /// Port for the independent WeCom HTTP callback listener.
-    #[serde(default = "default_wecom_port")]
-    pub port: u16,
+    /// Bot ID for WeCom WebSocket subscription.
+    pub bot_id: String,
+    /// Secret for WeCom WebSocket subscription authentication.
+    pub secret: String,
     /// File retention days for downloaded WeCom attachments under workspace cache.
     #[serde(default = "default_wecom_file_retention_days")]
     pub file_retention_days: u32,
     /// Maximum accepted file size (MiB) for WeCom attachment download attempts.
     #[serde(default = "default_wecom_max_file_size_mb")]
     pub max_file_size_mb: u64,
-    /// Max retained response_url entries per conversation scope.
-    #[serde(default = "default_wecom_response_url_cache_per_scope")]
-    pub response_url_cache_per_scope: usize,
-    /// TTL in seconds for cached response_url entries.
-    #[serde(default = "default_wecom_response_url_ttl_secs")]
-    pub response_url_ttl_secs: u64,
-    /// Lock TTL in seconds for in-flight execution scopes.
-    #[serde(default = "default_wecom_lock_timeout_secs")]
-    pub lock_timeout_secs: u64,
     /// Maximum retained turns per WeCom conversation scope.
     #[serde(default = "default_wecom_history_max_turns")]
     pub history_max_turns: usize,
-    /// Optional fallback group-bot webhook URL when no valid response_url is available.
-    #[serde(default)]
-    pub fallback_robot_webhook_url: Option<String>,
     /// Draft progress verbosity for streaming updates.
     #[serde(default)]
     pub progress_mode: ProgressMode,
@@ -6580,7 +6549,7 @@ impl ChannelConfig for WeComConfig {
         "WeCom"
     }
     fn desc() -> &'static str {
-        "WeCom AI Bot callback"
+        "WeCom AI Bot (WebSocket)"
     }
 }
 
@@ -7313,18 +7282,8 @@ fn decrypt_channel_secrets(
     if let Some(ref mut wecom) = channels.wecom {
         decrypt_secret(
             store,
-            &mut wecom.token,
-            "config.channels_config.wecom.token",
-        )?;
-        decrypt_secret(
-            store,
-            &mut wecom.encoding_aes_key,
-            "config.channels_config.wecom.encoding_aes_key",
-        )?;
-        decrypt_optional_secret(
-            store,
-            &mut wecom.fallback_robot_webhook_url,
-            "config.channels_config.wecom.fallback_robot_webhook_url",
+            &mut wecom.secret,
+            "config.channels_config.wecom.secret",
         )?;
     }
     if let Some(ref mut nostr) = channels.nostr {
@@ -7535,18 +7494,8 @@ fn encrypt_channel_secrets(
     if let Some(ref mut wecom) = channels.wecom {
         encrypt_secret(
             store,
-            &mut wecom.token,
-            "config.channels_config.wecom.token",
-        )?;
-        encrypt_secret(
-            store,
-            &mut wecom.encoding_aes_key,
-            "config.channels_config.wecom.encoding_aes_key",
-        )?;
-        encrypt_optional_secret(
-            store,
-            &mut wecom.fallback_robot_webhook_url,
-            "config.channels_config.wecom.fallback_robot_webhook_url",
+            &mut wecom.secret,
+            "config.channels_config.wecom.secret",
         )?;
     }
     if let Some(ref mut nostr) = channels.nostr {
@@ -14729,33 +14678,24 @@ use_feishu = true
     #[test]
     async fn wecom_config_deserializes_with_defaults() {
         let json =
-            r#"{"token":"token","encoding_aes_key":"abcdefghijklmnopqrstuvwxyz0123456789ABCDEFG"}"#;
+            r#"{"bot_id":"bot123","secret":"secret456"}"#;
         let parsed: WeComConfig = serde_json::from_str(json).unwrap();
-        assert_eq!(parsed.port, 9898);
+        assert_eq!(parsed.bot_id, "bot123");
+        assert_eq!(parsed.secret, "secret456");
         assert_eq!(parsed.file_retention_days, 3);
         assert_eq!(parsed.max_file_size_mb, 20);
-        assert_eq!(parsed.response_url_cache_per_scope, 50);
-        assert_eq!(parsed.lock_timeout_secs, 900);
         assert_eq!(parsed.history_max_turns, 50);
-        assert!(parsed.fallback_robot_webhook_url.is_none());
         assert_eq!(parsed.progress_mode, ProgressMode::Compact);
     }
 
     #[test]
     async fn wecom_config_toml_roundtrip() {
         let wc = WeComConfig {
-            token: "token".into(),
-            encoding_aes_key: "abcdefghijklmnopqrstuvwxyz0123456789ABCDEFG".into(),
-            port: 9898,
+            bot_id: "bot123".into(),
+            secret: "secret456".into(),
             file_retention_days: 5,
             max_file_size_mb: 30,
-            response_url_cache_per_scope: 80,
-            response_url_ttl_secs: 3600,
-            lock_timeout_secs: 1200,
             history_max_turns: 40,
-            fallback_robot_webhook_url: Some(
-                "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=test".into(),
-            ),
             progress_mode: ProgressMode::Verbose,
         };
 
@@ -14763,26 +14703,20 @@ use_feishu = true
         let parsed: WeComConfig = toml::from_str(&toml_str).unwrap();
         assert_eq!(parsed.file_retention_days, 5);
         assert_eq!(parsed.max_file_size_mb, 30);
-        assert_eq!(parsed.response_url_cache_per_scope, 80);
-        assert_eq!(parsed.lock_timeout_secs, 1200);
         assert_eq!(parsed.history_max_turns, 40);
-        assert_eq!(
-            parsed.fallback_robot_webhook_url.as_deref(),
-            Some("https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=test")
-        );
         assert_eq!(parsed.progress_mode, ProgressMode::Verbose);
     }
 
     #[test]
     async fn wecom_config_deserializes_progress_mode_verbose() {
-        let json = r#"{"token":"t","encoding_aes_key":"abcdefghijklmnopqrstuvwxyz0123456789ABCDEFG","progress_mode":"verbose"}"#;
+        let json = r#"{"bot_id":"b","secret":"s","progress_mode":"verbose"}"#;
         let parsed: WeComConfig = serde_json::from_str(json).unwrap();
         assert_eq!(parsed.progress_mode, ProgressMode::Verbose);
     }
 
     #[test]
     async fn wecom_config_deserializes_progress_mode_off() {
-        let json = r#"{"token":"t","encoding_aes_key":"abcdefghijklmnopqrstuvwxyz0123456789ABCDEFG","progress_mode":"off"}"#;
+        let json = r#"{"bot_id":"b","secret":"s","progress_mode":"off"}"#;
         let parsed: WeComConfig = serde_json::from_str(json).unwrap();
         assert_eq!(parsed.progress_mode, ProgressMode::Off);
     }

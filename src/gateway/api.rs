@@ -1130,9 +1130,7 @@ fn mask_sensitive_fields(config: &crate::config::Config) -> crate::config::Confi
         mask_required_secret(&mut qq.app_secret);
     }
     if let Some(wecom) = masked.channels_config.wecom.as_mut() {
-        mask_required_secret(&mut wecom.token);
-        mask_required_secret(&mut wecom.encoding_aes_key);
-        mask_optional_secret(&mut wecom.fallback_robot_webhook_url);
+        mask_required_secret(&mut wecom.secret);
     }
     if let Some(nostr) = masked.channels_config.nostr.as_mut() {
         mask_required_secret(&mut nostr.private_key);
@@ -1346,15 +1344,7 @@ fn restore_masked_sensitive_fields(
         incoming.channels_config.wecom.as_mut(),
         current.channels_config.wecom.as_ref(),
     ) {
-        restore_required_secret(&mut incoming_ch.token, &current_ch.token);
-        restore_required_secret(
-            &mut incoming_ch.encoding_aes_key,
-            &current_ch.encoding_aes_key,
-        );
-        restore_optional_secret(
-            &mut incoming_ch.fallback_robot_webhook_url,
-            &current_ch.fallback_robot_webhook_url,
-        );
+        restore_required_secret(&mut incoming_ch.secret, &current_ch.secret);
     }
     if let (Some(incoming_ch), Some(current_ch)) = (
         incoming.channels_config.nostr.as_mut(),
@@ -1502,18 +1492,11 @@ mod tests {
             max_draft_edits: crate::config::schema::default_lark_max_draft_edits(),
         });
         cfg.channels_config.wecom = Some(crate::config::WeComConfig {
-            token: "wecom-token".to_string(),
-            encoding_aes_key: "abcdefghijklmnopqrstuvwxyz0123456789ABCDEFG".to_string(),
-            port: 9898,
+            bot_id: "wecom-bot-id".to_string(),
+            secret: "wecom-secret".to_string(),
             file_retention_days: 3,
             max_file_size_mb: 20,
-            response_url_cache_per_scope: 50,
-            response_url_ttl_secs: 3600,
-            lock_timeout_secs: 900,
             history_max_turns: 30,
-            fallback_robot_webhook_url: Some(
-                "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=test".to_string(),
-            ),
             progress_mode: ProgressMode::default(),
         });
 
@@ -1595,12 +1578,7 @@ mod tests {
             .wecom
             .as_ref()
             .expect("wecom config should exist");
-        assert_eq!(masked_wecom.token, MASKED_SECRET);
-        assert_eq!(masked_wecom.encoding_aes_key, MASKED_SECRET);
-        assert_eq!(
-            masked_wecom.fallback_robot_webhook_url.as_deref(),
-            Some(MASKED_SECRET)
-        );
+        assert_eq!(masked_wecom.secret, MASKED_SECRET);
     }
 
     #[test]
@@ -1645,18 +1623,11 @@ mod tests {
             max_draft_edits: crate::config::schema::default_lark_max_draft_edits(),
         });
         current.channels_config.wecom = Some(crate::config::WeComConfig {
-            token: "wecom-token".to_string(),
-            encoding_aes_key: "abcdefghijklmnopqrstuvwxyz0123456789ABCDEFG".to_string(),
-            port: 9898,
+            bot_id: "wecom-bot-id".to_string(),
+            secret: "wecom-secret".to_string(),
             file_retention_days: 3,
             max_file_size_mb: 20,
-            response_url_cache_per_scope: 50,
-            response_url_ttl_secs: 3600,
-            lock_timeout_secs: 900,
             history_max_turns: 30,
-            fallback_robot_webhook_url: Some(
-                "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=test".to_string(),
-            ),
             progress_mode: ProgressMode::default(),
         });
 
@@ -1754,15 +1725,7 @@ mod tests {
             .wecom
             .as_ref()
             .expect("wecom config should exist");
-        assert_eq!(restored_wecom.token, "wecom-token");
-        assert_eq!(
-            restored_wecom.encoding_aes_key,
-            "abcdefghijklmnopqrstuvwxyz0123456789ABCDEFG"
-        );
-        assert_eq!(
-            restored_wecom.fallback_robot_webhook_url.as_deref(),
-            Some("https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=test")
-        );
+        assert_eq!(restored_wecom.secret, "wecom-secret");
     }
 
     #[test]

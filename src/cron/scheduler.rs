@@ -4,7 +4,7 @@ use crate::channels::LarkChannel;
 use crate::channels::MatrixChannel;
 use crate::channels::{
     Channel, DingTalkChannel, DiscordChannel, EmailChannel, MattermostChannel, NapcatChannel,
-    QQChannel, SendMessage, SlackChannel, TelegramChannel, WeComChannel, WhatsAppChannel,
+    QQChannel, SendMessage, SlackChannel, TelegramChannel, WhatsAppChannel,
 };
 use crate::config::Config;
 use crate::cron::{
@@ -429,19 +429,7 @@ pub(crate) async fn deliver_announcement(
             if let Some(live_channel) = crate::channels::get_live_channel("wecom") {
                 live_channel.send(&SendMessage::new(output, target)).await?;
             } else {
-                let wecom = config
-                    .channels_config
-                    .wecom
-                    .as_ref()
-                    .ok_or_else(|| anyhow::anyhow!("wecom channel not configured"))?;
-                let memory = Arc::from(crate::memory::create_memory_with_storage(
-                    &config.memory,
-                    Some(&config.storage.provider.config),
-                    &config.workspace_dir,
-                    config.api_key.as_deref(),
-                )?);
-                let channel = WeComChannel::new(wecom, &config.workspace_dir, memory)?;
-                channel.send(&SendMessage::new(output, target)).await?;
+                anyhow::bail!("wecom channel not available (WebSocket not connected)");
             }
         }
         "napcat" => {
@@ -1309,16 +1297,11 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let mut config = test_config(&tmp).await;
         config.channels_config.wecom = Some(crate::config::schema::WeComConfig {
-            token: "test-token".to_string(),
-            encoding_aes_key: "QUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUE".to_string(),
-            port: 9898,
+            bot_id: "test-bot-id".to_string(),
+            secret: "test-secret".to_string(),
             file_retention_days: 3,
             max_file_size_mb: 20,
-            response_url_cache_per_scope: 50,
-            response_url_ttl_secs: 3600,
-            lock_timeout_secs: 900,
             history_max_turns: 30,
-            fallback_robot_webhook_url: None,
             progress_mode: crate::config::schema::ProgressMode::default(),
         });
 

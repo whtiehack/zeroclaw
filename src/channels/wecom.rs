@@ -1,32 +1,30 @@
 use super::traits::{Channel, ChannelMessage, SendMessage};
-use crate::memory::Memory;
 use aes::Aes256;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
-use axum::{
-    body::Bytes,
-    extract::Query,
-    http::StatusCode,
-    routing::{get, post},
-    Router,
-};
 use base64::Engine as _;
-use cbc::cipher::{block_padding::NoPadding, BlockDecryptMut, BlockEncryptMut, KeyIvInit};
+use cbc::cipher::{block_padding::NoPadding, BlockDecryptMut, KeyIvInit};
+use futures_util::{SinkExt, StreamExt};
 use md5 as md5_crate;
 use parking_lot::Mutex;
 use rand::RngExt;
-use serde::Deserialize;
 use serde_json::Value;
-use sha1::{Digest, Sha1};
-use std::collections::{HashMap, HashSet, VecDeque};
-use std::net::SocketAddr;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use tokio::sync::mpsc;
+use tokio_tungstenite::tungstenite::Message as WsMessage;
 
 // ── Constants ────────────────────────────────────────────────────────
 
-const WECOM_RESPONSE_URL_TTL_SECS: u64 = 3600;
+const WECOM_WS_URL: &str = "wss://openws.work.weixin.qq.com";
+const WECOM_BACKOFF_INITIAL_SECS: u64 = 5;
+const WECOM_BACKOFF_MAX_SECS: u64 = 60;
+const WECOM_PING_INTERVAL_SECS: u64 = 30;
+const WECOM_SUBSCRIBE_TIMEOUT_SECS: u64 = 10;
+const WECOM_HTTP_TIMEOUT_SECS: u64 = 60;
+
 const WECOM_MARKDOWN_MAX_BYTES: usize = 20_480;
 const WECOM_MARKDOWN_CHUNK_BYTES: usize = 8_000;
 const WECOM_EMOJIS: &[&str] = &[
@@ -37,42 +35,19 @@ const WECOM_EMOJIS: &[&str] = &[
     "\u{1F44C}",
 ];
 const WECOM_FILE_CLEANUP_INTERVAL_SECS: u64 = 1800;
-const WECOM_STREAM_STATE_TTL_SECS: u64 = 7200;
-const WECOM_HTTP_TIMEOUT_SECS: u64 = 60;
 const WECOM_STREAM_BOOTSTRAP_CONTENT: &str =
     "\u{6b63}\u{5728}\u{5904}\u{7406}\u{4e2d}\u{ff0c}\u{8bf7}\u{7a0d}\u{5019}\u{3002}";
 const WECOM_STREAM_MAX_IMAGES: usize = 10;
 const WECOM_IMAGE_MAX_BYTES: usize = 10 * 1024 * 1024;
 
-// ── Communication types (internal, for axum handler → handle_callback bridge) ──
+// ── WebSocket outbound command ───────────────────────────────────────
 
-#[derive(Debug, Deserialize)]
-pub(crate) struct WeComCallbackQuery {
-    pub msg_signature: String,
-    pub timestamp: String,
-    pub nonce: String,
-    pub echostr: Option<String>,
-}
-
-/// Internal request envelope for handler → callback bridge.
-struct WeComInboundRequest {
-    pub query: WeComCallbackQuery,
-    pub body: Bytes,
-    pub reply_tx: tokio::sync::oneshot::Sender<WeComInboundResponse>,
-}
-
-/// Internal response envelope from callback → handler bridge.
-struct WeComInboundResponse {
-    pub status_code: u16,
-    pub body: String,
+enum WsOutbound {
+    Frame(Value),
+    Close,
 }
 
 // ── Internal types ───────────────────────────────────────────────────
-
-#[derive(Debug, Deserialize)]
-struct WeComEncryptedEnvelope {
-    encrypt: String,
-}
 
 #[derive(Debug, Clone)]
 struct ParsedInbound {
@@ -82,7 +57,6 @@ struct ParsedInbound {
     chat_id: Option<String>,
     sender_userid: String,
     aibot_id: String,
-    response_url: Option<String>,
     raw_payload: Value,
 }
 
@@ -114,29 +88,6 @@ enum NormalizedMessage {
     Unsupported,
 }
 
-/// Cached response_url entry with expiration tracking
-#[derive(Debug, Clone)]
-struct ResponseUrlEntry {
-    url: String,
-    expires_at: Instant,
-    received_at: Instant,
-    msg_id: String,
-}
-
-/// Configuration for response_url caching
-#[derive(Debug, Clone)]
-struct ResponseUrlCacheConfig {
-    ttl_secs: u64,
-    max_per_scope: usize,
-}
-
-#[derive(Clone)]
-struct WeComRuntimeConfig {
-    workspace_dir: PathBuf,
-    file_retention_days: u32,
-    max_file_size_bytes: u64,
-}
-
 struct SimpleIdempotencyStore {
     seen: Mutex<HashSet<String>>,
 }
@@ -152,12 +103,11 @@ impl SimpleIdempotencyStore {
     }
 }
 
-#[derive(Debug, Clone)]
-struct StreamState {
-    content: String,
-    finish: bool,
-    images: Vec<StreamImageItem>,
-    expires_at: Instant,
+#[derive(Clone)]
+struct WeComRuntimeConfig {
+    workspace_dir: PathBuf,
+    file_retention_days: u32,
+    max_file_size_bytes: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -166,422 +116,144 @@ struct StreamImageItem {
     md5: String,
 }
 
-// ── WeComCrypto ──────────────────────────────────────────────────────
+// ── MediaDecryptor (per-attachment AES key) ──────────────────────────
 
-#[derive(Debug, Clone)]
-struct WeComCrypto {
-    token: String,
-    key: [u8; 32],
-}
+struct MediaDecryptor;
 
-impl WeComCrypto {
-    fn new(token: &str, encoding_aes_key: &str) -> Result<Self> {
-        use base64::Engine;
-
-        let raw = base64::engine::general_purpose::STANDARD
-            .decode(format!("{}=", encoding_aes_key.trim()))
+impl MediaDecryptor {
+    /// Decrypt WeCom media attachment using per-message AES key.
+    /// AES-256-CBC, IV = first 16 bytes of key, WeCom-style PKCS padding.
+    fn decrypt(aeskey_b64: &str, encrypted: &[u8]) -> Result<Vec<u8>> {
+        let raw_key = base64::engine::general_purpose::STANDARD
+            .decode(aeskey_b64.trim())
             .or_else(|_| {
                 base64::engine::general_purpose::STANDARD_NO_PAD
-                    .decode(encoding_aes_key.trim())
+                    .decode(aeskey_b64.trim())
             })
             .or_else(|_| {
                 base64::engine::general_purpose::URL_SAFE
-                    .decode(format!("{}=", encoding_aes_key.trim()))
+                    .decode(aeskey_b64.trim())
             })
-            .or_else(|_| {
-                base64::engine::general_purpose::URL_SAFE_NO_PAD
-                    .decode(encoding_aes_key.trim())
-            })
-            .context("failed to decode WeCom EncodingAESKey - tried STANDARD, STANDARD_NO_PAD, URL_SAFE variants")?;
+            .context("failed to decode WeCom media aeskey")?;
 
-        if raw.len() != 32 {
+        if raw_key.len() < 32 {
             anyhow::bail!(
-                "invalid WeCom EncodingAESKey length: expected 32 bytes, got {}",
-                raw.len()
+                "WeCom media aeskey too short: expected >= 32 bytes, got {}",
+                raw_key.len()
             );
         }
-        let mut key = [0u8; 32];
-        key.copy_from_slice(&raw);
 
-        Ok(Self {
-            token: token.trim().to_string(),
-            key,
-        })
-    }
+        let key = &raw_key[..32];
+        let iv = &key[..16];
 
-    fn verify_signature(
-        &self,
-        msg_signature: &str,
-        timestamp: &str,
-        nonce: &str,
-        encrypt: &str,
-    ) -> bool {
-        let mut parts = [
-            self.token.as_str(),
-            timestamp.trim(),
-            nonce.trim(),
-            encrypt.trim(),
-        ];
-        parts.sort_unstable();
-
-        let mut sha = Sha1::new();
-        sha.update(parts.join(""));
-        let expected = hex::encode(sha.finalize());
-        expected.eq_ignore_ascii_case(msg_signature.trim())
-    }
-
-    fn encrypt_json_ciphertext(
-        &self,
-        plaintext: &str,
-        nonce: &str,
-        timestamp: &str,
-        receive_id: &str,
-    ) -> Result<String> {
-        let plaintext_bytes = plaintext.as_bytes();
-        if plaintext_bytes.len() > (u32::MAX as usize) {
-            anyhow::bail!("WeCom plaintext payload too large");
-        }
-
-        let mut raw = Vec::with_capacity(plaintext_bytes.len() + receive_id.len() + 64);
-        raw.extend_from_slice(random_ascii_token(16).as_bytes());
-        raw.extend_from_slice(&(plaintext_bytes.len() as u32).to_be_bytes());
-        raw.extend_from_slice(plaintext_bytes);
-        raw.extend_from_slice(receive_id.as_bytes());
-
-        let pad_len = 32 - (raw.len() % 32);
-        let actual_pad = if pad_len == 0 { 32 } else { pad_len };
-        raw.extend(vec![actual_pad as u8; actual_pad]);
-
-        let iv = &self.key[..16];
-        let mut buf = raw.clone();
-        let encrypted = cbc::Encryptor::<Aes256>::new((&self.key).into(), iv.into())
-            .encrypt_padded_mut::<NoPadding>(&mut buf, raw.len())
-            .context("failed to encrypt WeCom response payload")?;
-        let encrypted_b64 = base64::engine::general_purpose::STANDARD.encode(encrypted);
-
-        let mut parts = [
-            self.token.as_str(),
-            timestamp.trim(),
-            nonce.trim(),
-            &encrypted_b64,
-        ];
-        parts.sort_unstable();
-        let mut sha = Sha1::new();
-        sha.update(parts.join(""));
-        let signature = hex::encode(sha.finalize());
-
-        let envelope = serde_json::json!({
-            "encrypt": encrypted_b64,
-            "msgsignature": signature,
-            "timestamp": timestamp.trim(),
-            "nonce": nonce.trim(),
-        });
-        Ok(envelope.to_string())
-    }
-
-    fn decrypt_json_ciphertext(&self, encrypt: &str, receive_id: &str) -> Result<String> {
-        let ciphertext = base64::engine::general_purpose::STANDARD
-            .decode(encrypt.trim())
-            .context("failed to decode WeCom ciphertext")?;
-
-        let iv = &self.key[..16];
-        let mut buf = ciphertext.clone();
-        let plaintext = cbc::Decryptor::<Aes256>::new((&self.key).into(), iv.into())
-            .decrypt_padded_mut::<NoPadding>(&mut buf)
-            .context("failed to decrypt WeCom ciphertext")?;
-
-        let unpadded = strip_wecom_padding(plaintext)?;
-        if unpadded.len() < 20 {
-            anyhow::bail!("decrypted WeCom payload is too short");
-        }
-
-        let msg_len =
-            u32::from_be_bytes([unpadded[16], unpadded[17], unpadded[18], unpadded[19]]) as usize;
-        let msg_start = 20usize;
-        let msg_end = msg_start.saturating_add(msg_len);
-        if msg_end > unpadded.len() {
-            anyhow::bail!("decrypted WeCom payload length is invalid");
-        }
-
-        let msg = std::str::from_utf8(&unpadded[msg_start..msg_end])
-            .context("decrypted WeCom payload is not utf-8")?
-            .to_string();
-        let from_receive_id = std::str::from_utf8(&unpadded[msg_end..])
-            .context("decrypted WeCom receive_id is not utf-8")?;
-
-        if from_receive_id != receive_id {
-            anyhow::bail!("wecom receive_id mismatch");
-        }
-
-        Ok(msg)
-    }
-
-    fn decrypt_file_payload(&self, encrypted: &[u8]) -> Result<Vec<u8>> {
-        let iv = &self.key[..16];
         let mut buf = encrypted.to_vec();
-        let plaintext = cbc::Decryptor::<Aes256>::new((&self.key).into(), iv.into())
+        let plaintext = cbc::Decryptor::<Aes256>::new(key.into(), iv.into())
             .decrypt_padded_mut::<NoPadding>(&mut buf)
-            .context("failed to decrypt WeCom attachment")?;
+            .context("failed to decrypt WeCom media attachment")?;
         Ok(strip_wecom_padding(plaintext)?.to_vec())
     }
 }
 
 // ── WeComChannel struct ──────────────────────────────────────────────
 
-/// WeCom (企业微信) channel — thin adapter layer.
+/// WeCom (企业微信) channel — WebSocket long-connection mode.
 ///
-/// Runs its own axum HTTP server on a dedicated port.
-/// `listen()` binds the port, receives HTTP callbacks, decrypts and
-/// normalizes inbound messages, then forwards them to the framework
-/// via `ChannelMessage`. All LLM orchestration, conversation history,
-/// and execution control are handled by the shared channel framework.
-///
-/// Outbound messages use a 3-layer fallback:
-/// 1. response_url (cached from incoming messages, TTL 1 hour)
-/// 2. scope-specific push webhook (looked up from memory)
-/// 3. fallback push webhook (from config)
+/// Connects to `wss://openws.work.weixin.qq.com`, subscribes with bot_id + secret.
+/// Inbound messages arrive as plaintext JSON frames (no encryption).
+/// Outbound replies are pushed directly via WS frames (streaming supported).
+/// Media attachments are encrypted per-URL with individual AES keys.
 #[derive(Clone)]
 pub struct WeComChannel {
-    // Crypto
-    crypto: WeComCrypto,
-
-    // Runtime config
+    bot_id: String,
+    secret: String,
     cfg: WeComRuntimeConfig,
-
-    // Listening port for independent HTTP server
-    port: u16,
-
-    // HTTP client for attachment downloads and webhook sends
     client: reqwest::Client,
-
-    // Outbound send client (may use proxy)
-    send_client: reqwest::Client,
-
-    // Memory backend
-    memory: Arc<dyn Memory>,
-
-    // Fallback webhook
-    fallback_webhook_url: Option<String>,
-
-    // response_url cache
-    response_urls: Arc<Mutex<HashMap<String, VecDeque<ResponseUrlEntry>>>>,
-    cache_config: ResponseUrlCacheConfig,
-
-    // Runtime state
-    stream_states: Arc<Mutex<HashMap<String, StreamState>>>,
+    ws_tx: Arc<tokio::sync::Mutex<Option<mpsc::Sender<WsOutbound>>>>,
     last_cleanup: Arc<Mutex<Instant>>,
     idempotency: Arc<SimpleIdempotencyStore>,
-
-    fingerprint: String,
+    req_id_map: Arc<Mutex<HashMap<String, String>>>, // stream_id → req_id
 }
+
+// ── Construction + WS helpers ────────────────────────────────────────
 
 impl WeComChannel {
     pub fn new(
         config: &crate::config::WeComConfig,
         workspace_dir: &Path,
-        memory: Arc<dyn Memory>,
     ) -> Result<Self> {
-        let crypto = WeComCrypto::new(&config.token, &config.encoding_aes_key)?;
-
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(WECOM_HTTP_TIMEOUT_SECS))
             .build()
             .context("failed to initialize WeCom HTTP client")?;
 
-        let send_client = crate::config::build_runtime_proxy_client("channel.wecom");
-
-        let fingerprint = format!("{}|{}", config.token, config.encoding_aes_key);
-
         Ok(Self {
-            crypto,
+            bot_id: config.bot_id.clone(),
+            secret: config.secret.clone(),
             cfg: WeComRuntimeConfig {
                 workspace_dir: workspace_dir.to_path_buf(),
                 file_retention_days: config.file_retention_days,
                 max_file_size_bytes: config.max_file_size_mb.saturating_mul(1024 * 1024),
             },
-            port: config.port,
             client,
-            send_client,
-            memory,
-            fallback_webhook_url: config.fallback_robot_webhook_url.clone(),
-            response_urls: Arc::new(Mutex::new(HashMap::new())),
-            cache_config: ResponseUrlCacheConfig {
-                ttl_secs: config.response_url_ttl_secs,
-                max_per_scope: config.response_url_cache_per_scope,
-            },
-            stream_states: Arc::new(Mutex::new(HashMap::new())),
+            ws_tx: Arc::new(tokio::sync::Mutex::new(None)),
             last_cleanup: Arc::new(Mutex::new(Instant::now())),
             idempotency: Arc::new(SimpleIdempotencyStore::new()),
-            fingerprint,
+            req_id_map: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
-    // ── HTTP request handler (axum → handle_callback bridge) ────────
+    /// Send a JSON frame through the WebSocket outbound channel.
+    async fn ws_send_frame(&self, frame: Value) -> Result<()> {
+        let guard = self.ws_tx.lock().await;
+        match guard.as_ref() {
+            Some(tx) => tx
+                .send(WsOutbound::Frame(frame))
+                .await
+                .map_err(|_| anyhow::anyhow!("WeCom WS outbound channel closed")),
+            None => anyhow::bail!("WeCom WebSocket not connected"),
+        }
+    }
 
-    /// Process an HTTP request from the independent listener.
-    /// Internally bridges to `handle_callback` via oneshot for minimal refactor risk.
-    async fn handle_http_request(
+    /// Send an `aibot_respond_msg` streaming frame.
+    async fn ws_send_respond_msg(
         &self,
-        query: WeComCallbackQuery,
-        body: Bytes,
-        tx: &tokio::sync::mpsc::Sender<ChannelMessage>,
-    ) -> (StatusCode, String) {
-        tracing::debug!(
-            "[wecom] HTTP request received: msg_signature={} timestamp={} echostr={}",
-            query.msg_signature,
-            query.timestamp,
-            if query.echostr.is_some() {
-                "present(verify)"
-            } else {
-                "absent(callback)"
-            }
-        );
-
-        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-        let req = WeComInboundRequest {
-            query,
-            body,
-            reply_tx,
-        };
-
-        self.handle_callback(req, tx).await;
-
-        match reply_rx.await {
-            Ok(resp) => {
-                let status = StatusCode::from_u16(resp.status_code).unwrap_or(StatusCode::OK);
-                tracing::debug!("[wecom] HTTP response: status={}", status.as_u16());
-                (status, resp.body)
-            }
-            Err(_) => {
-                tracing::error!("[wecom] HTTP handler: reply channel dropped unexpectedly");
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "internal error".to_string(),
-                )
-            }
-        }
-    }
-
-    // ── response_url cache ───────────────────────────────────────────
-
-    /// Cache a response_url for later use.
-    pub fn cache_response_url(&self, scope: &str, msg_id: &str, url: Option<&str>) {
-        let Some(url) = url.map(str::trim).filter(|v| !v.is_empty()) else {
-            return;
-        };
-
-        tracing::info!(
-            "WeCom: caching response_url for scope={} msg_id={}",
-            scope,
-            msg_id
-        );
-
-        let now = Instant::now();
-        let expires_at = now + Duration::from_secs(self.cache_config.ttl_secs);
-
-        let mut cache = self.response_urls.lock();
-        let queue = cache.entry(scope.to_string()).or_default();
-        queue.push_back(ResponseUrlEntry {
-            url: url.to_string(),
-            expires_at,
-            received_at: now,
-            msg_id: msg_id.to_string(),
-        });
-
-        while queue.len() > self.cache_config.max_per_scope {
-            queue.pop_front();
-        }
-    }
-
-    fn take_response_url(&self, scope: &str) -> Option<ResponseUrlEntry> {
-        let now = Instant::now();
-        let mut cache = self.response_urls.lock();
-        let queue = cache.get_mut(scope)?;
-        queue.retain(|entry| entry.expires_at > now);
-        if queue.is_empty() {
-            return None;
-        }
-        queue.pop_front()
-    }
-
-    fn prune_response_urls(&self) {
-        let now = Instant::now();
-        let mut cache = self.response_urls.lock();
-        cache.retain(|_, queue| {
-            queue.retain(|entry| entry.expires_at > now);
-            !queue.is_empty()
-        });
-    }
-
-    // ── stream states ────────────────────────────────────────────────
-
-    fn upsert_stream_state(
-        &self,
+        req_id: &str,
         stream_id: &str,
         content: &str,
         finish: bool,
-        images: Vec<StreamImageItem>,
-    ) {
-        let mut states = self.stream_states.lock();
-        states.insert(
-            stream_id.to_string(),
-            StreamState {
-                content: normalize_stream_content(content),
-                finish,
-                images,
-                expires_at: Instant::now() + Duration::from_secs(WECOM_STREAM_STATE_TTL_SECS),
-            },
-        );
-        tracing::info!(
-            "WeCom: upsert stream state stream_id={} finish={}",
-            stream_id,
-            finish
-        );
-    }
-
-    fn update_stream_state_content(&self, stream_id: &str, content: &str, finish: bool) {
-        let mut states = self.stream_states.lock();
-        if let Some(state) = states.get_mut(stream_id) {
-            state.content = normalize_stream_content(content);
-            state.finish = finish;
-            state.images = Vec::new();
-            state.expires_at = Instant::now() + Duration::from_secs(WECOM_STREAM_STATE_TTL_SECS);
+        images: &[StreamImageItem],
+    ) -> Result<()> {
+        let mut stream_obj = serde_json::json!({
+            "id": stream_id,
+            "finish": finish,
+            "content": normalize_stream_content(content),
+        });
+        if finish && !images.is_empty() {
+            let msg_items: Vec<Value> = images
+                .iter()
+                .map(|img| {
+                    serde_json::json!({
+                        "msgtype": "image",
+                        "image": {
+                            "base64": img.base64,
+                            "md5": img.md5,
+                        }
+                    })
+                })
+                .collect();
+            stream_obj["msg_item"] = Value::Array(msg_items);
         }
-    }
-
-    fn update_stream_state_with_images(
-        &self,
-        stream_id: &str,
-        content: &str,
-        finish: bool,
-        images: Vec<StreamImageItem>,
-    ) {
-        let mut states = self.stream_states.lock();
-        if let Some(state) = states.get_mut(stream_id) {
-            state.content = normalize_stream_content(content);
-            state.finish = finish;
-            state.images = images;
-            state.expires_at = Instant::now() + Duration::from_secs(WECOM_STREAM_STATE_TTL_SECS);
-        }
-    }
-
-    fn get_stream_state(&self, stream_id: &str) -> Option<StreamState> {
-        self.prune_stream_states();
-        self.stream_states.lock().get(stream_id).cloned()
-    }
-
-    fn prune_stream_states(&self) {
-        let now = Instant::now();
-        self.stream_states
-            .lock()
-            .retain(|_, state| state.expires_at > now);
+        let frame = serde_json::json!({
+            "cmd": "aibot_respond_msg",
+            "headers": { "req_id": req_id },
+            "body": { "stream": stream_obj },
+        });
+        self.ws_send_frame(frame).await
     }
 
     // ── file cleanup ─────────────────────────────────────────────────
 
     async fn maybe_cleanup_files(&self) {
-        self.prune_stream_states();
-
         let now = Instant::now();
         {
             let mut last = self.last_cleanup.lock();
@@ -598,7 +270,282 @@ impl WeComChannel {
         });
     }
 
-    // ── attachment handling ──────────────────────────────────────────
+    // ── WS message dispatch ──────────────────────────────────────────
+
+    /// Returns `true` if the caller should trigger reconnection.
+    async fn handle_ws_message(
+        &self,
+        frame: Value,
+        tx: &mpsc::Sender<ChannelMessage>,
+    ) -> bool {
+        let cmd = frame
+            .get("cmd")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+
+        match cmd {
+            "aibot_msg_callback" => {
+                self.handle_msg_callback(frame, tx).await;
+                false
+            }
+            "aibot_event_callback" => self.handle_event_callback(frame).await,
+            _ => {
+                tracing::debug!("[wecom] ignoring WS frame cmd={cmd}");
+                false
+            }
+        }
+    }
+
+    // ── Message callback handling ────────────────────────────────────
+
+    async fn handle_msg_callback(
+        &self,
+        frame: Value,
+        tx: &mpsc::Sender<ChannelMessage>,
+    ) {
+        let req_id = frame
+            .get("headers")
+            .and_then(|h| h.get("req_id"))
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+
+        let body = match frame.get("body") {
+            Some(b) => b.clone(),
+            None => {
+                tracing::warn!("[wecom] msg_callback missing body");
+                return;
+            }
+        };
+
+        let parsed = match parse_inbound_payload(body) {
+            Ok(p) => p,
+            Err(err) => {
+                tracing::warn!("[wecom] msg_callback parse failed: {err:#}");
+                return;
+            }
+        };
+
+        // Idempotency check
+        if !parsed.msg_id.is_empty() {
+            let key = format!("wecom_msg_{}", parsed.msg_id);
+            if !self.idempotency.record_if_new(&key) {
+                return;
+            }
+        }
+
+        let scopes = compute_scopes(&parsed);
+
+        // Log inbound info
+        let preview =
+            crate::util::truncate_with_ellipsis(&inbound_content_preview(&parsed), 80);
+        let msg_id_str = if parsed.msg_id.trim().is_empty() {
+            "-"
+        } else {
+            parsed.msg_id.as_str()
+        };
+        tracing::info!(
+            "[wecom] from {} in {}: {} (msg_type={}, msg_id={})",
+            parsed.sender_userid,
+            scopes.conversation_scope,
+            preview,
+            parsed.msg_type,
+            msg_id_str
+        );
+
+        self.maybe_cleanup_files().await;
+
+        // ── Command detection ────────────────────────────────────────
+
+        let stop_text = extract_stop_signal_text(&parsed).unwrap_or_default();
+
+        // Clear session
+        if is_clear_session_command(&stop_text) {
+            let msg = "\u{4f1a}\u{8bdd}\u{5df2}\u{6e05}\u{9664}\u{ff0c}\u{5f00}\u{59cb}\u{65b0}\u{5bf9}\u{8bdd}\u{3002}";
+            let stream_id = next_stream_id();
+            let _ = self
+                .ws_send_respond_msg(&req_id, &stream_id, msg, true, &[])
+                .await;
+            tracing::info!(
+                "WeCom session cleared: scope={} msg_id={}",
+                scopes.conversation_scope,
+                parsed.msg_id
+            );
+            let _ = tx
+                .send(ChannelMessage {
+                    id: parsed.msg_id.clone(),
+                    sender: parsed.sender_userid.clone(),
+                    reply_target: scopes.conversation_scope.clone(),
+                    content: "/clear".to_string(),
+                    channel: "wecom".to_string(),
+                    timestamp: bytes_timestamp_now(),
+                    thread_ts: None,
+                })
+                .await;
+            return;
+        }
+
+        // Stop command
+        if contains_stop_command(&stop_text) {
+            let msg = "\u{5df2}\u{505c}\u{6b62}\u{5f53}\u{524d}\u{6d88}\u{606f}\u{5904}\u{7406}\u{3002}";
+            let stream_id = next_stream_id();
+            let _ = self
+                .ws_send_respond_msg(&req_id, &stream_id, msg, true, &[])
+                .await;
+            let _ = tx
+                .send(ChannelMessage {
+                    id: parsed.msg_id.clone(),
+                    sender: parsed.sender_userid.clone(),
+                    reply_target: scopes.conversation_scope.clone(),
+                    content: "/new".to_string(),
+                    channel: "wecom".to_string(),
+                    timestamp: bytes_timestamp_now(),
+                    thread_ts: None,
+                })
+                .await;
+            return;
+        }
+
+        // Voice without transcript
+        if is_voice_without_transcript(&parsed) {
+            let msg = format!(
+                "\u{6211}\u{73b0}\u{5728}\u{65e0}\u{6cd5}\u{5904}\u{7406}\u{8bed}\u{97f3}\u{6d88}\u{606f} {}",
+                random_emoji()
+            );
+            let stream_id = next_stream_id();
+            let _ = self
+                .ws_send_respond_msg(&req_id, &stream_id, &msg, true, &[])
+                .await;
+            return;
+        }
+
+        // Unsupported message type
+        if !is_model_supported_msgtype(&parsed.msg_type) {
+            tracing::info!(
+                "WeCom unsupported message ignored: msg_type={} msg_id={}",
+                parsed.msg_type,
+                parsed.msg_id
+            );
+            return;
+        }
+
+        // ── Forward normal message to framework ──────────────────────
+
+        let channel_self = self.clone();
+        let tx = tx.clone();
+        tokio::spawn(async move {
+            let mut inbound = parsed;
+            channel_self
+                .materialize_quote_attachments(&mut inbound)
+                .await;
+            let normalized = channel_self.normalize_message(&inbound).await;
+
+            let content = match normalized {
+                NormalizedMessage::VoiceMissingTranscript => {
+                    let msg = format!(
+                        "\u{6211}\u{73b0}\u{5728}\u{65e0}\u{6cd5}\u{5904}\u{7406}\u{8bed}\u{97f3}\u{6d88}\u{606f} {}",
+                        random_emoji()
+                    );
+                    let stream_id = next_stream_id();
+                    let _ = channel_self
+                        .ws_send_respond_msg(&req_id, &stream_id, &msg, true, &[])
+                        .await;
+                    return;
+                }
+                NormalizedMessage::Unsupported => {
+                    let msg = "\u{6682}\u{4e0d}\u{652f}\u{6301}\u{8be5}\u{6d88}\u{606f}\u{7c7b}\u{578b}\u{3002}";
+                    let stream_id = next_stream_id();
+                    let _ = channel_self
+                        .ws_send_respond_msg(&req_id, &stream_id, msg, true, &[])
+                        .await;
+                    return;
+                }
+                NormalizedMessage::Ready(content) => content,
+            };
+
+            let composed = compose_content_for_framework(&inbound, &content);
+
+            tracing::info!(
+                "WeCom: forwarding to framework: msg_id={} req_id={} scope={}",
+                inbound.msg_id,
+                req_id,
+                scopes.conversation_scope
+            );
+
+            let _ = tx
+                .send(ChannelMessage {
+                    id: inbound.msg_id.clone(),
+                    sender: inbound.sender_userid.clone(),
+                    reply_target: scopes.conversation_scope.clone(),
+                    content: composed,
+                    channel: "wecom".to_string(),
+                    timestamp: bytes_timestamp_now(),
+                    thread_ts: Some(req_id),
+                })
+                .await;
+        });
+    }
+
+    // ── Event callback handling ──────────────────────────────────────
+
+    /// Returns `true` if the caller should trigger reconnection.
+    async fn handle_event_callback(&self, frame: Value) -> bool {
+        let req_id = frame
+            .get("headers")
+            .and_then(|h| h.get("req_id"))
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+
+        let body = frame.get("body").cloned().unwrap_or(Value::Null);
+        let event_type =
+            parse_event_type(&body).unwrap_or_else(|| "unknown".to_string());
+
+        match event_type.as_str() {
+            "enter_chat" => {
+                let content = format!(
+                    "\u{4f60}\u{597d}\u{ff0c}\u{6b22}\u{8fce}\u{6765}\u{627e}\u{6211}\u{804a}\u{5929} {}",
+                    random_emoji()
+                );
+                let welcome = serde_json::json!({
+                    "cmd": "aibot_respond_welcome_msg",
+                    "headers": { "req_id": req_id },
+                    "body": {
+                        "msgtype": "text",
+                        "text": { "content": content }
+                    }
+                });
+                let _ = self.ws_send_frame(welcome).await;
+                false
+            }
+            "template_card_event" => {
+                let event_key = extract_template_card_event_key(&body)
+                    .unwrap_or_else(|| "-".to_string());
+                tracing::info!(
+                    "WeCom template_card_event received: event_key={event_key}"
+                );
+                false
+            }
+            "feedback_event" => {
+                let summary = extract_feedback_event_summary(&body)
+                    .unwrap_or_else(|| "feedback=invalid-payload".to_string());
+                tracing::info!("WeCom feedback_event received: {summary}");
+                false
+            }
+            "disconnected_event" => {
+                tracing::warn!(
+                    "[wecom] received disconnected_event, triggering reconnect"
+                );
+                true
+            }
+            other => {
+                tracing::debug!("[wecom] ignoring event_type={other}");
+                false
+            }
+        }
+    }
+
+    // ── Attachment handling ──────────────────────────────────────────
 
     async fn materialize_quote_attachments(&self, inbound: &mut ParsedInbound) {
         let quote_type = inbound
@@ -610,18 +557,22 @@ impl WeComChannel {
             .unwrap_or("");
 
         if quote_type == "image" {
-            let quote_url = inbound
+            let quote_obj = inbound
                 .raw_payload
                 .get("quote")
-                .and_then(|v| v.get("image"))
+                .and_then(|v| v.get("image"));
+            let quote_url = quote_obj
                 .and_then(|v| v.get("url"))
                 .and_then(Value::as_str)
                 .map(str::trim)
                 .filter(|v| !v.is_empty())
                 .map(ToOwned::to_owned);
+            let aeskey = quote_obj
+                .and_then(|v| v.get("aeskey"))
+                .and_then(Value::as_str);
             if let Some(url) = quote_url {
                 let marker = match self
-                    .download_and_store_attachment(&url, AttachmentKind::Image, inbound)
+                    .download_and_store_attachment(&url, AttachmentKind::Image, inbound, aeskey)
                     .await
                 {
                     Ok(value) => value,
@@ -645,18 +596,22 @@ impl WeComChannel {
         }
 
         if quote_type == "file" {
-            let quote_url = inbound
+            let quote_obj = inbound
                 .raw_payload
                 .get("quote")
-                .and_then(|v| v.get("file"))
+                .and_then(|v| v.get("file"));
+            let quote_url = quote_obj
                 .and_then(|v| v.get("url"))
                 .and_then(Value::as_str)
                 .map(str::trim)
                 .filter(|v| !v.is_empty())
                 .map(ToOwned::to_owned);
+            let aeskey = quote_obj
+                .and_then(|v| v.get("aeskey"))
+                .and_then(Value::as_str);
             if let Some(url) = quote_url {
                 let marker = match self
-                    .download_and_store_attachment(&url, AttachmentKind::File, inbound)
+                    .download_and_store_attachment(&url, AttachmentKind::File, inbound, aeskey)
                     .await
                 {
                     Ok(value) => value,
@@ -680,7 +635,7 @@ impl WeComChannel {
         }
 
         if quote_type == "mixed" {
-            let quote_images: Vec<(usize, String)> = inbound
+            let quote_images: Vec<(usize, String, Option<String>)> = inbound
                 .raw_payload
                 .get("quote")
                 .and_then(|v| v.get("mixed"))
@@ -698,12 +653,17 @@ impl WeComChannel {
                             if item_type != "image" {
                                 return None;
                             }
-                            item.get("image")
-                                .and_then(|v| v.get("url"))
+                            let img = item.get("image")?;
+                            let url = img
+                                .get("url")
                                 .and_then(Value::as_str)
                                 .map(str::trim)
-                                .filter(|v| !v.is_empty())
-                                .map(|url| (idx, url.to_string()))
+                                .filter(|v| !v.is_empty())?;
+                            let aeskey = img
+                                .get("aeskey")
+                                .and_then(Value::as_str)
+                                .map(ToOwned::to_owned);
+                            Some((idx, url.to_string(), aeskey))
                         })
                         .collect()
                 })
@@ -714,9 +674,14 @@ impl WeComChannel {
             }
 
             let mut results: Vec<(usize, String)> = Vec::with_capacity(quote_images.len());
-            for (idx, url) in quote_images {
+            for (idx, url, aeskey) in &quote_images {
                 let marker = match self
-                    .download_and_store_attachment(&url, AttachmentKind::Image, inbound)
+                    .download_and_store_attachment(
+                        url,
+                        AttachmentKind::Image,
+                        inbound,
+                        aeskey.as_deref(),
+                    )
                     .await
                 {
                     Ok(value) => value,
@@ -726,13 +691,13 @@ impl WeComChannel {
                             &err,
                             inbound,
                             AttachmentKind::Image,
-                            &url,
+                            url,
                         );
                         "[\u{5f15}\u{7528}\u{56fe}\u{7247}\u{4e0b}\u{8f7d}\u{5931}\u{8d25}]"
                             .to_string()
                     }
                 };
-                results.push((idx, marker));
+                results.push((*idx, marker));
             }
 
             if let Some(items) = inbound
@@ -786,20 +751,22 @@ impl WeComChannel {
                 }
             }
             "image" => {
-                let url = inbound
-                    .raw_payload
-                    .get("image")
+                let image_obj = inbound.raw_payload.get("image");
+                let url = image_obj
                     .and_then(|v| v.get("url"))
                     .and_then(Value::as_str)
                     .unwrap_or("")
                     .trim();
+                let aeskey = image_obj
+                    .and_then(|v| v.get("aeskey"))
+                    .and_then(Value::as_str);
 
                 if url.is_empty() {
                     return NormalizedMessage::Unsupported;
                 }
 
                 match self
-                    .download_and_store_attachment(url, AttachmentKind::Image, inbound)
+                    .download_and_store_attachment(url, AttachmentKind::Image, inbound, aeskey)
                     .await
                 {
                     Ok(marker) => NormalizedMessage::Ready(marker),
@@ -819,20 +786,22 @@ impl WeComChannel {
                 }
             }
             "file" => {
-                let url = inbound
-                    .raw_payload
-                    .get("file")
+                let file_obj = inbound.raw_payload.get("file");
+                let url = file_obj
                     .and_then(|v| v.get("url"))
                     .and_then(Value::as_str)
                     .unwrap_or("")
                     .trim();
+                let aeskey = file_obj
+                    .and_then(|v| v.get("aeskey"))
+                    .and_then(Value::as_str);
 
                 if url.is_empty() {
                     return NormalizedMessage::Unsupported;
                 }
 
                 match self
-                    .download_and_store_attachment(url, AttachmentKind::File, inbound)
+                    .download_and_store_attachment(url, AttachmentKind::File, inbound, aeskey)
                     .await
                 {
                     Ok(marker) => NormalizedMessage::Ready(marker),
@@ -876,16 +845,20 @@ impl WeComChannel {
                                 }
                             }
                         } else if item_type == "image" {
-                            if let Some(url) = item
-                                .get("image")
+                            let img = item.get("image");
+                            let url = img
                                 .and_then(|v| v.get("url"))
-                                .and_then(Value::as_str)
-                            {
+                                .and_then(Value::as_str);
+                            let aeskey = img
+                                .and_then(|v| v.get("aeskey"))
+                                .and_then(Value::as_str);
+                            if let Some(url) = url {
                                 match self
                                     .download_and_store_attachment(
                                         url,
                                         AttachmentKind::Image,
                                         inbound,
+                                        aeskey,
                                     )
                                     .await
                                 {
@@ -930,6 +903,7 @@ impl WeComChannel {
         url: &str,
         kind: AttachmentKind,
         inbound: &ParsedInbound,
+        aeskey: Option<&str>,
     ) -> Result<String> {
         if self.cfg.max_file_size_bytes == 0 {
             anyhow::bail!("WeCom max_file_size_bytes is zero");
@@ -946,6 +920,7 @@ impl WeComChannel {
             sender_userid = %inbound.sender_userid,
             attachment_kind = %kind.as_str(),
             url_target = %url_target,
+            has_aeskey = aeskey.is_some(),
             timeout_secs = WECOM_HTTP_TIMEOUT_SECS,
             "WeCom attachment download started"
         );
@@ -957,16 +932,11 @@ impl WeComChannel {
             .await
             .with_context(|| {
                 format!(
-                    "failed to download WeCom attachment: kind={} msg_id={} msg_type={} chat_type={} chat_id={} sender_userid={} url_target={} elapsed_ms={} timeout_secs={}",
+                    "failed to download WeCom attachment: kind={} msg_id={} url_target={} elapsed_ms={}",
                     kind.as_str(),
                     inbound.msg_id,
-                    inbound.msg_type,
-                    inbound.chat_type,
-                    chat_id,
-                    inbound.sender_userid,
                     url_target,
                     started.elapsed().as_millis(),
-                    WECOM_HTTP_TIMEOUT_SECS
                 )
             })?;
         let status = response.status();
@@ -974,16 +944,11 @@ impl WeComChannel {
             let body = response.text().await.unwrap_or_default();
             let body_preview = truncate_for_log(&body, 512);
             anyhow::bail!(
-                "WeCom attachment download failed: kind={} msg_id={} msg_type={} chat_type={} chat_id={} sender_userid={} url_target={} status={} elapsed_ms={} body_preview={}",
+                "WeCom attachment download failed: kind={} msg_id={} url_target={} status={} body_preview={}",
                 kind.as_str(),
                 inbound.msg_id,
-                inbound.msg_type,
-                inbound.chat_type,
-                chat_id,
-                inbound.sender_userid,
                 url_target,
                 status,
-                started.elapsed().as_millis(),
                 body_preview
             );
         }
@@ -992,15 +957,9 @@ impl WeComChannel {
             if len > self.cfg.max_file_size_bytes {
                 tracing::warn!(
                     msg_id = %inbound.msg_id,
-                    msg_type = %inbound.msg_type,
-                    chat_type = %inbound.chat_type,
-                    chat_id = %chat_id,
-                    sender_userid = %inbound.sender_userid,
                     attachment_kind = %kind.as_str(),
-                    url_target = %url_target,
                     declared_bytes = len,
                     max_file_size_bytes = self.cfg.max_file_size_bytes,
-                    elapsed_ms = started.elapsed().as_millis(),
                     "WeCom attachment skipped: declared size exceeds configured limit"
                 );
                 return Ok(format!(
@@ -1015,30 +974,20 @@ impl WeComChannel {
             .await
             .with_context(|| {
                 format!(
-                    "failed to read WeCom attachment bytes: kind={} msg_id={} msg_type={} chat_type={} chat_id={} sender_userid={} url_target={} elapsed_ms={}",
+                    "failed to read WeCom attachment bytes: kind={} msg_id={} url_target={} elapsed_ms={}",
                     kind.as_str(),
                     inbound.msg_id,
-                    inbound.msg_type,
-                    inbound.chat_type,
-                    chat_id,
-                    inbound.sender_userid,
                     url_target,
-                    started.elapsed().as_millis()
+                    started.elapsed().as_millis(),
                 )
             })?;
 
         if bytes.len() as u64 > self.cfg.max_file_size_bytes {
             tracing::warn!(
                 msg_id = %inbound.msg_id,
-                msg_type = %inbound.msg_type,
-                chat_type = %inbound.chat_type,
-                chat_id = %chat_id,
-                sender_userid = %inbound.sender_userid,
                 attachment_kind = %kind.as_str(),
-                url_target = %url_target,
                 actual_bytes = bytes.len(),
                 max_file_size_bytes = self.cfg.max_file_size_bytes,
-                elapsed_ms = started.elapsed().as_millis(),
                 "WeCom attachment skipped: payload exceeds configured limit"
             );
             return Ok(format!(
@@ -1049,19 +998,19 @@ impl WeComChannel {
             ));
         }
 
-        let decrypted = self.crypto.decrypt_file_payload(&bytes).with_context(|| {
-            format!(
-                "failed to decrypt WeCom attachment payload: kind={} msg_id={} msg_type={} chat_type={} chat_id={} sender_userid={} url_target={} encrypted_bytes={}",
-                kind.as_str(),
-                inbound.msg_id,
-                inbound.msg_type,
-                inbound.chat_type,
-                chat_id,
-                inbound.sender_userid,
-                url_target,
-                bytes.len()
-            )
-        })?;
+        // Decrypt if aeskey is present; otherwise use raw bytes
+        let decrypted = match aeskey {
+            Some(key) => MediaDecryptor::decrypt(key, &bytes).with_context(|| {
+                format!(
+                    "failed to decrypt WeCom attachment: kind={} msg_id={} url_target={} encrypted_bytes={}",
+                    kind.as_str(),
+                    inbound.msg_id,
+                    url_target,
+                    bytes.len(),
+                )
+            })?,
+            None => bytes.to_vec(),
+        };
         let decrypted_len = decrypted.len();
 
         let ext = match kind {
@@ -1105,10 +1054,6 @@ impl WeComChannel {
         let abs = path.canonicalize().unwrap_or(path);
         tracing::info!(
             msg_id = %inbound.msg_id,
-            msg_type = %inbound.msg_type,
-            chat_type = %inbound.chat_type,
-            chat_id = %chat_id,
-            sender_userid = %inbound.sender_userid,
             attachment_kind = %kind.as_str(),
             url_target = %url_target,
             encrypted_bytes = bytes.len(),
@@ -1122,545 +1067,6 @@ impl WeComChannel {
             AttachmentKind::File => Ok(format!("[Document: {}]", abs.display())),
         }
     }
-
-    // ── outbound send helpers ────────────────────────────────────────
-
-    /// Look up a scope-specific push webhook URL from memory.
-    async fn lookup_scope_webhook(&self, scope: &str) -> Option<String> {
-        let key = format!("wecom_push_url::{scope}");
-        let entry = self.memory.get(&key).await.ok().flatten()?;
-        let url = entry.content.trim();
-        if is_valid_robot_webhook_url(url) {
-            Some(url.to_string())
-        } else {
-            None
-        }
-    }
-
-    /// Send content to a WeCom group-bot webhook URL (used by send()).
-    async fn send_to_url(&self, url: &str, content: &str) -> Result<()> {
-        let payload = serde_json::json!({
-            "msgtype": "markdown",
-            "markdown": {
-                "content": content,
-            }
-        });
-
-        let resp = self.send_client.post(url).json(&payload).send().await?;
-
-        let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
-        if !status.is_success() {
-            anyhow::bail!("WeCom webhook send failed: {status} \u{2014} {body}");
-        }
-
-        if let Ok(parsed) = serde_json::from_str::<Value>(&body) {
-            if let Some(errcode) = parsed.get("errcode").and_then(|v| v.as_i64()) {
-                if errcode != 0 {
-                    let errmsg = parsed
-                        .get("errmsg")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("unknown");
-                    anyhow::bail!(
-                        "WeCom webhook business error: errcode={errcode} errmsg={errmsg}"
-                    );
-                }
-            }
-        }
-
-        Ok(())
-    }
-
-    // ── encrypt helpers ──────────────────────────────────────────────
-
-    fn encrypt_passive_stream_reply(
-        &self,
-        query: &WeComCallbackQuery,
-        stream_id: &str,
-        content: &str,
-        finish: bool,
-        images: &[StreamImageItem],
-    ) -> Result<String> {
-        let timestamp = reply_timestamp(query);
-        let nonce = reply_nonce(query);
-        let payload = make_stream_payload(stream_id, content, finish, images);
-        self.crypto
-            .encrypt_json_ciphertext(&payload.to_string(), &nonce, &timestamp, "")
-    }
-
-    fn encrypt_passive_text_reply(
-        &self,
-        query: &WeComCallbackQuery,
-        content: &str,
-    ) -> Result<String> {
-        let timestamp = reply_timestamp(query);
-        let nonce = reply_nonce(query);
-        let payload = make_text_payload(content);
-        self.crypto
-            .encrypt_json_ciphertext(&payload.to_string(), &nonce, &timestamp, "")
-    }
-
-    // ── handle_callback (main routing) ───────────────────────────────
-
-    async fn handle_callback(
-        &self,
-        req: WeComInboundRequest,
-        tx: &tokio::sync::mpsc::Sender<ChannelMessage>,
-    ) {
-        let query = req.query;
-        let body = req.body;
-        let reply_tx = req.reply_tx;
-
-        tracing::debug!(
-            "[wecom] handle_callback: body_len={} echostr={}",
-            body.len(),
-            query.echostr.is_some()
-        );
-
-        // Verification request (echostr present)
-        if let Some(echostr) = query.echostr.as_deref() {
-            tracing::info!("[wecom] URL verification request received");
-            if !self.crypto.verify_signature(
-                &query.msg_signature,
-                &query.timestamp,
-                &query.nonce,
-                echostr,
-            ) {
-                let _ = reply_tx.send(WeComInboundResponse {
-                    status_code: 401,
-                    body: r#"{"error":"invalid signature"}"#.to_string(),
-                });
-                return;
-            }
-            tracing::info!("WeCom: signature verified for URL verification");
-
-            match self.crypto.decrypt_json_ciphertext(echostr, "") {
-                Ok(plain) => {
-                    let _ = reply_tx.send(WeComInboundResponse {
-                        status_code: 200,
-                        body: plain,
-                    });
-                }
-                Err(err) => {
-                    tracing::warn!("WeCom URL verify decrypt failed: {err}");
-                    let _ = reply_tx.send(WeComInboundResponse {
-                        status_code: 400,
-                        body: r#"{"error":"decrypt failed"}"#.to_string(),
-                    });
-                }
-            }
-            return;
-        }
-
-        // Parse encrypted envelope
-        let envelope = match serde_json::from_slice::<WeComEncryptedEnvelope>(&body) {
-            Ok(value) => value,
-            Err(_) => {
-                let _ = reply_tx.send(WeComInboundResponse {
-                    status_code: 400,
-                    body: r#"{"error":"invalid encrypted payload"}"#.to_string(),
-                });
-                return;
-            }
-        };
-
-        // Verify signature
-        if !self.crypto.verify_signature(
-            &query.msg_signature,
-            &query.timestamp,
-            &query.nonce,
-            &envelope.encrypt,
-        ) {
-            let _ = reply_tx.send(WeComInboundResponse {
-                status_code: 401,
-                body: r#"{"error":"invalid signature"}"#.to_string(),
-            });
-            return;
-        }
-        tracing::debug!("WeCom: callback signature verified");
-
-        // Decrypt
-        let plaintext = match self.crypto.decrypt_json_ciphertext(&envelope.encrypt, "") {
-            Ok(value) => value,
-            Err(err) => {
-                tracing::warn!("WeCom callback decrypt failed: {err}");
-                let _ = reply_tx.send(WeComInboundResponse {
-                    status_code: 400,
-                    body: r#"{"error":"decrypt failed"}"#.to_string(),
-                });
-                return;
-            }
-        };
-        tracing::debug!("WeCom: callback decrypted successfully");
-
-        // Parse JSON payload
-        let payload: Value = match serde_json::from_str(&plaintext) {
-            Ok(value) => value,
-            Err(_) => {
-                let _ = reply_tx.send(WeComInboundResponse {
-                    status_code: 400,
-                    body: r#"{"error":"invalid callback json"}"#.to_string(),
-                });
-                return;
-            }
-        };
-
-        // Parse inbound
-        let parsed = match parse_inbound_payload(payload) {
-            Ok(value) => value,
-            Err(err) => {
-                tracing::warn!("WeCom callback parse failed: {err}");
-                let _ = reply_tx.send(WeComInboundResponse {
-                    status_code: 200,
-                    body: "success".to_string(),
-                });
-                return;
-            }
-        };
-
-        // Idempotency check
-        if parsed.msg_type != "stream" && !parsed.msg_id.is_empty() {
-            let key = format!("wecom_msg_{}", parsed.msg_id);
-            if !self.idempotency.record_if_new(&key) {
-                let _ = reply_tx.send(WeComInboundResponse {
-                    status_code: 200,
-                    body: "success".to_string(),
-                });
-                return;
-            }
-        }
-
-        let scopes = compute_scopes(&parsed);
-
-        // Log inbound info
-        if parsed.msg_type != "stream" && parsed.msg_type != "event" {
-            let preview =
-                crate::util::truncate_with_ellipsis(&inbound_content_preview(&parsed), 80);
-            let msg_id = if parsed.msg_id.trim().is_empty() {
-                "-"
-            } else {
-                parsed.msg_id.as_str()
-            };
-            tracing::info!(
-                "[wecom] from {} in {}: {} (msg_type={}, msg_id={})",
-                parsed.sender_userid,
-                scopes.conversation_scope,
-                preview,
-                parsed.msg_type,
-                msg_id
-            );
-        }
-
-        // Cache response_url
-        self.cache_response_url(
-            &scopes.conversation_scope,
-            &parsed.msg_id,
-            parsed.response_url.as_deref(),
-        );
-
-        self.maybe_cleanup_files().await;
-
-        // ── Route by msg_type ────────────────────────────────────────
-
-        // Stream refresh
-        if parsed.msg_type == "stream" {
-            let stream_id = parse_stream_id(&parsed.raw_payload).unwrap_or_else(next_stream_id);
-            let state_snapshot = self.get_stream_state(&stream_id);
-            let (content, finish, images) = if let Some(snapshot) = state_snapshot {
-                tracing::info!(
-                    "[wecom] stream poll: scope={} stream_id={} finish={}",
-                    scopes.conversation_scope,
-                    stream_id,
-                    snapshot.finish
-                );
-                (snapshot.content, snapshot.finish, snapshot.images)
-            } else {
-                tracing::info!(
-                    "[wecom] stream poll: scope={} stream_id={} (no active stream)",
-                    scopes.conversation_scope,
-                    stream_id
-                );
-                ("\u{4efb}\u{52a1}\u{5df2}\u{7ed3}\u{675f}\u{6216}\u{4e0d}\u{5b58}\u{5728}\u{3002}".to_string(), true, Vec::new())
-            };
-            let resp = match self
-                .encrypt_passive_stream_reply(&query, &stream_id, &content, finish, &images)
-            {
-                Ok(r) => WeComInboundResponse {
-                    status_code: 200,
-                    body: r,
-                },
-                Err(err) => {
-                    tracing::error!("WeCom stream refresh encrypt failed: {err:#}");
-                    WeComInboundResponse {
-                        status_code: 200,
-                        body: "success".to_string(),
-                    }
-                }
-            };
-            let _ = reply_tx.send(resp);
-            return;
-        }
-
-        // Event handling
-        if parsed.msg_type == "event" {
-            tracing::info!("WeCom: routing as event callback");
-            let event_type =
-                parse_event_type(&parsed.raw_payload).unwrap_or_else(|| "unknown".to_string());
-            if event_type == "enter_chat" {
-                let content = format!("\u{4f60}\u{597d}\u{ff0c}\u{6b22}\u{8fce}\u{6765}\u{627e}\u{6211}\u{804a}\u{5929} {}", random_emoji());
-                let resp = match self.encrypt_passive_text_reply(&query, &content) {
-                    Ok(r) => WeComInboundResponse {
-                        status_code: 200,
-                        body: r,
-                    },
-                    Err(err) => {
-                        tracing::error!("WeCom enter_chat reply encrypt failed: {err:#}");
-                        WeComInboundResponse {
-                            status_code: 200,
-                            body: "success".to_string(),
-                        }
-                    }
-                };
-                let _ = reply_tx.send(resp);
-                return;
-            }
-            if event_type == "template_card_event" {
-                let event_key = extract_template_card_event_key(&parsed.raw_payload)
-                    .unwrap_or_else(|| "-".to_string());
-                tracing::info!(
-                    "WeCom template_card_event received: msg_id={} event_key={}",
-                    parsed.msg_id,
-                    event_key
-                );
-                let _ = reply_tx.send(WeComInboundResponse {
-                    status_code: 200,
-                    body: "success".to_string(),
-                });
-                return;
-            }
-            if event_type == "feedback_event" {
-                let summary = extract_feedback_event_summary(&parsed.raw_payload)
-                    .unwrap_or_else(|| "feedback=invalid-payload".to_string());
-                tracing::info!(
-                    "WeCom feedback_event received: msg_id={} {}",
-                    parsed.msg_id,
-                    summary
-                );
-                let _ = reply_tx.send(WeComInboundResponse {
-                    status_code: 200,
-                    body: "success".to_string(),
-                });
-                return;
-            }
-
-            tracing::info!(
-                "WeCom event ignored: event_type={} msg_id={}",
-                event_type,
-                parsed.msg_id
-            );
-            let _ = reply_tx.send(WeComInboundResponse {
-                status_code: 200,
-                body: "success".to_string(),
-            });
-            return;
-        }
-
-        // Unsupported message type
-        if !is_model_supported_msgtype(&parsed.msg_type) {
-            tracing::info!(
-                "WeCom unsupported message ignored: msg_type={} msg_id={}",
-                parsed.msg_type,
-                parsed.msg_id
-            );
-            let _ = reply_tx.send(WeComInboundResponse {
-                status_code: 200,
-                body: "success".to_string(),
-            });
-            return;
-        }
-
-        // ── Normal message processing ────────────────────────────────
-
-        let stop_text = extract_stop_signal_text(&parsed).unwrap_or_default();
-
-        // Clear session: reply with confirmation stream, forward /clear to framework
-        if is_clear_session_command(&stop_text) {
-            let msg = "\u{4f1a}\u{8bdd}\u{5df2}\u{6e05}\u{9664}\u{ff0c}\u{5f00}\u{59cb}\u{65b0}\u{5bf9}\u{8bdd}\u{3002}";
-            let clear_stream = next_stream_id();
-            self.upsert_stream_state(&clear_stream, msg, true, Vec::new());
-            tracing::info!(
-                "WeCom session cleared: scope={} msg_id={}",
-                scopes.conversation_scope,
-                parsed.msg_id
-            );
-            let resp =
-                match self.encrypt_passive_stream_reply(&query, &clear_stream, msg, true, &[]) {
-                    Ok(r) => WeComInboundResponse {
-                        status_code: 200,
-                        body: r,
-                    },
-                    Err(err) => {
-                        tracing::error!("WeCom clear-session reply encrypt failed: {err:#}");
-                        WeComInboundResponse {
-                            status_code: 200,
-                            body: "success".to_string(),
-                        }
-                    }
-                };
-            let _ = reply_tx.send(resp);
-            // Forward /clear to the framework so it clears conversation history
-            let _ = tx
-                .send(ChannelMessage {
-                    id: parsed.msg_id.clone(),
-                    sender: parsed.sender_userid.clone(),
-                    reply_target: scopes.conversation_scope.clone(),
-                    content: "/clear".to_string(),
-                    channel: "wecom".to_string(),
-                    timestamp: bytes_timestamp_now(),
-                    thread_ts: None,
-                })
-                .await;
-            return;
-        }
-
-        // Stop command: reply with confirmation stream, forward /new to framework
-        if contains_stop_command(&stop_text) {
-            let stopped =
-                "\u{5df2}\u{505c}\u{6b62}\u{5f53}\u{524d}\u{6d88}\u{606f}\u{5904}\u{7406}\u{3002}";
-            let stop_stream = next_stream_id();
-            self.upsert_stream_state(&stop_stream, stopped, true, Vec::new());
-            let resp =
-                match self.encrypt_passive_stream_reply(&query, &stop_stream, stopped, true, &[]) {
-                    Ok(r) => WeComInboundResponse {
-                        status_code: 200,
-                        body: r,
-                    },
-                    Err(err) => {
-                        tracing::error!("WeCom stop reply encrypt failed: {err:#}");
-                        WeComInboundResponse {
-                            status_code: 200,
-                            body: "success".to_string(),
-                        }
-                    }
-                };
-            let _ = reply_tx.send(resp);
-            // Forward /new to the framework: interrupt mechanism cancels in-flight task
-            let _ = tx
-                .send(ChannelMessage {
-                    id: parsed.msg_id.clone(),
-                    sender: parsed.sender_userid.clone(),
-                    reply_target: scopes.conversation_scope.clone(),
-                    content: "/new".to_string(),
-                    channel: "wecom".to_string(),
-                    timestamp: bytes_timestamp_now(),
-                    thread_ts: None,
-                })
-                .await;
-            return;
-        }
-
-        // Voice without transcript
-        if is_voice_without_transcript(&parsed) {
-            let msg = format!("\u{6211}\u{73b0}\u{5728}\u{65e0}\u{6cd5}\u{5904}\u{7406}\u{8bed}\u{97f3}\u{6d88}\u{606f} {}", random_emoji());
-            let stream_id = next_stream_id();
-            self.upsert_stream_state(&stream_id, &msg, true, Vec::new());
-            let resp = match self.encrypt_passive_stream_reply(&query, &stream_id, &msg, true, &[])
-            {
-                Ok(r) => WeComInboundResponse {
-                    status_code: 200,
-                    body: r,
-                },
-                Err(err) => {
-                    tracing::error!("WeCom voice fallback encrypt failed: {err:#}");
-                    WeComInboundResponse {
-                        status_code: 200,
-                        body: "success".to_string(),
-                    }
-                }
-            };
-            let _ = reply_tx.send(resp);
-            return;
-        }
-
-        // ── Forward normal message to framework ──────────────────────
-
-        // Bootstrap stream state for immediate HTTP reply
-        let stream_id = next_stream_id();
-        self.upsert_stream_state(
-            &stream_id,
-            WECOM_STREAM_BOOTSTRAP_CONTENT,
-            false,
-            Vec::new(),
-        );
-
-        // Reply immediately with bootstrap stream
-        let resp = match self.encrypt_passive_stream_reply(
-            &query,
-            &stream_id,
-            WECOM_STREAM_BOOTSTRAP_CONTENT,
-            false,
-            &[],
-        ) {
-            Ok(r) => WeComInboundResponse {
-                status_code: 200,
-                body: r,
-            },
-            Err(err) => {
-                tracing::error!("WeCom bootstrap stream encrypt failed: {err:#}");
-                WeComInboundResponse {
-                    status_code: 200,
-                    body: "success".to_string(),
-                }
-            }
-        };
-        let _ = reply_tx.send(resp);
-
-        // Spawn async: materialize attachments → normalize → compose → send ChannelMessage
-        let channel_self = self.clone();
-        let tx = tx.clone();
-        tokio::spawn(async move {
-            let mut inbound = parsed;
-            channel_self
-                .materialize_quote_attachments(&mut inbound)
-                .await;
-            let normalized = channel_self.normalize_message(&inbound).await;
-
-            let content = match normalized {
-                NormalizedMessage::VoiceMissingTranscript => {
-                    let msg = format!("\u{6211}\u{73b0}\u{5728}\u{65e0}\u{6cd5}\u{5904}\u{7406}\u{8bed}\u{97f3}\u{6d88}\u{606f} {}", random_emoji());
-                    channel_self.update_stream_state_content(&stream_id, &msg, true);
-                    return;
-                }
-                NormalizedMessage::Unsupported => {
-                    let msg = "\u{6682}\u{4e0d}\u{652f}\u{6301}\u{8be5}\u{6d88}\u{606f}\u{7c7b}\u{578b}\u{3002}".to_string();
-                    channel_self.update_stream_state_content(&stream_id, &msg, true);
-                    return;
-                }
-                NormalizedMessage::Ready(content) => content,
-            };
-
-            let composed = compose_content_for_framework(&inbound, &content);
-
-            tracing::info!(
-                "WeCom: forwarding to framework: msg_id={} stream_id={} scope={}",
-                inbound.msg_id,
-                stream_id,
-                scopes.conversation_scope
-            );
-
-            let _ = tx
-                .send(ChannelMessage {
-                    id: inbound.msg_id.clone(),
-                    sender: inbound.sender_userid.clone(),
-                    reply_target: scopes.conversation_scope.clone(),
-                    content: composed,
-                    channel: "wecom".to_string(),
-                    timestamp: bytes_timestamp_now(),
-                    thread_ts: Some(stream_id),
-                })
-                .await;
-        });
-    }
 }
 
 // ── Channel trait impl ───────────────────────────────────────────────
@@ -1673,6 +1079,7 @@ impl Channel for WeComChannel {
 
     async fn send(&self, message: &SendMessage) -> Result<()> {
         let scope = &message.recipient;
+        let (chat_type, chatid) = parse_scope(scope)?;
         let chunks = split_markdown_chunks(&message.content);
 
         tracing::info!(
@@ -1682,87 +1089,18 @@ impl Channel for WeComChannel {
             chunks.len()
         );
 
-        self.prune_response_urls();
-
         for chunk in chunks {
-            let mut sent = false;
-
-            // Level 1: response_url
-            while let Some(entry) = self.take_response_url(scope) {
-                match self.send_to_url(&entry.url, &chunk).await {
-                    Ok(()) => {
-                        tracing::info!(
-                            "WeCom: sent via response_url to scope={} msg_id={} age_ms={}",
-                            scope,
-                            entry.msg_id,
-                            entry.received_at.elapsed().as_millis()
-                        );
-                        sent = true;
-                        break;
-                    }
-                    Err(err) => {
-                        tracing::warn!(
-                            "WeCom response_url send failed: scope={} msg_id={} age_ms={} error={}",
-                            scope,
-                            entry.msg_id,
-                            entry.received_at.elapsed().as_millis(),
-                            err
-                        );
-                    }
+            let frame = serde_json::json!({
+                "cmd": "aibot_send_msg",
+                "headers": { "req_id": random_ascii_token(16) },
+                "body": {
+                    "chatid": chatid,
+                    "chat_type": chat_type,
+                    "msgtype": "markdown",
+                    "markdown": { "content": chunk }
                 }
-            }
-
-            if sent {
-                continue;
-            }
-
-            // Level 2: scope-specific push webhook
-            if let Some(url) = self.lookup_scope_webhook(scope).await {
-                match self.send_to_url(&url, &chunk).await {
-                    Ok(()) => {
-                        tracing::info!("WeCom: sent via scope webhook to scope={}", scope);
-                        sent = true;
-                    }
-                    Err(err) => {
-                        tracing::warn!(
-                            "WeCom scope webhook send failed: scope={} error={}",
-                            scope,
-                            err
-                        );
-                    }
-                }
-            }
-
-            if sent {
-                continue;
-            }
-
-            // Level 3: fallback push webhook
-            if let Some(url) = &self.fallback_webhook_url {
-                if is_valid_robot_webhook_url(url) {
-                    let tagged = format!("[FallbackPush] {chunk}");
-                    match self.send_to_url(url, &tagged).await {
-                        Ok(()) => {
-                            tracing::info!("WeCom: sent via fallback webhook to scope={}", scope);
-                            sent = true;
-                        }
-                        Err(err) => {
-                            tracing::warn!(
-                                "WeCom fallback webhook send failed: scope={} error={}",
-                                scope,
-                                err
-                            );
-                        }
-                    }
-                }
-            }
-
-            if !sent {
-                tracing::warn!(
-                    "WeCom outbound dropped: no usable URL for scope={} (all 3 layers failed)",
-                    scope
-                );
-            }
+            });
+            self.ws_send_frame(frame).await?;
         }
 
         Ok(())
@@ -1770,103 +1108,210 @@ impl Channel for WeComChannel {
 
     async fn listen(&self, tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> Result<()> {
         tracing::info!(
-            "[wecom] starting independent HTTP listener on port {} (fingerprint={})",
-            self.port,
-            self.fingerprint
+            "[wecom] starting WebSocket listener (bot_id={})",
+            self.bot_id
         );
 
-        let channel = Arc::new(self.clone());
-        let tx = Arc::new(tx);
+        let mut backoff = WECOM_BACKOFF_INITIAL_SECS;
 
-        // Axum route handlers as closures capturing the Arc<WeComChannel>
-        let verify_channel = Arc::clone(&channel);
-        let callback_channel = Arc::clone(&channel);
-        let callback_tx = Arc::clone(&tx);
+        loop {
+            tracing::info!("[wecom] connecting to {WECOM_WS_URL}");
 
-        let app = Router::new()
-            .route(
-                "/wecom",
-                get(move |Query(query): Query<WeComCallbackQuery>| {
-                    let ch = Arc::clone(&verify_channel);
-                    async move {
-                        tracing::info!("[wecom] GET /wecom — URL verification request");
-                        // Verification requests don't need the tx channel
-                        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-                        let req = WeComInboundRequest {
-                            query,
-                            body: Bytes::new(),
-                            reply_tx,
-                        };
-                        // Dummy tx - verification only uses reply_tx
-                        let (dummy_tx, _) = tokio::sync::mpsc::channel(1);
-                        ch.handle_callback(req, &dummy_tx).await;
-                        match reply_rx.await {
-                            Ok(resp) => {
-                                let status = StatusCode::from_u16(resp.status_code)
-                                    .unwrap_or(StatusCode::OK);
-                                (status, resp.body)
+            let ws_stream = match tokio_tungstenite::connect_async(WECOM_WS_URL).await {
+                Ok((stream, _)) => {
+                    tracing::info!("[wecom] WebSocket connected");
+                    stream
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        "[wecom] WebSocket connect failed: {err:#}, retrying in {backoff}s"
+                    );
+                    tokio::time::sleep(Duration::from_secs(backoff)).await;
+                    backoff = (backoff * 2).min(WECOM_BACKOFF_MAX_SECS);
+                    continue;
+                }
+            };
+
+            let (mut ws_write, mut ws_read) = ws_stream.split();
+
+            // Send subscribe
+            let subscribe = serde_json::json!({
+                "cmd": "aibot_subscribe",
+                "headers": {
+                    "bot_id": self.bot_id,
+                    "secret": self.secret,
+                }
+            });
+            if let Err(err) = ws_write
+                .send(WsMessage::Text(subscribe.to_string().into()))
+                .await
+            {
+                tracing::warn!(
+                    "[wecom] subscribe send failed: {err:#}, retrying in {backoff}s"
+                );
+                tokio::time::sleep(Duration::from_secs(backoff)).await;
+                backoff = (backoff * 2).min(WECOM_BACKOFF_MAX_SECS);
+                continue;
+            }
+
+            // Wait for subscribe response
+            let subscribe_ok = match tokio::time::timeout(
+                Duration::from_secs(WECOM_SUBSCRIBE_TIMEOUT_SECS),
+                ws_read.next(),
+            )
+            .await
+            {
+                Ok(Some(Ok(WsMessage::Text(text)))) => {
+                    match serde_json::from_str::<Value>(&text) {
+                        Ok(val) => {
+                            let errcode = val
+                                .get("body")
+                                .and_then(|b| b.get("errcode"))
+                                .and_then(Value::as_i64)
+                                .unwrap_or(-1);
+                            if errcode == 0 {
+                                tracing::info!("[wecom] subscribe succeeded");
+                                true
+                            } else {
+                                let errmsg = val
+                                    .get("body")
+                                    .and_then(|b| b.get("errmsg"))
+                                    .and_then(Value::as_str)
+                                    .unwrap_or("unknown");
+                                tracing::error!(
+                                    "[wecom] subscribe rejected: errcode={errcode} errmsg={errmsg}"
+                                );
+                                false
                             }
-                            Err(_) => (
-                                StatusCode::INTERNAL_SERVER_ERROR,
-                                "internal error".to_string(),
-                            ),
+                        }
+                        Err(err) => {
+                            tracing::warn!(
+                                "[wecom] subscribe response parse failed: {err:#}"
+                            );
+                            false
                         }
                     }
-                }),
-            )
-            .route(
-                "/wecom",
-                post(
-                    move |Query(query): Query<WeComCallbackQuery>, body: Bytes| {
-                        let ch = Arc::clone(&callback_channel);
-                        let tx = Arc::clone(&callback_tx);
-                        async move {
-                            tracing::debug!("[wecom] POST /wecom — encrypted callback");
-                            ch.handle_http_request(query, body, &tx).await
+                }
+                Ok(Some(Ok(_))) => {
+                    tracing::warn!("[wecom] unexpected subscribe response frame type");
+                    false
+                }
+                Ok(Some(Err(err))) => {
+                    tracing::warn!("[wecom] subscribe response read error: {err:#}");
+                    false
+                }
+                Ok(None) => {
+                    tracing::warn!("[wecom] WebSocket closed before subscribe response");
+                    false
+                }
+                Err(_) => {
+                    tracing::warn!("[wecom] subscribe response timeout");
+                    false
+                }
+            };
+
+            if !subscribe_ok {
+                tokio::time::sleep(Duration::from_secs(backoff)).await;
+                backoff = (backoff * 2).min(WECOM_BACKOFF_MAX_SECS);
+                continue;
+            }
+
+            // Create mpsc channel for outbound frames
+            let (out_tx, mut out_rx) = mpsc::channel::<WsOutbound>(64);
+            *self.ws_tx.lock().await = Some(out_tx);
+            backoff = WECOM_BACKOFF_INITIAL_SECS; // reset on successful connect
+
+            let mut ping_interval =
+                tokio::time::interval(Duration::from_secs(WECOM_PING_INTERVAL_SECS));
+            ping_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+            let mut should_reconnect = false;
+
+            // Inner loop: process WS frames
+            loop {
+                tokio::select! {
+                    _ = ping_interval.tick() => {
+                        if let Err(err) = ws_write
+                            .send(WsMessage::Ping(vec![].into()))
+                            .await
+                        {
+                            tracing::warn!("[wecom] ping send failed: {err:#}");
+                            break;
                         }
-                    },
-                ),
-            );
+                    }
+                    Some(outbound) = out_rx.recv() => {
+                        match outbound {
+                            WsOutbound::Frame(value) => {
+                                if let Err(err) = ws_write
+                                    .send(WsMessage::Text(value.to_string().into()))
+                                    .await
+                                {
+                                    tracing::warn!(
+                                        "[wecom] outbound frame send failed: {err:#}"
+                                    );
+                                    break;
+                                }
+                            }
+                            WsOutbound::Close => {
+                                let _ = ws_write.send(WsMessage::Close(None)).await;
+                                break;
+                            }
+                        }
+                    }
+                    msg = ws_read.next() => {
+                        match msg {
+                            Some(Ok(WsMessage::Text(text))) => {
+                                match serde_json::from_str::<Value>(&text) {
+                                    Ok(frame) => {
+                                        should_reconnect =
+                                            self.handle_ws_message(frame, &tx).await;
+                                        if should_reconnect {
+                                            break;
+                                        }
+                                    }
+                                    Err(err) => {
+                                        tracing::warn!(
+                                            "[wecom] WS frame parse error: {err:#}"
+                                        );
+                                    }
+                                }
+                            }
+                            Some(Ok(WsMessage::Pong(_))) => {}
+                            Some(Ok(WsMessage::Close(_))) => {
+                                tracing::info!("[wecom] WebSocket closed by server");
+                                break;
+                            }
+                            Some(Ok(_)) => {}
+                            Some(Err(err)) => {
+                                tracing::warn!("[wecom] WS read error: {err:#}");
+                                break;
+                            }
+                            None => {
+                                tracing::info!("[wecom] WebSocket stream ended");
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
 
-        let addr = SocketAddr::from(([0, 0, 0, 0], self.port));
-        tracing::info!("[wecom] binding HTTP listener to {}", addr);
+            // Disconnect cleanup
+            *self.ws_tx.lock().await = None;
 
-        let listener = tokio::net::TcpListener::bind(addr).await.with_context(|| {
-            format!("WeCom: failed to bind HTTP listener on port {}", self.port)
-        })?;
-
-        tracing::info!(
-            "[wecom] HTTP listener started successfully on {} — ready to receive callbacks",
-            listener.local_addr().unwrap_or(addr)
-        );
-        println!(
-            "  GET  /wecom     — WeCom callback URL verification (port {})",
-            self.port
-        );
-        println!(
-            "  POST /wecom     — WeCom encrypted callback (port {})",
-            self.port
-        );
-
-        axum::serve(listener, app).await?;
-
-        tracing::info!("[wecom] HTTP listener exiting");
-        Ok(())
+            if should_reconnect {
+                // Server-initiated disconnect — reconnect quickly
+                tracing::info!("[wecom] disconnected (server event), reconnecting immediately");
+                backoff = WECOM_BACKOFF_INITIAL_SECS;
+            } else {
+                tracing::info!("[wecom] disconnected, will reconnect in {backoff}s");
+                tokio::time::sleep(Duration::from_secs(backoff)).await;
+                backoff = (backoff * 2).min(WECOM_BACKOFF_MAX_SECS);
+            }
+        }
     }
 
     async fn health_check(&self) -> bool {
-        match &self.fallback_webhook_url {
-            Some(url) => {
-                let valid = is_valid_robot_webhook_url(url);
-                if !valid {
-                    tracing::info!(
-                        "WeCom: health check failed \u{2014} invalid fallback webhook URL"
-                    );
-                }
-                valid
-            }
-            None => true,
-        }
+        self.ws_tx.lock().await.is_some()
     }
 
     fn supports_draft_updates(&self) -> bool {
@@ -1874,13 +1319,25 @@ impl Channel for WeComChannel {
     }
 
     async fn send_draft(&self, message: &SendMessage) -> Result<Option<String>> {
-        // thread_ts carries the stream_id from handle_callback
-        let stream_id = message.thread_ts.as_deref().unwrap_or("");
-        if stream_id.is_empty() {
+        // thread_ts carries the req_id from handle_msg_callback
+        let req_id = message.thread_ts.as_deref().unwrap_or("");
+        if req_id.is_empty() {
             return Ok(None);
         }
-        // Stream state already bootstrapped in handle_callback; return stream_id as draft ID
-        Ok(Some(stream_id.to_string()))
+        let stream_id = next_stream_id();
+        self.req_id_map
+            .lock()
+            .insert(stream_id.clone(), req_id.to_string());
+
+        self.ws_send_respond_msg(
+            req_id,
+            &stream_id,
+            WECOM_STREAM_BOOTSTRAP_CONTENT,
+            false,
+            &[],
+        )
+        .await?;
+        Ok(Some(stream_id))
     }
 
     async fn update_draft(
@@ -1889,116 +1346,82 @@ impl Channel for WeComChannel {
         message_id: &str,
         content: &str,
     ) -> Result<Option<String>> {
-        self.update_stream_state_content(message_id, content, false);
+        let req_id = self
+            .req_id_map
+            .lock()
+            .get(message_id)
+            .cloned()
+            .unwrap_or_default();
+        if req_id.is_empty() {
+            return Ok(None);
+        }
+        self.ws_send_respond_msg(&req_id, message_id, content, false, &[])
+            .await?;
         Ok(None)
     }
 
     async fn finalize_draft(
         &self,
-        _recipient: &str,
+        recipient: &str,
         message_id: &str,
         content: &str,
     ) -> Result<()> {
+        let req_id = self
+            .req_id_map
+            .lock()
+            .get(message_id)
+            .cloned()
+            .unwrap_or_default();
+
         let (text_without_images, image_paths) = parse_image_markers(content);
         let images = prepare_stream_images(&image_paths).await;
-
         let (stream_content, overflow) = split_stream_content_and_overflow(&text_without_images);
-        self.update_stream_state_with_images(message_id, &stream_content, true, images);
 
-        // Send overflow via webhook fallback chain
-        if let Some(extra) = overflow {
-            // Determine scope from stream state (recipient is the scope)
-            let extra_msg = format!("[\u{8865}\u{5145}\u{6d88}\u{606f}]\n{extra}");
-            let scope = _recipient;
-            self.send_overflow(scope, &extra_msg).await;
+        if !req_id.is_empty() {
+            self.ws_send_respond_msg(&req_id, message_id, &stream_content, true, &images)
+                .await?;
         }
+
+        // Send overflow via aibot_send_msg
+        if let Some(extra) = overflow {
+            let extra_msg =
+                format!("[\u{8865}\u{5145}\u{6d88}\u{606f}]\n{extra}");
+            if let Ok((chat_type, chatid)) = parse_scope(recipient) {
+                for chunk in split_markdown_chunks(&extra_msg) {
+                    let frame = serde_json::json!({
+                        "cmd": "aibot_send_msg",
+                        "headers": { "req_id": random_ascii_token(16) },
+                        "body": {
+                            "chatid": chatid,
+                            "chat_type": chat_type,
+                            "msgtype": "markdown",
+                            "markdown": { "content": chunk }
+                        }
+                    });
+                    let _ = self.ws_send_frame(frame).await;
+                }
+            }
+        }
+
+        // Cleanup req_id mapping
+        self.req_id_map.lock().remove(message_id);
 
         Ok(())
     }
 
     async fn cancel_draft(&self, _recipient: &str, message_id: &str) -> Result<()> {
-        self.update_stream_state_content(message_id, "", true);
-        Ok(())
-    }
-}
-
-// ── WeComChannel overflow helper ─────────────────────────────────────
-
-impl WeComChannel {
-    /// Send overflow message using the 3-layer fallback chain.
-    async fn send_overflow(&self, scope: &str, content: &str) {
-        let chunks = split_markdown_chunks(content);
-        for chunk in chunks {
-            let mut sent = false;
-
-            // Level 1: response_url
-            while let Some(entry) = self.take_response_url(scope) {
-                match self.send_to_url(&entry.url, &chunk).await {
-                    Ok(()) => {
-                        tracing::info!("WeCom: overflow sent via response_url to scope={}", scope);
-                        sent = true;
-                        break;
-                    }
-                    Err(err) => {
-                        tracing::warn!(
-                            "WeCom overflow response_url send failed: scope={} error={}",
-                            scope,
-                            err
-                        );
-                    }
-                }
-            }
-            if sent {
-                continue;
-            }
-
-            // Level 2: scope webhook
-            if let Some(url) = self.lookup_scope_webhook(scope).await {
-                match self.send_to_url(&url, &chunk).await {
-                    Ok(()) => {
-                        tracing::info!("WeCom: overflow sent via scope webhook to scope={}", scope);
-                        sent = true;
-                    }
-                    Err(err) => {
-                        tracing::warn!(
-                            "WeCom overflow scope webhook send failed: scope={} error={}",
-                            scope,
-                            err
-                        );
-                    }
-                }
-            }
-            if sent {
-                continue;
-            }
-
-            // Level 3: fallback webhook
-            if let Some(url) = &self.fallback_webhook_url {
-                if is_valid_robot_webhook_url(url) {
-                    let tagged = format!("[FallbackPush] {chunk}");
-                    match self.send_to_url(url, &tagged).await {
-                        Ok(()) => {
-                            tracing::info!(
-                                "WeCom: overflow sent via fallback webhook to scope={}",
-                                scope
-                            );
-                            sent = true;
-                        }
-                        Err(err) => {
-                            tracing::warn!(
-                                "WeCom overflow fallback webhook send failed: scope={} error={}",
-                                scope,
-                                err
-                            );
-                        }
-                    }
-                }
-            }
-
-            if !sent {
-                tracing::warn!("WeCom overflow dropped: no usable URL for scope={}", scope);
-            }
+        let req_id = self
+            .req_id_map
+            .lock()
+            .get(message_id)
+            .cloned()
+            .unwrap_or_default();
+        if !req_id.is_empty() {
+            self.ws_send_respond_msg(&req_id, message_id, "", true, &[])
+                .await?;
         }
+        self.req_id_map.lock().remove(message_id);
+        Ok(())
     }
 }
 
@@ -2055,13 +1478,6 @@ fn parse_inbound_payload(payload: Value) -> Result<ParsedInbound> {
         .unwrap_or("unknown")
         .to_string();
 
-    let response_url = payload
-        .get("response_url")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|v| !v.is_empty())
-        .map(ToOwned::to_owned);
-
     Ok(ParsedInbound {
         msg_id,
         msg_type,
@@ -2069,7 +1485,6 @@ fn parse_inbound_payload(payload: Value) -> Result<ParsedInbound> {
         chat_id,
         sender_userid,
         aibot_id,
-        response_url,
         raw_payload: payload,
     })
 }
@@ -2115,6 +1530,18 @@ fn normalize_scope_component(raw: &str) -> String {
             }
         })
         .collect()
+}
+
+/// Parse scope string into (chat_type, chatid) for aibot_send_msg.
+/// `user--{userid}` → (1, userid), `group--{chatid}` → (2, chatid)
+fn parse_scope(scope: &str) -> Result<(u32, &str)> {
+    if let Some(userid) = scope.strip_prefix("user--") {
+        Ok((1, userid))
+    } else if let Some(chatid) = scope.strip_prefix("group--") {
+        Ok((2, chatid))
+    } else {
+        anyhow::bail!("WeCom: invalid scope format: {scope}")
+    }
 }
 
 fn summarize_attachment_url_for_log(url: &str) -> String {
@@ -2229,7 +1656,8 @@ fn strip_edge_mentions(text: &str) -> String {
             break;
         }
         let mut probe = end;
-        while probe > start && !bytes[probe - 1].is_ascii_whitespace() && bytes[probe - 1] != b'@' {
+        while probe > start && !bytes[probe - 1].is_ascii_whitespace() && bytes[probe - 1] != b'@'
+        {
             probe -= 1;
         }
         if probe > start && bytes[probe - 1] == b'@' {
@@ -2308,7 +1736,6 @@ fn inbound_content_preview(inbound: &ParsedInbound) -> String {
             .and_then(Value::as_str)
             .map(|name| format!("[File message: {name}]"))
             .unwrap_or_else(|| "[File message]".to_string()),
-        "stream" => "[Stream refresh callback]".to_string(),
         "event" => "[Event callback]".to_string(),
         other => format!("[{other} message]"),
     }
@@ -2429,57 +1856,6 @@ async fn prepare_stream_images(paths: &[String]) -> Vec<StreamImageItem> {
     items
 }
 
-fn make_stream_payload(
-    stream_id: &str,
-    content: &str,
-    finish: bool,
-    images: &[StreamImageItem],
-) -> Value {
-    let mut stream_obj = serde_json::json!({
-        "id": stream_id,
-        "finish": finish,
-        "content": normalize_stream_content(content),
-    });
-    if finish && !images.is_empty() {
-        let msg_items: Vec<Value> = images
-            .iter()
-            .map(|img| {
-                serde_json::json!({
-                    "msgtype": "image",
-                    "image": {
-                        "base64": img.base64,
-                        "md5": img.md5,
-                    }
-                })
-            })
-            .collect();
-        stream_obj["msg_item"] = Value::Array(msg_items);
-    }
-    serde_json::json!({
-        "msgtype": "stream",
-        "stream": stream_obj,
-    })
-}
-
-fn make_text_payload(content: &str) -> Value {
-    serde_json::json!({
-        "msgtype": "text",
-        "text": {
-            "content": content,
-        }
-    })
-}
-
-fn parse_stream_id(payload: &Value) -> Option<String> {
-    payload
-        .get("stream")
-        .and_then(|v| v.get("id"))
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|v| !v.is_empty())
-        .map(ToOwned::to_owned)
-}
-
 fn parse_event_type(payload: &Value) -> Option<String> {
     payload
         .get("event")
@@ -2544,14 +1920,20 @@ fn extract_quote_context(payload: &Value) -> Option<String> {
             .map(str::trim)
             .filter(|v| !v.is_empty())
             .map(ToOwned::to_owned)
-            .unwrap_or_else(|| "[\u{5f15}\u{7528}\u{6587}\u{672c}\u{4e3a}\u{7a7a}]".to_string()),
+            .unwrap_or_else(|| {
+                "[\u{5f15}\u{7528}\u{6587}\u{672c}\u{4e3a}\u{7a7a}]".to_string()
+            }),
         "voice" => quote
             .get("voice")
             .and_then(|v| v.get("content"))
             .and_then(Value::as_str)
             .map(str::trim)
             .filter(|v| !v.is_empty())
-            .map(|v| format!("[\u{5f15}\u{7528}\u{8bed}\u{97f3}\u{8f6c}\u{5199}] {v}"))
+            .map(|v| {
+                format!(
+                    "[\u{5f15}\u{7528}\u{8bed}\u{97f3}\u{8f6c}\u{5199}] {v}"
+                )
+            })
             .unwrap_or_else(|| {
                 "[\u{5f15}\u{7528}\u{8bed}\u{97f3}\u{65e0}\u{8f6c}\u{5199}]".to_string()
             }),
@@ -2601,9 +1983,13 @@ fn extract_quote_context(payload: &Value) -> Option<String> {
                             .map(str::trim)
                             .filter(|v| !v.is_empty())
                         {
-                            parts.push(format!("[\u{5f15}\u{7528}\u{56fe}\u{7247}] {path}"));
+                            parts.push(format!(
+                                "[\u{5f15}\u{7528}\u{56fe}\u{7247}] {path}"
+                            ));
                         } else {
-                            parts.push("[\u{5f15}\u{7528}\u{56fe}\u{7247}]".to_string());
+                            parts.push(
+                                "[\u{5f15}\u{7528}\u{56fe}\u{7247}]".to_string(),
+                            );
                         }
                     }
                 }
@@ -2615,78 +2001,15 @@ fn extract_quote_context(payload: &Value) -> Option<String> {
                 parts.join("\n")
             }
         }
-        _ => format!("[\u{5f15}\u{7528}\u{6d88}\u{606f} type={quote_type}]"),
+        _ => format!(
+            "[\u{5f15}\u{7528}\u{6d88}\u{606f} type={quote_type}]"
+        ),
     };
 
     let content = trim_utf8_to_max_bytes(&content, 4_096);
     Some(format!(
         "[WECOM_QUOTE]\nmsgtype={quote_type}\ncontent={content}\n[/WECOM_QUOTE]"
     ))
-}
-
-fn parse_wecom_business_response(body: &str) -> Result<()> {
-    let parsed: Value = serde_json::from_str(body).context("invalid WeCom response json")?;
-    let errcode = parsed
-        .get("errcode")
-        .and_then(Value::as_i64)
-        .ok_or_else(|| anyhow::anyhow!("missing errcode in WeCom response"))?;
-    if errcode != 0 {
-        let errmsg = parsed
-            .get("errmsg")
-            .and_then(Value::as_str)
-            .unwrap_or("unknown");
-        anyhow::bail!("errcode={errcode} errmsg={errmsg}");
-    }
-    Ok(())
-}
-
-async fn cleanup_inbox_files(root: PathBuf, retention: Duration) {
-    if !root.exists() {
-        return;
-    }
-
-    let mut stack = vec![root];
-    while let Some(dir) = stack.pop() {
-        let Ok(mut rd) = tokio::fs::read_dir(&dir).await else {
-            continue;
-        };
-
-        while let Ok(Some(entry)) = rd.next_entry().await {
-            let path = entry.path();
-            let Ok(meta) = entry.metadata().await else {
-                continue;
-            };
-
-            if meta.is_dir() {
-                stack.push(path);
-                continue;
-            }
-
-            let Ok(modified) = meta.modified() else {
-                continue;
-            };
-
-            let age = SystemTime::now()
-                .duration_since(modified)
-                .unwrap_or_else(|_| Duration::from_secs(0));
-            if age > retention {
-                let _ = tokio::fs::remove_file(&path).await;
-            }
-        }
-    }
-}
-
-fn is_valid_robot_webhook_url(url: &str) -> bool {
-    let Ok(parsed) = reqwest::Url::parse(url) else {
-        return false;
-    };
-
-    parsed.scheme() == "https"
-        && parsed
-            .host_str()
-            .map(|host| host.eq_ignore_ascii_case("qyapi.weixin.qq.com"))
-            .unwrap_or(false)
-        && parsed.path().starts_with("/cgi-bin/webhook/send")
 }
 
 fn bytes_timestamp_now() -> u64 {
@@ -2748,22 +2071,6 @@ fn split_markdown_chunks(input: &str) -> Vec<String> {
     chunks
 }
 
-fn reply_timestamp(query: &WeComCallbackQuery) -> String {
-    if query.timestamp.trim().is_empty() {
-        bytes_timestamp_now().to_string()
-    } else {
-        query.timestamp.trim().to_string()
-    }
-}
-
-fn reply_nonce(query: &WeComCallbackQuery) -> String {
-    if query.nonce.trim().is_empty() {
-        random_ascii_token(12)
-    } else {
-        query.nonce.trim().to_string()
-    }
-}
-
 fn is_model_supported_msgtype(msg_type: &str) -> bool {
     matches!(msg_type, "text" | "voice" | "image" | "file" | "mixed")
 }
@@ -2780,6 +2087,42 @@ fn is_voice_without_transcript(inbound: &ParsedInbound) -> bool {
         .map(str::trim)
         .unwrap_or("")
         .is_empty()
+}
+
+async fn cleanup_inbox_files(root: PathBuf, retention: Duration) {
+    if !root.exists() {
+        return;
+    }
+
+    let mut stack = vec![root];
+    while let Some(dir) = stack.pop() {
+        let Ok(mut rd) = tokio::fs::read_dir(&dir).await else {
+            continue;
+        };
+
+        while let Ok(Some(entry)) = rd.next_entry().await {
+            let path = entry.path();
+            let Ok(meta) = entry.metadata().await else {
+                continue;
+            };
+
+            if meta.is_dir() {
+                stack.push(path);
+                continue;
+            }
+
+            let Ok(modified) = meta.modified() else {
+                continue;
+            };
+
+            let age = SystemTime::now()
+                .duration_since(modified)
+                .unwrap_or_else(|_| Duration::from_secs(0));
+            if age > retention {
+                let _ = tokio::fs::remove_file(&path).await;
+            }
+        }
+    }
 }
 
 /// Find the largest char boundary <= `max_bytes` in `s`.
@@ -2807,7 +2150,6 @@ mod tests {
             chat_id: Some("g1".to_string()),
             sender_userid: "u1".to_string(),
             aibot_id: "b1".to_string(),
-            response_url: None,
             raw_payload: serde_json::json!({}),
         };
 
@@ -2842,18 +2184,6 @@ mod tests {
     }
 
     #[test]
-    fn robot_webhook_url_validation() {
-        assert!(is_valid_robot_webhook_url(
-            "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=test"
-        ));
-        assert!(!is_valid_robot_webhook_url("http://example.com/test"));
-        assert!(!is_valid_robot_webhook_url(
-            "https://qyapi.weixin.qq.com/cgi-bin/message/send"
-        ));
-        assert!(!is_valid_robot_webhook_url("not-a-url"));
-    }
-
-    #[test]
     fn summarize_attachment_url_for_log_redacts_query_string() {
         let url = "https://wework.qpic.cn/wwpic/123456/0?auth=secret_token&expires=123";
         let summary = summarize_attachment_url_for_log(url);
@@ -2874,52 +2204,9 @@ mod tests {
     fn stop_command_detection_supports_cn_and_en() {
         assert!(contains_stop_command("\u{505c}\u{6b62}"));
         assert!(contains_stop_command("Please STOP now"));
-        assert!(!contains_stop_command("\u{7ee7}\u{7eed}\u{5904}\u{7406}"));
-    }
-
-    #[test]
-    fn crypto_encrypt_and_decrypt_roundtrip() {
-        let crypto =
-            WeComCrypto::new("token123", "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY").unwrap();
-        let nonce = "nonce123";
-        let timestamp = "1700000000";
-        let plain = r#"{"msgtype":"stream","stream":{"id":"sid","finish":false,"content":"hi"}}"#;
-
-        let envelope = crypto
-            .encrypt_json_ciphertext(plain, nonce, timestamp, "")
-            .unwrap();
-        let parsed: Value = serde_json::from_str(&envelope).unwrap();
-        let encrypt = parsed
-            .get("encrypt")
-            .and_then(Value::as_str)
-            .unwrap()
-            .to_string();
-        let signature = parsed
-            .get("msgsignature")
-            .and_then(Value::as_str)
-            .unwrap()
-            .to_string();
-
-        assert!(crypto.verify_signature(&signature, timestamp, nonce, &encrypt));
-        let decrypted = crypto.decrypt_json_ciphertext(&encrypt, "").unwrap();
-        assert_eq!(decrypted, plain);
-    }
-
-    #[test]
-    fn crypto_signature_verification_matches_sorted_sha1() {
-        let crypto =
-            WeComCrypto::new("token123", "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY").unwrap();
-        let encrypt = "enc_payload";
-        let timestamp = "1700000000";
-        let nonce = "nonce123";
-
-        let mut parts = ["token123", timestamp, nonce, encrypt];
-        parts.sort_unstable();
-        let mut sha = Sha1::new();
-        sha.update(parts.join(""));
-        let signature = hex::encode(sha.finalize());
-
-        assert!(crypto.verify_signature(&signature, timestamp, nonce, encrypt));
+        assert!(!contains_stop_command(
+            "\u{7ee7}\u{7eed}\u{5904}\u{7406}"
+        ));
     }
 
     #[test]
@@ -2975,13 +2262,6 @@ mod tests {
         let quote = extract_quote_context(&payload).expect("quote should be extracted");
         assert!(quote.contains("\u{7b2c}\u{4e00}\u{6bb5}"));
         assert!(quote.contains("\u{5f15}\u{7528}\u{56fe}\u{7247}"));
-    }
-
-    #[test]
-    fn parse_wecom_business_response_requires_zero_errcode() {
-        assert!(parse_wecom_business_response(r#"{"errcode":0,"errmsg":"ok"}"#).is_ok());
-        assert!(parse_wecom_business_response(r#"{"errcode":93000,"errmsg":"expired"}"#).is_err());
-        assert!(parse_wecom_business_response(r#"{"errmsg":"ok"}"#).is_err());
     }
 
     #[test]
@@ -3062,51 +2342,6 @@ mod tests {
     }
 
     #[test]
-    fn make_stream_payload_with_images_on_finish() {
-        let imgs = vec![StreamImageItem {
-            base64: "aGVsbG8=".to_string(),
-            md5: "5d41402abc4b2a76b9719d911017c592".to_string(),
-        }];
-        let payload = make_stream_payload("sid1", "done", true, &imgs);
-        let stream = payload.get("stream").expect("stream key");
-        assert_eq!(stream.get("finish").and_then(Value::as_bool), Some(true));
-        let msg_items = stream
-            .get("msg_item")
-            .and_then(Value::as_array)
-            .expect("msg_item");
-        assert_eq!(msg_items.len(), 1);
-        assert_eq!(
-            msg_items[0].get("msgtype").and_then(Value::as_str),
-            Some("image")
-        );
-        assert_eq!(
-            msg_items[0]
-                .get("image")
-                .and_then(|v| v.get("base64"))
-                .and_then(Value::as_str),
-            Some("aGVsbG8=")
-        );
-    }
-
-    #[test]
-    fn make_stream_payload_no_images() {
-        let payload = make_stream_payload("sid2", "hello", true, &[]);
-        let stream = payload.get("stream").expect("stream key");
-        assert!(stream.get("msg_item").is_none());
-    }
-
-    #[test]
-    fn make_stream_payload_ignores_images_when_not_finish() {
-        let imgs = vec![StreamImageItem {
-            base64: "aGVsbG8=".to_string(),
-            md5: "abc".to_string(),
-        }];
-        let payload = make_stream_payload("sid3", "partial", false, &imgs);
-        let stream = payload.get("stream").expect("stream key");
-        assert!(stream.get("msg_item").is_none());
-    }
-
-    #[test]
     fn clear_session_bare_commands() {
         assert!(is_clear_session_command("/clear"));
         assert!(is_clear_session_command("/new"));
@@ -3125,7 +2360,9 @@ mod tests {
 
     #[test]
     fn clear_session_rejects_old_and_invalid() {
-        assert!(!is_clear_session_command("\u{65b0}\u{4f1a}\u{8bdd}"));
+        assert!(!is_clear_session_command(
+            "\u{65b0}\u{4f1a}\u{8bdd}"
+        ));
         assert!(!is_clear_session_command("clear history"));
         assert!(!is_clear_session_command("/clear now"));
         assert!(!is_clear_session_command("please /new"));
@@ -3147,5 +2384,24 @@ mod tests {
         let s = "Hello";
         let boundary = floor_char_boundary(s, 100);
         assert_eq!(boundary, s.len());
+    }
+
+    #[test]
+    fn parse_scope_user() {
+        let (chat_type, chatid) = parse_scope("user--alice123").unwrap();
+        assert_eq!(chat_type, 1);
+        assert_eq!(chatid, "alice123");
+    }
+
+    #[test]
+    fn parse_scope_group() {
+        let (chat_type, chatid) = parse_scope("group--meeting_room").unwrap();
+        assert_eq!(chat_type, 2);
+        assert_eq!(chatid, "meeting_room");
+    }
+
+    #[test]
+    fn parse_scope_invalid() {
+        assert!(parse_scope("invalid_scope").is_err());
     }
 }
