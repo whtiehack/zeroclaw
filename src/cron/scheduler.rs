@@ -1293,7 +1293,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn deliver_if_configured_supports_wecom_scope_target() {
+    async fn deliver_if_configured_requires_live_wecom_channel() {
         let tmp = TempDir::new().unwrap();
         let mut config = test_config(&tmp).await;
         config.channels_config.wecom = Some(crate::config::schema::WeComConfig {
@@ -1315,9 +1315,8 @@ mod tests {
             best_effort: true,
         };
 
-        // No response_url/scope webhook/fallback in this test environment.
-        // WeCom channel should degrade to a dropped outbound warning and still return Ok.
-        assert!(deliver_if_configured(&config, &job, "x").await.is_ok());
+        let err = deliver_if_configured(&config, &job, "x").await.unwrap_err();
+        assert!(err.to_string().contains("wecom channel not available"));
     }
 
     #[tokio::test]

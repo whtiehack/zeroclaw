@@ -640,7 +640,6 @@ fn channel_delivery_instructions(channel_name: &str) -> Option<&'static str> {
              - Image/file attachments are automatically downloaded and provided as local paths like [IMAGE:/path/to/file.png] or [Document: /path/to/file.bin].\n\
              - Quoted messages (when user replies to a specific message) are injected as [WECOM_QUOTE]...[/WECOM_QUOTE] blocks containing msgtype and content.\n\
              - In shared group chats, each turn includes a [sender_userid=xxx] prefix to identify who is speaking.\n\
-             - If user asks to enable proactive push notifications, call memory_store with key=push_url_memory_key, content=<raw webhook URL>, and category='wecom_push'.\n\
              - Use tool results silently: answer the user's question directly without narrating internal execution steps.",
         ),
         "lark" | "feishu" => Some(
@@ -930,12 +929,10 @@ fn build_channel_system_prompt(
         } else {
             ("single", reply_target.to_string())
         };
-        let push_url_key = format!("wecom_push_url::{conversation_scope}");
         let mut lines = vec![
             "\n\n[WECOM_STATIC_CONTEXT_V1]".to_string(),
             format!("chat_type={chat_type}"),
             format!("conversation_scope={conversation_scope}"),
-            format!("push_url_memory_key={push_url_key}"),
         ];
         // Single chat: include sender_userid derived from reply_target (user--xxx).
         if let Some(userid) = reply_target.strip_prefix("user--") {
