@@ -1218,16 +1218,23 @@ impl Channel for WeComChannel {
         let scope = &message.recipient;
         let (chat_type, chatid) = parse_scope(scope)?;
         let chunks = split_markdown_chunks(&message.content);
+        let cron = crate::cron::current_log_fields();
 
         tracing::info!(
+            job_id = %cron.job_id,
+            run_id = %cron.run_id,
+            parent_run_id = %cron.parent_run_id,
+            depth = cron.depth,
             "WeCom: sending message to scope={}, len={}, chunks={}",
             scope,
             message.content.len(),
             chunks.len()
         );
 
-        for chunk in chunks {
+        let total_chunks = chunks.len();
+        for (idx, chunk) in chunks.into_iter().enumerate() {
             let req_id = random_ascii_token(16);
+            let chunk_len = chunk.len();
             let frame = serde_json::json!({
                 "cmd": "aibot_send_msg",
                 "headers": { "req_id": req_id },
@@ -1240,6 +1247,18 @@ impl Channel for WeComChannel {
             });
             self.ws_send_frame_and_wait_for_response(frame, &req_id, "aibot_send_msg")
                 .await?;
+            tracing::info!(
+                scope = %scope,
+                req_id = %req_id,
+                chunk_index = idx + 1,
+                chunk_count = total_chunks,
+                chunk_len,
+                job_id = %cron.job_id,
+                run_id = %cron.run_id,
+                parent_run_id = %cron.parent_run_id,
+                depth = cron.depth,
+                "WeCom send ack received"
+            );
         }
 
         Ok(())

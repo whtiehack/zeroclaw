@@ -148,8 +148,13 @@ fn resolve_embedding_config(
         .iter()
         .find(|route| route.hint.trim() == hint)
     else {
+        let cron = crate::cron::current_log_fields();
         tracing::warn!(
             hint,
+            job_id = %cron.job_id,
+            run_id = %cron.run_id,
+            parent_run_id = %cron.parent_run_id,
+            depth = cron.depth,
             "Unknown embedding route hint; falling back to [memory] embedding settings"
         );
         return fallback;
@@ -159,8 +164,13 @@ fn resolve_embedding_config(
     let model = route.model.trim();
     let dimensions = route.dimensions.unwrap_or(config.embedding_dimensions);
     if provider.is_empty() || model.is_empty() || dimensions == 0 {
+        let cron = crate::cron::current_log_fields();
         tracing::warn!(
             hint,
+            job_id = %cron.job_id,
+            run_id = %cron.run_id,
+            parent_run_id = %cron.parent_run_id,
+            depth = cron.depth,
             "Invalid embedding route configuration; falling back to [memory] embedding settings"
         );
         return fallback;

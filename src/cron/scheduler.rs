@@ -8,8 +8,9 @@ use crate::channels::{
 };
 use crate::config::Config;
 use crate::cron::{
-    due_jobs, next_run_for_schedule, record_last_run, record_run, remove_job, reschedule_after_run,
-    update_job, CronJob, CronJobPatch, DeliveryConfig, JobType, Schedule, SessionTarget,
+    current_log_fields, due_jobs, next_run_for_schedule, record_last_run, record_run, remove_job,
+    reschedule_after_run, update_job, with_execution_log_context, CronExecutionLogContext, CronJob,
+    CronJobPatch, DeliveryConfig, JobType, Schedule, SessionTarget,
 };
 use crate::security::SecurityPolicy;
 use anyhow::Result;
@@ -67,7 +68,37 @@ pub async fn execute_job_now_with_approval(
     approved: bool,
 ) -> (bool, String) {
     let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
-    execute_job_with_retry(config, &security, job, approved).await
+    let context = CronExecutionLogContext::for_job(job.id.clone());
+    with_execution_log_context(context.clone(), async move {
+        tracing::info!(
+            job_id = %context.job_id,
+            run_id = %context.run_id,
+            parent_run_id = %context.parent_run_id.as_deref().unwrap_or("-"),
+            depth = context.depth,
+            job_type = ?job.job_type,
+            schedule = ?job.schedule,
+            approved,
+            "Cron job execution started"
+        );
+
+        let started_at = Utc::now();
+        let (success, output) = execute_job_with_retry(config, &security, job, approved).await;
+        let finished_at = Utc::now();
+        let duration_ms = (finished_at - started_at).num_milliseconds();
+
+        tracing::info!(
+            job_id = %context.job_id,
+            run_id = %context.run_id,
+            parent_run_id = %context.parent_run_id.as_deref().unwrap_or("-"),
+            depth = context.depth,
+            duration_ms,
+            status = if success { "ok" } else { "error" },
+            "Cron job execution finished"
+        );
+
+        (success, output)
+    })
+    .await
 }
 
 async fn execute_job_with_retry(
@@ -79,8 +110,20 @@ async fn execute_job_with_retry(
     let mut last_output = String::new();
     let retries = config.reliability.scheduler_retries;
     let mut backoff_ms = config.reliability.provider_backoff_ms.max(200);
+    let cron = current_log_fields();
 
     for attempt in 0..=retries {
+        tracing::info!(
+            job_id = %cron.job_id,
+            run_id = %cron.run_id,
+            parent_run_id = %cron.parent_run_id,
+            depth = cron.depth,
+            attempt = attempt + 1,
+            max_attempts = retries + 1,
+            job_type = ?job.job_type,
+            "Cron job attempt started"
+        );
+
         let (success, output) = match job.job_type {
             JobType::Shell => run_job_command_with_approval(config, security, job, approved).await,
             JobType::Agent => run_agent_job(config, security, job).await,
@@ -88,8 +131,30 @@ async fn execute_job_with_retry(
         last_output = output;
 
         if success {
+            tracing::info!(
+                job_id = %cron.job_id,
+                run_id = %cron.run_id,
+                parent_run_id = %cron.parent_run_id,
+                depth = cron.depth,
+                attempt = attempt + 1,
+                max_attempts = retries + 1,
+                "Cron job attempt succeeded"
+            );
             return (true, last_output);
         }
+
+        let scrubbed_output = crate::agent::loop_::scrub_credentials(&last_output);
+        tracing::warn!(
+            job_id = %cron.job_id,
+            run_id = %cron.run_id,
+            parent_run_id = %cron.parent_run_id,
+            depth = cron.depth,
+            attempt = attempt + 1,
+            max_attempts = retries + 1,
+            will_retry = attempt < retries,
+            failure_output = %scrubbed_output,
+            "Cron job attempt failed"
+        );
 
         if last_output.starts_with("blocked by security policy:") {
             // Deterministic policy violations are not retryable.
@@ -147,13 +212,40 @@ async fn execute_and_persist_job(
 ) -> (String, bool, String) {
     crate::health::mark_component_ok(component);
     warn_if_high_frequency_agent_job(job);
+    let context = CronExecutionLogContext::for_job(job.id.clone());
 
-    let started_at = Utc::now();
-    let (success, output) = execute_job_with_retry(config, security, job, false).await;
-    let finished_at = Utc::now();
-    let success = persist_job_result(config, job, success, &output, started_at, finished_at).await;
+    with_execution_log_context(context.clone(), async move {
+        tracing::info!(
+            job_id = %context.job_id,
+            run_id = %context.run_id,
+            parent_run_id = %context.parent_run_id.as_deref().unwrap_or("-"),
+            depth = context.depth,
+            job_type = ?job.job_type,
+            schedule = ?job.schedule,
+            delete_after_run = job.delete_after_run,
+            "Cron job execution started"
+        );
 
-    (job.id.clone(), success, output)
+        let started_at = Utc::now();
+        let (success, output) = execute_job_with_retry(config, security, job, false).await;
+        let finished_at = Utc::now();
+        let duration_ms = (finished_at - started_at).num_milliseconds();
+        let success =
+            persist_job_result(config, job, success, &output, started_at, finished_at).await;
+
+        tracing::info!(
+            job_id = %context.job_id,
+            run_id = %context.run_id,
+            parent_run_id = %context.parent_run_id.as_deref().unwrap_or("-"),
+            depth = context.depth,
+            duration_ms,
+            status = if success { "ok" } else { "error" },
+            "Cron job execution finished"
+        );
+
+        (job.id.clone(), success, output)
+    })
+    .await
 }
 
 async fn run_agent_job(
@@ -224,14 +316,41 @@ async fn persist_job_result(
     finished_at: DateTime<Utc>,
 ) -> bool {
     let duration_ms = (finished_at - started_at).num_milliseconds();
+    let cron = current_log_fields();
 
     if let Err(e) = deliver_if_configured(config, job, output).await {
         if job.delivery.best_effort {
-            tracing::warn!("Cron delivery failed (best_effort): {e}");
+            tracing::warn!(
+                job_id = %cron.job_id,
+                run_id = %cron.run_id,
+                parent_run_id = %cron.parent_run_id,
+                depth = cron.depth,
+                best_effort = true,
+                error = %e,
+                "Cron delivery failed"
+            );
         } else {
             success = false;
-            tracing::warn!("Cron delivery failed: {e}");
+            tracing::warn!(
+                job_id = %cron.job_id,
+                run_id = %cron.run_id,
+                parent_run_id = %cron.parent_run_id,
+                depth = cron.depth,
+                best_effort = false,
+                error = %e,
+                "Cron delivery failed"
+            );
         }
+    } else if job.delivery.mode.eq_ignore_ascii_case("announce") {
+        tracing::info!(
+            job_id = %cron.job_id,
+            run_id = %cron.run_id,
+            parent_run_id = %cron.parent_run_id,
+            depth = cron.depth,
+            channel = %job.delivery.channel.as_deref().unwrap_or("-"),
+            target = %job.delivery.to.as_deref().unwrap_or("-"),
+            "Cron delivery succeeded"
+        );
     }
 
     let _ = record_run(

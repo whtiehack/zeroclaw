@@ -2594,9 +2594,8 @@ pub(crate) fn build_shell_policy_instructions(autonomy: &crate::config::Autonomy
         .collect();
 
     if normalized.contains("*") {
-        instructions.push_str(
-            "- Allowed commands: all commands are permitted (wildcard * configured).\n",
-        );
+        instructions
+            .push_str("- Allowed commands: all commands are permitted (wildcard * configured).\n");
     } else if normalized.is_empty() {
         instructions
             .push_str("- Allowed commands: none configured. Any shell command will be rejected.\n");
@@ -2681,7 +2680,15 @@ pub async fn run(
         &config.workspace_dir,
         config.api_key.as_deref(),
     )?);
-    tracing::info!(backend = mem.name(), "Memory initialized");
+    let cron = crate::cron::current_log_fields();
+    tracing::info!(
+        backend = mem.name(),
+        job_id = %cron.job_id,
+        run_id = %cron.run_id,
+        parent_run_id = %cron.parent_run_id,
+        depth = cron.depth,
+        "Memory initialized"
+    );
 
     // ── Peripherals (merge peripheral tools into registry) ─
     if !peripheral_overrides.is_empty() {

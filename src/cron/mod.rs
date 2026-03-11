@@ -3,12 +3,18 @@ use crate::security::SecurityPolicy;
 use anyhow::{anyhow, bail, Result};
 
 pub mod consolidation;
+mod log_context;
 mod schedule;
 mod store;
 mod types;
 
 pub mod scheduler;
 
+#[allow(unused_imports)]
+pub use log_context::{
+    current_execution_log_context, current_log_fields, with_execution_log_context,
+    CronExecutionLogContext, CronExecutionLogFields,
+};
 #[allow(unused_imports)]
 pub use schedule::{
     next_run_for_schedule, normalize_expression, schedule_cron_expression, validate_schedule,

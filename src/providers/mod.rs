@@ -1692,8 +1692,13 @@ pub fn create_resilient_provider_with_options(
         match create_provider_with_options(provider_name, fallback_api_key, &fallback_options) {
             Ok(provider) => providers.push((fallback.clone(), provider)),
             Err(_error) => {
+                let cron = crate::cron::current_log_fields();
                 tracing::warn!(
                     fallback_provider = provider_name,
+                    job_id = %cron.job_id,
+                    run_id = %cron.run_id,
+                    parent_run_id = %cron.parent_run_id,
+                    depth = cron.depth,
                     "Ignoring invalid fallback provider during initialization"
                 );
             }

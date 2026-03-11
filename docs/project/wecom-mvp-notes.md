@@ -218,6 +218,7 @@ Current behavior:
 - outbound content is chunked with an `8000`-byte target and `20480`-byte hard cap
 - each chunk becomes a WS `aibot_send_msg` markdown frame
 - each `aibot_send_msg` currently waits for the WeCom ack frame and surfaces `errcode/errmsg` back to the caller
+- successful `aibot_send_msg` acks are info-logged with `req_id`, chunk index/count, and active cron execution IDs when the send originated from cron delivery
 - there is no current `response_url` cache
 - there is no current scope webhook lookup
 - there is no current config fallback webhook

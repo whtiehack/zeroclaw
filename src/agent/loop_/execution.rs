@@ -30,13 +30,32 @@ async fn execute_one_tool(
     observer.record_event(&ObserverEvent::ToolCallStart {
         tool: call_name.to_string(),
     });
-    tracing::info!(tool = %call_name, args = %scrub_credentials(&call_arguments.to_string()), "tool call started");
+    let scrubbed_args = scrub_credentials(&call_arguments.to_string());
+    let cron = crate::cron::current_log_fields();
+    tracing::info!(
+        tool = %call_name,
+        args = %scrubbed_args,
+        job_id = %cron.job_id,
+        run_id = %cron.run_id,
+        parent_run_id = %cron.parent_run_id,
+        depth = cron.depth,
+        "tool call started"
+    );
     let start = Instant::now();
 
     let Some(tool) = find_tool(tools_registry, call_name) else {
         let reason = format!("Unknown tool: {call_name}");
         let duration = start.elapsed();
-        tracing::info!(tool = %call_name, "tool call failed: unknown tool");
+        tracing::info!(
+            tool = %call_name,
+            args = %scrubbed_args,
+            job_id = %cron.job_id,
+            run_id = %cron.run_id,
+            parent_run_id = %cron.parent_run_id,
+            depth = cron.depth,
+            reason = %reason,
+            "tool call failed"
+        );
         observer.record_event(&ObserverEvent::ToolCall {
             tool: call_name.to_string(),
             duration,
@@ -69,7 +88,17 @@ async fn execute_one_tool(
                 success: r.success,
             });
             if r.success {
-                tracing::info!(tool = %call_name, duration_ms = duration.as_millis(), output = %brief(&scrub_credentials(&r.output), 200), "tool call succeeded");
+                tracing::info!(
+                    tool = %call_name,
+                    args = %scrubbed_args,
+                    duration_ms = duration.as_millis(),
+                    output = %brief(&scrub_credentials(&r.output), 200),
+                    job_id = %cron.job_id,
+                    run_id = %cron.run_id,
+                    parent_run_id = %cron.parent_run_id,
+                    depth = cron.depth,
+                    "tool call succeeded"
+                );
                 Ok(ToolExecutionOutcome {
                     output: scrub_credentials(&r.output),
                     success: true,
@@ -78,18 +107,39 @@ async fn execute_one_tool(
                 })
             } else {
                 let reason = r.error.unwrap_or(r.output);
-                tracing::info!(tool = %call_name, duration_ms = duration.as_millis(), reason = %brief(&scrub_credentials(&reason), 300), "tool call failed");
+                let scrubbed_reason = scrub_credentials(&reason);
+                tracing::info!(
+                    tool = %call_name,
+                    args = %scrubbed_args,
+                    duration_ms = duration.as_millis(),
+                    reason = %scrubbed_reason,
+                    job_id = %cron.job_id,
+                    run_id = %cron.run_id,
+                    parent_run_id = %cron.parent_run_id,
+                    depth = cron.depth,
+                    "tool call failed"
+                );
                 Ok(ToolExecutionOutcome {
                     output: format!("Error: {reason}"),
                     success: false,
-                    error_reason: Some(scrub_credentials(&reason)),
+                    error_reason: Some(scrubbed_reason),
                     duration,
                 })
             }
         }
         Err(e) => {
             let duration = start.elapsed();
-            tracing::info!(tool = %call_name, duration_ms = duration.as_millis(), error = %e, "tool call error");
+            tracing::info!(
+                tool = %call_name,
+                args = %scrubbed_args,
+                duration_ms = duration.as_millis(),
+                error = %e,
+                job_id = %cron.job_id,
+                run_id = %cron.run_id,
+                parent_run_id = %cron.parent_run_id,
+                depth = cron.depth,
+                "tool call error"
+            );
             observer.record_event(&ObserverEvent::ToolCall {
                 tool: call_name.to_string(),
                 duration,
