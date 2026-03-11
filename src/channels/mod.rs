@@ -490,6 +490,16 @@ fn llm_user_content_with_sender_identity(msg: &traits::ChannelMessage, content: 
     format!("{prefix} {content}")
 }
 
+fn persisted_channel_user_content(msg: &traits::ChannelMessage, content: &str) -> String {
+    // WeCom group chats share one history window across multiple senders, so the
+    // sender marker must be preserved in cached user turns as well.
+    if msg.channel == "wecom" && msg.reply_target.starts_with("group--") {
+        return llm_user_content_with_sender_identity(msg, content);
+    }
+
+    content.to_string()
+}
+
 /// Strip tool-call XML tags from outgoing messages.
 ///
 /// LLM responses may contain `<function_calls>`, `<function_call>`,
@@ -3922,7 +3932,7 @@ If this input is legitimate, rephrase the request and avoid instruction-override
     let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S %Z");
     let llm_user_content = llm_user_content_with_sender_identity(&msg, &msg.content);
     let timestamped_content = format!("[{now}] {llm_user_content}");
-    let persisted_user_content = msg.content.clone();
+    let persisted_user_content = persisted_channel_user_content(&msg, &msg.content);
 
     // Preserve user turn before the LLM call so interrupted requests keep context.
     append_sender_turn(
@@ -6743,6 +6753,11 @@ mod tests {
     }
 
     #[derive(Default)]
+    struct WecomRecordingChannel {
+        sent_messages: tokio::sync::Mutex<Vec<String>>,
+    }
+
+    #[derive(Default)]
     struct DraftStreamingRecordingChannel {
         sent_messages: tokio::sync::Mutex<Vec<String>>,
         draft_updates: tokio::sync::Mutex<Vec<String>>,
@@ -6829,6 +6844,36 @@ mod tests {
             text: &str,
         ) -> anyhow::Result<()> {
             self.finalized_drafts.lock().await.push(text.to_string());
+            Ok(())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Channel for WecomRecordingChannel {
+        fn name(&self) -> &str {
+            "wecom"
+        }
+
+        async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
+            self.sent_messages
+                .lock()
+                .await
+                .push(format!("{}:{}", message.recipient, message.content));
+            Ok(())
+        }
+
+        async fn listen(
+            &self,
+            _tx: tokio::sync::mpsc::Sender<traits::ChannelMessage>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn start_typing(&self, _recipient: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn stop_typing(&self, _recipient: &str) -> anyhow::Result<()> {
             Ok(())
         }
     }
@@ -11591,6 +11636,22 @@ BTC is currently around $65,000 based on latest tool output."#
     }
 
     #[test]
+    fn wecom_group_messages_persist_sender_identity_in_history() {
+        let msg = traits::ChannelMessage {
+            id: "msg_1".into(),
+            sender: "hanxiao".into(),
+            reply_target: "group--room-1".into(),
+            content: "who am i?".into(),
+            channel: "wecom".into(),
+            timestamp: 1,
+            thread_ts: None,
+        };
+
+        let persisted = persisted_channel_user_content(&msg, &msg.content);
+        assert_eq!(persisted, "[sender_userid=hanxiao] who am i?");
+    }
+
+    #[test]
     fn telegram_dm_messages_do_not_prefix_sender_identity() {
         let msg = traits::ChannelMessage {
             id: "msg_1".into(),
@@ -11802,6 +11863,98 @@ BTC is currently around $65,000 based on latest tool output."#
         assert!(calls[1][1].1.contains("hello"));
         assert!(calls[1][2].1.contains("response-1"));
         assert!(calls[1][3].1.contains("follow up"));
+    }
+
+    #[tokio::test]
+    async fn process_channel_message_wecom_group_history_preserves_sender_identity() {
+        let channel_impl = Arc::new(WecomRecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+
+        let mut channels_by_name = HashMap::new();
+        channels_by_name.insert(channel.name().to_string(), channel);
+
+        let provider_impl = Arc::new(HistoryCaptureProvider::default());
+
+        let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            channels_by_name: Arc::new(channels_by_name),
+            provider: provider_impl.clone(),
+            default_provider: Arc::new("test-provider".to_string()),
+            memory: Arc::new(NoopMemory),
+            tools_registry: Arc::new(vec![]),
+            observer: Arc::new(NoopObserver),
+            system_prompt: Arc::new("test-system-prompt".to_string()),
+            model: Arc::new("test-model".to_string()),
+            temperature: 0.0,
+            auto_save_memory: false,
+            max_tool_iterations: 5,
+            min_relevance_score: 0.0,
+            conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            conversation_locks: Default::default(),
+            session_config: crate::config::AgentSessionConfig::default(),
+            session_manager: None,
+            provider_cache: Arc::new(Mutex::new(HashMap::new())),
+            route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            api_key: None,
+            api_url: None,
+            reliability: Arc::new(crate::config::ReliabilityConfig::default()),
+            provider_runtime_options: providers::ProviderRuntimeOptions::default(),
+            workspace_dir: Arc::new(std::env::temp_dir()),
+            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            interrupt_on_new_message: false,
+            multimodal: crate::config::MultimodalConfig::default(),
+            hooks: None,
+            non_cli_excluded_tools: Arc::new(Mutex::new(Vec::new())),
+            query_classification: crate::config::QueryClassificationConfig::default(),
+            model_routes: Vec::new(),
+            approval_manager: Arc::new(ApprovalManager::from_config(
+                &crate::config::AutonomyConfig::default(),
+            )),
+            safety_heartbeat: None,
+            startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
+        });
+
+        process_channel_message(
+            runtime_ctx.clone(),
+            traits::ChannelMessage {
+                id: "msg-a".to_string(),
+                sender: "hanxiao".to_string(),
+                reply_target: "group--project-room".to_string(),
+                content: "first turn".to_string(),
+                channel: "wecom".to_string(),
+                timestamp: 1,
+                thread_ts: Some("req-1".to_string()),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+        process_channel_message(
+            runtime_ctx,
+            traits::ChannelMessage {
+                id: "msg-b".to_string(),
+                sender: "lin".to_string(),
+                reply_target: "group--project-room".to_string(),
+                content: "second turn".to_string(),
+                channel: "wecom".to_string(),
+                timestamp: 2,
+                thread_ts: Some("req-2".to_string()),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+        let calls = provider_impl
+            .calls
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[1].len(), 4);
+        assert_eq!(calls[1][1].0, "user");
+        assert_eq!(calls[1][2].0, "assistant");
+        assert_eq!(calls[1][3].0, "user");
+        assert!(calls[1][1].1.contains("[sender_userid=hanxiao] first turn"));
+        assert!(calls[1][2].1.contains("response-1"));
+        assert!(calls[1][3].1.contains("[sender_userid=lin] second turn"));
     }
 
     #[tokio::test]
