@@ -388,6 +388,7 @@ Notes:
 
 - Local Docker-based CI is strongly recommended when Docker is available.
 - Contributors are not blocked from opening a PR if local Docker CI is unavailable; in that case run the most relevant native checks and document what was run.
+- Do not run multiple `cargo`/`rustc` validation commands in parallel in the same workspace. Serialize `cargo fmt`, `cargo clippy`, `cargo test`, and targeted `cargo test <filter>` runs to avoid package-cache and artifact-directory lock contention.
 
 Additional expectations by change type:
 
