@@ -883,6 +883,43 @@ fn strip_progress_section_markers(text: &str) -> String {
     text.replace(crate::agent::loop_::DRAFT_PROGRESS_SECTION_START, "")
         .replace(crate::agent::loop_::DRAFT_PROGRESS_SECTION_END, "")
 }
+
+fn apply_draft_delta(accumulated: &mut String, delta: &str, mode: ProgressMode) {
+    if delta == crate::agent::loop_::DRAFT_CLEAR_SENTINEL {
+        accumulated.clear();
+        return;
+    }
+    if let Some(block) = delta.strip_prefix(crate::agent::loop_::DRAFT_PROGRESS_BLOCK_SENTINEL) {
+        if mode == ProgressMode::Off {
+            return;
+        }
+        upsert_progress_section(accumulated, block);
+        return;
+    }
+
+    let (is_internal_progress, visible_delta) = split_internal_progress_delta(delta);
+    if is_internal_progress {
+        if mode == ProgressMode::Off {
+            return;
+        }
+        if mode == ProgressMode::Compact && is_verbose_only_progress_line(visible_delta) {
+            return;
+        }
+    }
+
+    if mode == ProgressMode::Verbose {
+        accumulated.push_str(visible_delta);
+        return;
+    }
+
+    let sanitized_delta = strip_tool_call_tags(visible_delta);
+    if sanitized_delta.is_empty() {
+        return;
+    }
+
+    accumulated.push_str(&sanitized_delta);
+}
+
 fn build_channel_system_prompt(
     base_prompt: &str,
     channel_name: &str,
@@ -4053,33 +4090,25 @@ If this input is legitimate, rephrase the request and avoid instruction-override
         let mode = progress_mode;
         Some(tokio::spawn(async move {
             let mut accumulated = String::new();
-            while let Some(delta) = rx.recv().await {
-                if delta == crate::agent::loop_::DRAFT_CLEAR_SENTINEL {
-                    accumulated.clear();
-                    continue;
-                }
-                if let Some(block) =
-                    delta.strip_prefix(crate::agent::loop_::DRAFT_PROGRESS_BLOCK_SENTINEL)
-                {
-                    if mode == ProgressMode::Off {
-                        continue;
-                    }
-                    upsert_progress_section(&mut accumulated, block);
+            let mut queued_delta: Option<String> = None;
+            loop {
+                let delta = if let Some(delta) = queued_delta.take() {
+                    delta
                 } else {
-                    let (is_internal_progress, visible_delta) =
-                        split_internal_progress_delta(&delta);
-                    if is_internal_progress {
-                        if mode == ProgressMode::Off {
-                            continue;
-                        }
-                        if mode == ProgressMode::Compact
-                            && is_verbose_only_progress_line(visible_delta)
-                        {
-                            continue;
-                        }
+                    match rx.recv().await {
+                        Some(delta) => delta,
+                        None => break,
                     }
-
-                    accumulated.push_str(visible_delta);
+                };
+                apply_draft_delta(&mut accumulated, &delta, mode);
+                while let Ok(next_delta) = rx.try_recv() {
+                    if next_delta == crate::agent::loop_::DRAFT_CLEAR_SENTINEL
+                        && !accumulated.is_empty()
+                    {
+                        queued_delta = Some(next_delta);
+                        break;
+                    }
+                    apply_draft_delta(&mut accumulated, &next_delta, mode);
                 }
                 let display_text = strip_progress_section_markers(&accumulated);
                 if let Err(e) = channel
@@ -12404,6 +12433,44 @@ Done reminder set for 1:38 AM."#;
         let stripped = strip_progress_section_markers(&text);
         assert!(!stripped.contains("⏳ shell: ls"));
         assert!(stripped.contains("✅ shell (1s)"));
+    }
+
+    #[test]
+    fn apply_draft_delta_clears_and_filters_verbose_progress() {
+        let mut text = String::from("draft");
+        apply_draft_delta(
+            &mut text,
+            &format!(
+                "{}💬 Got 1 tool call(s) (1s)\n",
+                crate::agent::loop_::DRAFT_PROGRESS_SENTINEL
+            ),
+            ProgressMode::Compact,
+        );
+        assert_eq!(text, "draft");
+
+        apply_draft_delta(
+            &mut text,
+            "<tool_call>\n{\"name\":\"shell\",\"arguments\":{\"command\":\"pwd\"}}\n</tool_call>",
+            ProgressMode::Compact,
+        );
+        assert_eq!(text, "draft");
+
+        apply_draft_delta(
+            &mut text,
+            &format!(
+                "{}⏳ shell: ls\n",
+                crate::agent::loop_::DRAFT_PROGRESS_BLOCK_SENTINEL
+            ),
+            ProgressMode::Compact,
+        );
+        assert!(text.contains(crate::agent::loop_::DRAFT_PROGRESS_SECTION_START));
+
+        apply_draft_delta(
+            &mut text,
+            crate::agent::loop_::DRAFT_CLEAR_SENTINEL,
+            ProgressMode::Compact,
+        );
+        assert!(text.is_empty());
     }
 
     #[test]

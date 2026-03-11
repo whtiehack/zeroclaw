@@ -156,6 +156,9 @@ Current stream constraints:
 - stream text is trimmed to `20480` bytes
 - overflow text is sent separately through `aibot_send_msg`
 - all updates for one inbound callback reuse the original `req_id`
+- `aibot_respond_msg` updates are serialized per inbound `req_id`; the channel waits for the WS ack before sending the next refresh
+- `errcode=6000` (`data version conflict`) is retried with short backoff inside the channel layer instead of being left as an unsolicited failure
+- the shared runtime coalesces queued draft deltas before calling `update_draft()` so bursty progress output does not flood WeCom with redundant refreshes
 
 Important current limitation:
 

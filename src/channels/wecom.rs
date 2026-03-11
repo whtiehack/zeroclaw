@@ -27,6 +27,8 @@ const WECOM_COMMAND_TIMEOUT_SECS: u64 = 10;
 const WECOM_HTTP_TIMEOUT_SECS: u64 = 60;
 const WECOM_WS_READY_WAIT_SECS: u64 = 10;
 const WECOM_WS_READY_POLL_MILLIS: u64 = 100;
+const WECOM_STREAM_CONFLICT_MAX_RETRIES: usize = 3;
+const WECOM_STREAM_CONFLICT_RETRY_BASE_MILLIS: u64 = 150;
 
 const WECOM_MARKDOWN_MAX_BYTES: usize = 20_480;
 const WECOM_MARKDOWN_CHUNK_BYTES: usize = 8_000;
@@ -167,6 +169,7 @@ pub struct WeComChannel {
     ws_tx: Arc<tokio::sync::Mutex<Option<mpsc::Sender<WsOutbound>>>>,
     pending_responses:
         Arc<tokio::sync::Mutex<HashMap<String, tokio::sync::oneshot::Sender<Result<()>>>>>,
+    respond_msg_locks: Arc<tokio::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
     last_cleanup: Arc<Mutex<Instant>>,
     idempotency: Arc<SimpleIdempotencyStore>,
     req_id_map: Arc<Mutex<HashMap<String, String>>>, // stream_id → req_id
@@ -192,6 +195,7 @@ impl WeComChannel {
             client,
             ws_tx: Arc::new(tokio::sync::Mutex::new(None)),
             pending_responses: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            respond_msg_locks: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             last_cleanup: Arc::new(Mutex::new(Instant::now())),
             idempotency: Arc::new(SimpleIdempotencyStore::new()),
             req_id_map: Arc::new(Mutex::new(HashMap::new())),
@@ -303,6 +307,19 @@ impl WeComChannel {
         true
     }
 
+    async fn respond_msg_lock_for_req_id(&self, req_id: &str) -> Arc<tokio::sync::Mutex<()>> {
+        self.respond_msg_locks
+            .lock()
+            .await
+            .entry(req_id.to_string())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
+    }
+
+    async fn cleanup_respond_msg_lock(&self, req_id: &str) {
+        self.respond_msg_locks.lock().await.remove(req_id);
+    }
+
     async fn fail_pending_responses(&self, reason: &str) {
         let pending = {
             let mut guard = self.pending_responses.lock().await;
@@ -349,7 +366,45 @@ impl WeComChannel {
                 "stream": stream_obj,
             },
         });
-        self.ws_send_frame(frame).await
+        if req_id.is_empty() {
+            return self.ws_send_frame(frame).await;
+        }
+
+        let stream_lock = self.respond_msg_lock_for_req_id(req_id).await;
+        let _guard = stream_lock.lock().await;
+        let mut attempt = 0usize;
+
+        let result = loop {
+            match self
+                .ws_send_frame_and_wait_for_response(frame.clone(), req_id, "aibot_respond_msg")
+                .await
+            {
+                Ok(()) => break Ok(()),
+                Err(err)
+                    if is_wecom_data_version_conflict_error(&err)
+                        && attempt < WECOM_STREAM_CONFLICT_MAX_RETRIES =>
+                {
+                    let retry_in_ms =
+                        WECOM_STREAM_CONFLICT_RETRY_BASE_MILLIS.saturating_mul(1u64 << attempt);
+                    attempt += 1;
+                    tracing::warn!(
+                        req_id,
+                        stream_id,
+                        attempt,
+                        retry_in_ms,
+                        "WeCom stream reply hit data-version conflict; retrying"
+                    );
+                    tokio::time::sleep(Duration::from_millis(retry_in_ms)).await;
+                }
+                Err(err) => break Err(err),
+            }
+        };
+
+        if finish {
+            self.cleanup_respond_msg_lock(req_id).await;
+        }
+
+        result
     }
 
     // ── file cleanup ─────────────────────────────────────────────────
@@ -1521,6 +1576,11 @@ fn strip_wecom_padding(input: &[u8]) -> Result<&[u8]> {
     Ok(&input[..input.len() - pad_len])
 }
 
+fn is_wecom_data_version_conflict_error(err: &anyhow::Error) -> bool {
+    let msg = err.to_string();
+    msg.contains("errcode=6000") || msg.contains("data version conflict")
+}
+
 fn parse_inbound_payload(payload: Value) -> Result<ParsedInbound> {
     let msg_type = payload
         .get("msgtype")
@@ -2471,16 +2531,20 @@ mod tests {
         assert!(parse_scope("invalid_scope").is_err());
     }
 
-    #[tokio::test]
-    async fn command_response_resolves_waiter_successfully() {
-        let config = crate::config::schema::WeComConfig {
+    fn test_wecom_config() -> crate::config::schema::WeComConfig {
+        crate::config::schema::WeComConfig {
             bot_id: "bot123".to_string(),
             secret: "secret456".to_string(),
             file_retention_days: 3,
             max_file_size_mb: 20,
             history_max_turns: 50,
             progress_mode: crate::config::schema::ProgressMode::Compact,
-        };
+        }
+    }
+
+    #[tokio::test]
+    async fn command_response_resolves_waiter_successfully() {
+        let config = test_wecom_config();
         let channel = WeComChannel::new(&config, Path::new("/tmp")).unwrap();
 
         let (waiter, rx) = tokio::sync::oneshot::channel();
@@ -2504,14 +2568,7 @@ mod tests {
 
     #[tokio::test]
     async fn command_response_resolves_waiter_failure() {
-        let config = crate::config::schema::WeComConfig {
-            bot_id: "bot123".to_string(),
-            secret: "secret456".to_string(),
-            file_retention_days: 3,
-            max_file_size_mb: 20,
-            history_max_turns: 50,
-            progress_mode: crate::config::schema::ProgressMode::Compact,
-        };
+        let config = test_wecom_config();
         let channel = WeComChannel::new(&config, Path::new("/tmp")).unwrap();
 
         let (waiter, rx) = tokio::sync::oneshot::channel();
@@ -2533,5 +2590,131 @@ mod tests {
         let err = rx.await.unwrap().unwrap_err().to_string();
         assert!(err.contains("errcode=93001"));
         assert!(err.contains("session not allowed"));
+    }
+
+    #[tokio::test]
+    async fn stream_reply_retries_data_version_conflict() {
+        let config = test_wecom_config();
+        let channel = WeComChannel::new(&config, Path::new("/tmp")).unwrap();
+
+        let (tx, mut rx) = mpsc::channel::<WsOutbound>(8);
+        *channel.ws_tx.lock().await = Some(tx);
+
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let responder_channel = channel.clone();
+        let responder_attempts = Arc::clone(&attempts);
+        let responder = tokio::spawn(async move {
+            while let Some(WsOutbound::Frame(frame)) = rx.recv().await {
+                let attempt = responder_attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let req_id = frame
+                    .get("headers")
+                    .and_then(|headers| headers.get("req_id"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+
+                let errcode = if attempt == 0 { 6000 } else { 0 };
+                let errmsg = if errcode == 0 {
+                    "ok"
+                } else {
+                    "more than one callers at the same time, data version conflict"
+                };
+                responder_channel
+                    .maybe_handle_command_response(&serde_json::json!({
+                        "headers": { "req_id": req_id },
+                        "errcode": errcode,
+                        "errmsg": errmsg
+                    }))
+                    .await;
+
+                if errcode == 0 {
+                    break;
+                }
+            }
+        });
+
+        channel
+            .ws_send_respond_msg("req-stream", "stream-1", "hello", false, &[])
+            .await
+            .unwrap();
+
+        responder.await.unwrap();
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn stream_reply_serializes_same_req_id_updates() {
+        let config = test_wecom_config();
+        let channel = WeComChannel::new(&config, Path::new("/tmp")).unwrap();
+
+        let (tx, mut rx) = mpsc::channel::<WsOutbound>(8);
+        *channel.ws_tx.lock().await = Some(tx);
+
+        let first_channel = channel.clone();
+        let first = tokio::spawn(async move {
+            first_channel
+                .ws_send_respond_msg("req-serial", "stream-1", "first", false, &[])
+                .await
+        });
+
+        let second_channel = channel.clone();
+        let second = tokio::spawn(async move {
+            second_channel
+                .ws_send_respond_msg("req-serial", "stream-1", "second", false, &[])
+                .await
+        });
+
+        let first_frame = tokio::time::timeout(Duration::from_millis(250), rx.recv())
+            .await
+            .expect("first frame should arrive")
+            .expect("first frame should exist");
+        let WsOutbound::Frame(first_frame) = first_frame;
+        assert_eq!(
+            first_frame
+                .get("body")
+                .and_then(|body| body.get("stream"))
+                .and_then(|stream| stream.get("content"))
+                .and_then(Value::as_str),
+            Some("first")
+        );
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(75), rx.recv())
+                .await
+                .is_err(),
+            "second frame should wait for the first ack"
+        );
+
+        channel
+            .maybe_handle_command_response(&serde_json::json!({
+                "headers": { "req_id": "req-serial" },
+                "errcode": 0,
+                "errmsg": "ok"
+            }))
+            .await;
+        first.await.unwrap().unwrap();
+
+        let second_frame = tokio::time::timeout(Duration::from_millis(250), rx.recv())
+            .await
+            .expect("second frame should arrive after first ack")
+            .expect("second frame should exist");
+        let WsOutbound::Frame(second_frame) = second_frame;
+        assert_eq!(
+            second_frame
+                .get("body")
+                .and_then(|body| body.get("stream"))
+                .and_then(|stream| stream.get("content"))
+                .and_then(Value::as_str),
+            Some("second")
+        );
+
+        channel
+            .maybe_handle_command_response(&serde_json::json!({
+                "headers": { "req_id": "req-serial" },
+                "errcode": 0,
+                "errmsg": "ok"
+            }))
+            .await;
+        second.await.unwrap().unwrap();
     }
 }
