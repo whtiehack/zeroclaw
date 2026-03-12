@@ -3818,6 +3818,10 @@ fn default_wecom_history_max_turns() -> usize {
     50
 }
 
+fn default_wecom_stream_mode() -> StreamMode {
+    StreamMode::Partial
+}
+
 /// WeCom AI Bot channel configuration.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct WeComConfig {
@@ -3834,6 +3838,9 @@ pub struct WeComConfig {
     /// Maximum retained turns per WeCom conversation scope.
     #[serde(default = "default_wecom_history_max_turns")]
     pub history_max_turns: usize,
+    /// Streaming mode for progressive draft delivery over the WeCom long connection.
+    #[serde(default = "default_wecom_stream_mode")]
+    pub stream_mode: StreamMode,
 }
 
 impl ChannelConfig for WeComConfig {
@@ -6258,6 +6265,36 @@ tool_dispatcher = "xml"
         assert_eq!(parsed.stream_mode, StreamMode::Off);
         assert_eq!(parsed.draft_update_interval_ms, 1000);
         assert!(!parsed.interrupt_on_new_message);
+    }
+
+    #[test]
+    async fn wecom_config_serde() {
+        let wc = WeComConfig {
+            bot_id: "bot123".into(),
+            secret: "secret456".into(),
+            file_retention_days: 14,
+            max_file_size_mb: 32,
+            history_max_turns: 80,
+            stream_mode: StreamMode::Partial,
+        };
+        let json = serde_json::to_string(&wc).unwrap();
+        let parsed: WeComConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.bot_id, "bot123");
+        assert_eq!(parsed.secret, "secret456");
+        assert_eq!(parsed.file_retention_days, 14);
+        assert_eq!(parsed.max_file_size_mb, 32);
+        assert_eq!(parsed.history_max_turns, 80);
+        assert_eq!(parsed.stream_mode, StreamMode::Partial);
+    }
+
+    #[test]
+    async fn wecom_config_defaults_stream_partial() {
+        let json = r#"{"bot_id":"bot123","secret":"secret456"}"#;
+        let parsed: WeComConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.file_retention_days, 7);
+        assert_eq!(parsed.max_file_size_mb, 20);
+        assert_eq!(parsed.history_max_turns, 50);
+        assert_eq!(parsed.stream_mode, StreamMode::Partial);
     }
 
     #[test]

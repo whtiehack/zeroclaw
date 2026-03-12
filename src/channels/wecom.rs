@@ -1,4 +1,5 @@
 use super::traits::{Channel, ChannelMessage, SendMessage};
+use crate::config::StreamMode;
 use aes::Aes256;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
@@ -112,6 +113,7 @@ struct WeComRuntimeConfig {
     workspace_dir: PathBuf,
     file_retention_days: u32,
     max_file_size_bytes: u64,
+    stream_mode: StreamMode,
 }
 
 #[derive(Debug, Clone)]
@@ -191,6 +193,7 @@ impl WeComChannel {
                 workspace_dir: workspace_dir.to_path_buf(),
                 file_retention_days: config.file_retention_days,
                 max_file_size_bytes: config.max_file_size_mb.saturating_mul(1024 * 1024),
+                stream_mode: config.stream_mode,
             },
             client,
             ws_tx: Arc::new(tokio::sync::Mutex::new(None)),
@@ -1468,10 +1471,14 @@ impl Channel for WeComChannel {
     }
 
     fn supports_draft_updates(&self) -> bool {
-        true
+        self.cfg.stream_mode != StreamMode::Off
     }
 
     async fn send_draft(&self, message: &SendMessage) -> Result<Option<String>> {
+        if self.cfg.stream_mode == StreamMode::Off {
+            return Ok(None);
+        }
+
         // thread_ts carries the req_id from handle_msg_callback
         let req_id = message.thread_ts.as_deref().unwrap_or("");
         if req_id.is_empty() {
@@ -2542,7 +2549,33 @@ mod tests {
             file_retention_days: 3,
             max_file_size_mb: 20,
             history_max_turns: 50,
+            stream_mode: StreamMode::Partial,
         }
+    }
+
+    #[test]
+    fn supports_draft_updates_respects_stream_mode() {
+        let mut off_cfg = test_wecom_config();
+        off_cfg.stream_mode = StreamMode::Off;
+        let off = WeComChannel::new(&off_cfg, Path::new("/tmp")).unwrap();
+        assert!(!off.supports_draft_updates());
+
+        let partial = WeComChannel::new(&test_wecom_config(), Path::new("/tmp")).unwrap();
+        assert!(partial.supports_draft_updates());
+    }
+
+    #[tokio::test]
+    async fn send_draft_returns_none_when_stream_mode_off() {
+        let mut cfg = test_wecom_config();
+        cfg.stream_mode = StreamMode::Off;
+        let channel = WeComChannel::new(&cfg, Path::new("/tmp")).unwrap();
+
+        let id = channel
+            .send_draft(&SendMessage::new("draft", "user--alice"))
+            .await
+            .unwrap();
+
+        assert!(id.is_none());
     }
 
     #[tokio::test]
