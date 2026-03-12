@@ -1736,7 +1736,7 @@ pub async fn run_tool_call_loop(
                 }
                 let mut parsed_text = String::new();
 
-                if invalid_native_tool_json_count == 0 && calls.is_empty() {
+                if invalid_native_tool_json_count == 0 && calls.is_empty() && !use_native_tools {
                     let (fallback_text, fallback_calls) = parse_tool_calls(&response_text);
                     if !fallback_text.is_empty() {
                         parsed_text = fallback_text;
