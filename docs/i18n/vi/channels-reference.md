@@ -343,6 +343,8 @@ allowed_users = ["*"]
 [channels_config.wecom]
 bot_id = "wecom-bot-id"
 secret = "wecom-long-connection-secret"
+allowed_users = ["zeroclaw_user"]     # tùy chọn: allowlist userid WeCom, "*" = mọi người dùng
+allowed_groups = ["zeroclaw_group"]   # tùy chọn: allowlist chatid nhóm WeCom, "*" = mọi nhóm
 stream_mode = "partial"  # tùy chọn: off | partial
 file_retention_days = 7  # tùy chọn
 max_file_size_mb = 20    # tùy chọn
@@ -352,6 +354,8 @@ history_max_turns = 50   # tùy chọn
 Lưu ý:
 
 - WeCom dùng API WebSocket kết nối dài của AI bot nên không cần endpoint webhook công khai.
+- `allowed_users` khớp theo `userid` người gửi; `allowed_groups` khớp theo `chatid` của nhóm. Nếu cả hai allowlist đều rỗng thì mặc định từ chối tin nhắn vào.
+- Khi từ chối trong nhóm, phản hồi sẽ kèm `chatid` để operator có thể chép vào `allowed_groups`.
 - `stream_mode = "partial"` giữ cơ chế phản hồi nháp theo tiến trình; `off` sẽ chỉ gửi câu trả lời cuối cùng.
 - Khi `zeroclaw channel start` hoặc `zeroclaw daemon` giữ kết nối đang hoạt động, các thông báo chủ động từ scheduler có thể được gửi qua phiên WeCom hiện tại.
 
@@ -430,7 +434,7 @@ rg -n "Matrix|Telegram|Discord|Slack|Mattermost|Signal|WhatsApp|Email|IRC|Lark|D
 | Lark / Feishu | `Lark: WS connected` / `Lark event callback server listening on` | `Lark WS: ignoring ... (not in allowed_users)` / `Lark: ignoring message from unauthorized user:` | `Lark: ping failed, reconnecting` / `Lark: heartbeat timeout, reconnecting` / `Lark: WS read error:` |
 | DingTalk | `DingTalk: connected and listening for messages...` | `DingTalk: ignoring message from unauthorized user:` | `DingTalk WebSocket error:` / `DingTalk: message channel closed` |
 | QQ | `QQ: connected and identified` | `QQ: ignoring C2C message from unauthorized user:` / `QQ: ignoring group message from unauthorized user:` | `QQ: received Reconnect (op 7)` / `QQ: received Invalid Session (op 9)` / `QQ: message channel closed` |
-| WeCom | `[wecom] WebSocket connected` / `[wecom] subscribe succeeded` | (phạm vi hội thoại đến từ metadata phiên trong callback WeCom) | `[wecom] WebSocket connect failed:` / `[wecom] subscribe rejected:` / `[wecom] disconnected_event, triggering reconnect` |
+| WeCom | `[wecom] WebSocket connected` / `[wecom] subscribe succeeded` | `[wecom] inbound denied because allowlist is not configured` / `[wecom] inbound denied by allowlist` | `[wecom] WebSocket connect failed:` / `[wecom] subscribe rejected:` / `[wecom] disconnected_event, triggering reconnect` |
 | iMessage | `iMessage channel listening (AppleScript bridge)...` | (allowlist liên hệ được thực thi bởi `allowed_contacts`) | `iMessage poll error:` |
 
 ### 7.3 Từ khóa của runtime supervisor

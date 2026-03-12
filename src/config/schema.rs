@@ -3829,6 +3829,12 @@ pub struct WeComConfig {
     pub bot_id: String,
     /// Secret for WeCom WebSocket subscription authentication.
     pub secret: String,
+    /// Allowed WeCom user IDs. Empty = deny all, "*" = allow all users.
+    #[serde(default)]
+    pub allowed_users: Vec<String>,
+    /// Allowed WeCom group chat IDs. Empty = deny all groups, "*" = allow all groups.
+    #[serde(default)]
+    pub allowed_groups: Vec<String>,
     /// File retention days for downloaded WeCom attachments under workspace cache.
     #[serde(default = "default_wecom_file_retention_days")]
     pub file_retention_days: u32,
@@ -6272,6 +6278,8 @@ tool_dispatcher = "xml"
         let wc = WeComConfig {
             bot_id: "bot123".into(),
             secret: "secret456".into(),
+            allowed_users: vec!["zeroclaw_user".into(), "*".into()],
+            allowed_groups: vec!["zeroclaw_group".into()],
             file_retention_days: 14,
             max_file_size_mb: 32,
             history_max_turns: 80,
@@ -6281,6 +6289,8 @@ tool_dispatcher = "xml"
         let parsed: WeComConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.bot_id, "bot123");
         assert_eq!(parsed.secret, "secret456");
+        assert_eq!(parsed.allowed_users, vec!["zeroclaw_user", "*"]);
+        assert_eq!(parsed.allowed_groups, vec!["zeroclaw_group"]);
         assert_eq!(parsed.file_retention_days, 14);
         assert_eq!(parsed.max_file_size_mb, 32);
         assert_eq!(parsed.history_max_turns, 80);
@@ -6291,6 +6301,8 @@ tool_dispatcher = "xml"
     async fn wecom_config_defaults_stream_partial() {
         let json = r#"{"bot_id":"bot123","secret":"secret456"}"#;
         let parsed: WeComConfig = serde_json::from_str(json).unwrap();
+        assert!(parsed.allowed_users.is_empty());
+        assert!(parsed.allowed_groups.is_empty());
         assert_eq!(parsed.file_retention_days, 7);
         assert_eq!(parsed.max_file_size_mb, 20);
         assert_eq!(parsed.history_max_turns, 50);

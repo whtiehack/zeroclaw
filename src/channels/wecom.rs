@@ -72,6 +72,13 @@ struct ScopeDecision {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AccessDecision {
+    Allowed,
+    AllowlistMissing,
+    Denied,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AttachmentKind {
     Image,
     File,
@@ -111,6 +118,8 @@ impl SimpleIdempotencyStore {
 #[derive(Clone)]
 struct WeComRuntimeConfig {
     workspace_dir: PathBuf,
+    allowed_users: Vec<String>,
+    allowed_groups: Vec<String>,
     file_retention_days: u32,
     max_file_size_bytes: u64,
     stream_mode: StreamMode,
@@ -191,6 +200,8 @@ impl WeComChannel {
             secret: config.secret.clone(),
             cfg: WeComRuntimeConfig {
                 workspace_dir: workspace_dir.to_path_buf(),
+                allowed_users: normalize_wecom_allowlist(config.allowed_users.clone()),
+                allowed_groups: normalize_wecom_allowlist(config.allowed_groups.clone()),
                 file_retention_days: config.file_retention_days,
                 max_file_size_bytes: config.max_file_size_mb.saturating_mul(1024 * 1024),
                 stream_mode: config.stream_mode,
@@ -333,6 +344,32 @@ impl WeComChannel {
             let _ = waiter.send(Err(anyhow::anyhow!(
                 "WeCom WebSocket disconnected before response: req_id={req_id} reason={reason}"
             )));
+        }
+    }
+
+    fn access_decision(&self, inbound: &ParsedInbound) -> AccessDecision {
+        evaluate_access_decision(&self.cfg.allowed_users, &self.cfg.allowed_groups, inbound)
+    }
+
+    async fn respond_access_denied(
+        &self,
+        req_id: &str,
+        inbound: &ParsedInbound,
+        decision: AccessDecision,
+    ) {
+        let message = build_access_denied_message(inbound, decision);
+        let stream_id = next_stream_id();
+        if let Err(err) = self
+            .ws_send_respond_msg(req_id, &stream_id, &message, true, &[])
+            .await
+        {
+            tracing::warn!(
+                sender_userid = %inbound.sender_userid,
+                chat_type = %inbound.chat_type,
+                chat_id = %inbound.chat_id.as_deref().unwrap_or("-"),
+                error = %format_args!("{err:#}"),
+                "[wecom] failed to send access-denied response"
+            );
         }
     }
 
@@ -503,6 +540,32 @@ impl WeComChannel {
             parsed.msg_type,
             msg_id_str
         );
+
+        match self.access_decision(&parsed) {
+            AccessDecision::Allowed => {}
+            AccessDecision::AllowlistMissing => {
+                tracing::warn!(
+                    sender_userid = %parsed.sender_userid,
+                    chat_type = %parsed.chat_type,
+                    chat_id = %parsed.chat_id.as_deref().unwrap_or("-"),
+                    "[wecom] inbound denied because allowlist is not configured"
+                );
+                self.respond_access_denied(&req_id, &parsed, AccessDecision::AllowlistMissing)
+                    .await;
+                return;
+            }
+            AccessDecision::Denied => {
+                tracing::warn!(
+                    sender_userid = %parsed.sender_userid,
+                    chat_type = %parsed.chat_type,
+                    chat_id = %parsed.chat_id.as_deref().unwrap_or("-"),
+                    "[wecom] inbound denied by allowlist"
+                );
+                self.respond_access_denied(&req_id, &parsed, AccessDecision::Denied)
+                    .await;
+                return;
+            }
+        }
 
         self.maybe_cleanup_files();
 
@@ -1664,6 +1727,88 @@ fn compute_scopes(inbound: &ParsedInbound) -> ScopeDecision {
     }
 }
 
+fn normalize_wecom_identity(value: &str) -> String {
+    value.trim().to_string()
+}
+
+fn normalize_wecom_allowlist(entries: Vec<String>) -> Vec<String> {
+    entries
+        .into_iter()
+        .map(|entry| normalize_wecom_identity(&entry))
+        .filter(|entry| !entry.is_empty())
+        .collect()
+}
+
+fn allowlist_matches(allowlist: &[String], candidate: &str) -> bool {
+    let candidate = normalize_wecom_identity(candidate);
+    !candidate.is_empty()
+        && allowlist
+            .iter()
+            .any(|entry| entry == "*" || entry == &candidate)
+}
+
+fn evaluate_access_decision(
+    allowed_users: &[String],
+    allowed_groups: &[String],
+    inbound: &ParsedInbound,
+) -> AccessDecision {
+    if allowed_users.is_empty() && allowed_groups.is_empty() {
+        return AccessDecision::AllowlistMissing;
+    }
+
+    if allowlist_matches(allowed_users, &inbound.sender_userid) {
+        return AccessDecision::Allowed;
+    }
+
+    if inbound.chat_type.eq_ignore_ascii_case("group")
+        && inbound
+            .chat_id
+            .as_deref()
+            .is_some_and(|chat_id| allowlist_matches(allowed_groups, chat_id))
+    {
+        return AccessDecision::Allowed;
+    }
+
+    AccessDecision::Denied
+}
+
+fn build_access_denied_message(inbound: &ParsedInbound, decision: AccessDecision) -> String {
+    let userid = normalize_wecom_identity(&inbound.sender_userid);
+    let userid = if userid.is_empty() {
+        "unknown"
+    } else {
+        userid.as_str()
+    };
+
+    if inbound.chat_type.eq_ignore_ascii_case("group") {
+        let chatid = inbound
+            .chat_id
+            .as_deref()
+            .map(normalize_wecom_identity)
+            .filter(|chatid| !chatid.is_empty())
+            .unwrap_or_else(|| "unknown".to_string());
+        return match decision {
+            AccessDecision::AllowlistMissing => format!(
+                "管理员尚未配置 WeCom allowlist，当前机器人不接收任何群消息。\n\n群 chatid: {chatid}\n发送者 userid: {userid}\n\n请在 channels_config.wecom.allowed_groups 或 channels_config.wecom.allowed_users 中加入允许项，也可以临时设置为 [\"*\"] 进行测试。"
+            ),
+            AccessDecision::Denied => format!(
+                "当前群未被允许使用此机器人。\n\n群 chatid: {chatid}\n发送者 userid: {userid}\n\n请管理员将该群加入 channels_config.wecom.allowed_groups，或将你的 userid 加入 channels_config.wecom.allowed_users。"
+            ),
+            AccessDecision::Allowed => String::new(),
+        };
+    }
+
+    match decision {
+        AccessDecision::AllowlistMissing => format!(
+            "管理员尚未配置 WeCom allowlist，当前机器人不接收任何消息。\n\n你的 userid: {userid}\n\n请在 channels_config.wecom.allowed_users 中加入允许项，也可以临时设置为 [\"*\"] 进行测试。"
+        ),
+        AccessDecision::Denied => format!(
+            "你没有权限使用此机器人。\n\n你的 userid: {userid}\n\n请管理员将你的 userid 加入 channels_config.wecom.allowed_users。"
+        ),
+        AccessDecision::Allowed => String::new(),
+    }
+}
+
 /// Compose content for framework: quote context (if any) + normalized user text.
 /// Sender prefix and static context are handled by the framework (mod.rs).
 fn compose_content_for_framework(inbound: &ParsedInbound, normalized: &str) -> String {
@@ -2525,16 +2670,16 @@ mod tests {
 
     #[test]
     fn parse_scope_user() {
-        let (chat_type, chatid) = parse_scope("user--alice123").unwrap();
+        let (chat_type, chatid) = parse_scope("user--zeroclaw_user").unwrap();
         assert_eq!(chat_type, 1);
-        assert_eq!(chatid, "alice123");
+        assert_eq!(chatid, "zeroclaw_user");
     }
 
     #[test]
     fn parse_scope_group() {
-        let (chat_type, chatid) = parse_scope("group--meeting_room").unwrap();
+        let (chat_type, chatid) = parse_scope("group--zeroclaw_group").unwrap();
         assert_eq!(chat_type, 2);
-        assert_eq!(chatid, "meeting_room");
+        assert_eq!(chatid, "zeroclaw_group");
     }
 
     #[test]
@@ -2542,15 +2687,85 @@ mod tests {
         assert!(parse_scope("invalid_scope").is_err());
     }
 
+    fn test_inbound(chat_type: &str, chat_id: Option<&str>, sender_userid: &str) -> ParsedInbound {
+        ParsedInbound {
+            msg_id: "msg-1".to_string(),
+            msg_type: "text".to_string(),
+            chat_type: chat_type.to_string(),
+            chat_id: chat_id.map(str::to_string),
+            sender_userid: sender_userid.to_string(),
+            aibot_id: "bot123".to_string(),
+            raw_payload: serde_json::json!({
+                "msgtype": "text",
+                "msgid": "msg-1",
+                "chattype": chat_type,
+                "chatid": chat_id,
+                "from": { "userid": sender_userid },
+                "text": { "content": "@bot hello" }
+            }),
+        }
+    }
+
     fn test_wecom_config() -> crate::config::schema::WeComConfig {
         crate::config::schema::WeComConfig {
             bot_id: "bot123".to_string(),
             secret: "secret456".to_string(),
+            allowed_users: vec![],
+            allowed_groups: vec![],
             file_retention_days: 3,
             max_file_size_mb: 20,
             history_max_turns: 50,
             stream_mode: StreamMode::Partial,
         }
+    }
+
+    #[test]
+    fn access_decision_denies_when_allowlists_missing() {
+        let inbound = test_inbound("single", None, "zeroclaw_user");
+        assert_eq!(
+            evaluate_access_decision(&[], &[], &inbound),
+            AccessDecision::AllowlistMissing
+        );
+    }
+
+    #[test]
+    fn access_decision_allows_userid_in_single_chat() {
+        let inbound = test_inbound("single", None, "zeroclaw_user");
+        assert_eq!(
+            evaluate_access_decision(&["zeroclaw_user".to_string()], &[], &inbound),
+            AccessDecision::Allowed
+        );
+    }
+
+    #[test]
+    fn access_decision_allows_group_chatid() {
+        let inbound = test_inbound("group", Some("zeroclaw_group"), "zeroclaw_user");
+        assert_eq!(
+            evaluate_access_decision(&[], &["zeroclaw_group".to_string()], &inbound),
+            AccessDecision::Allowed
+        );
+    }
+
+    #[test]
+    fn access_decision_allows_wildcards() {
+        let inbound = test_inbound("group", Some("zeroclaw_group"), "zeroclaw_user");
+        assert_eq!(
+            evaluate_access_decision(&["*".to_string()], &[], &inbound),
+            AccessDecision::Allowed
+        );
+        assert_eq!(
+            evaluate_access_decision(&[], &["*".to_string()], &inbound),
+            AccessDecision::Allowed
+        );
+    }
+
+    #[test]
+    fn denied_group_message_mentions_chatid_and_userid() {
+        let inbound = test_inbound("group", Some("zeroclaw_group"), "zeroclaw_user");
+        let text = build_access_denied_message(&inbound, AccessDecision::Denied);
+        assert!(text.contains("zeroclaw_group"));
+        assert!(text.contains("zeroclaw_user"));
+        assert!(text.contains("allowed_groups"));
     }
 
     #[test]
@@ -2571,7 +2786,7 @@ mod tests {
         let channel = WeComChannel::new(&cfg, Path::new("/tmp")).unwrap();
 
         let id = channel
-            .send_draft(&SendMessage::new("draft", "user--alice"))
+            .send_draft(&SendMessage::new("draft", "user--zeroclaw_user"))
             .await
             .unwrap();
 
@@ -2626,6 +2841,71 @@ mod tests {
         let err = rx.await.unwrap().unwrap_err().to_string();
         assert!(err.contains("errcode=93001"));
         assert!(err.contains("session not allowed"));
+    }
+
+    #[tokio::test]
+    async fn unauthorized_group_message_replies_with_chatid_and_does_not_forward() {
+        let config = test_wecom_config();
+        let channel = WeComChannel::new(&config, Path::new("/tmp")).unwrap();
+
+        let (ws_tx, mut ws_rx) = mpsc::channel::<WsOutbound>(4);
+        *channel.ws_tx.lock().await = Some(ws_tx);
+
+        let responder_channel = channel.clone();
+        let responder = tokio::spawn(async move {
+            let Some(WsOutbound::Frame(frame)) = ws_rx.recv().await else {
+                panic!("expected access-denied response frame");
+            };
+            let req_id = frame
+                .get("headers")
+                .and_then(|headers| headers.get("req_id"))
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let content = frame
+                .pointer("/body/stream/content")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            responder_channel
+                .maybe_handle_command_response(&serde_json::json!({
+                    "headers": { "req_id": req_id },
+                    "errcode": 0,
+                    "errmsg": "ok"
+                }))
+                .await;
+            content
+        });
+
+        let (tx, mut rx) = mpsc::channel::<ChannelMessage>(1);
+        channel
+            .handle_msg_callback(
+                serde_json::json!({
+                    "headers": { "req_id": "req-denied" },
+                    "body": {
+                        "msgtype": "text",
+                        "msgid": "msg-denied",
+                        "chattype": "group",
+                        "chatid": "zeroclaw_group",
+                        "from": { "userid": "zeroclaw_user" },
+                        "text": { "content": "@bot hello" }
+                    }
+                }),
+                &tx,
+            )
+            .await;
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), rx.recv())
+                .await
+                .is_err(),
+            "unauthorized message must not reach framework"
+        );
+
+        let denied = responder.await.unwrap();
+        assert!(denied.contains("zeroclaw_group"));
+        assert!(denied.contains("zeroclaw_user"));
+        assert!(denied.contains("allowed_groups"));
     }
 
     #[tokio::test]
