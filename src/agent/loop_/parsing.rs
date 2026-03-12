@@ -1530,46 +1530,9 @@ pub(super) fn parse_tool_calls(response: &str) -> (String, Vec<ParsedToolCall>) 
         }
     }
 
-    // Direct XML tool tags (without <tool_call> wrapper), e.g.:
-    // <shell>pwd</shell>
-    // <file_write><path>...</path><content>...</content></file_write>
-    if calls.is_empty() {
-        if let Some(xml_calls) = parse_xml_tool_calls(remaining) {
-            let direct_calls: Vec<ParsedToolCall> = xml_calls
-                .into_iter()
-                .filter(|call| is_probable_direct_xml_tool_name(&call.name))
-                .collect();
-            if !direct_calls.is_empty() {
-                let mut cleaned_text = remaining.to_string();
-                let parsed_names: HashSet<&str> =
-                    direct_calls.iter().map(|call| call.name.as_str()).collect();
-
-                for (tag_name, _) in extract_xml_pairs(remaining) {
-                    let canonical_tag = map_tool_name_alias(tag_name);
-                    if !parsed_names.contains(tag_name) && !parsed_names.contains(canonical_tag) {
-                        continue;
-                    }
-
-                    let open = format!("<{tag_name}>");
-                    let close = format!("</{tag_name}>");
-                    while let Some(start) = cleaned_text.find(&open) {
-                        let search_from = start + open.len();
-                        let Some(end_rel) = cleaned_text[search_from..].find(&close) else {
-                            break;
-                        };
-                        let end = search_from + end_rel + close.len();
-                        cleaned_text.replace_range(start..end, "");
-                    }
-                }
-
-                calls.extend(direct_calls);
-                if !cleaned_text.trim().is_empty() {
-                    text_parts.push(cleaned_text.trim().to_string());
-                }
-                remaining = "";
-            }
-        }
-    }
+    // Direct XML tool tags — DISABLED: too permissive XML regex matches
+    // C# doc comments (<summary>, <param>, <returns>) as tool calls.
+    // if calls.is_empty() { ... parse_xml_tool_calls(remaining) ... }
 
     // XML attribute-style tool calls:
     // <minimax:toolcall>
