@@ -380,8 +380,12 @@ fn interruption_scope_key(msg: &traits::ChannelMessage) -> String {
     format!("{}_{}_{}", msg.channel, msg.reply_target, msg.sender)
 }
 
+fn wecom_group_requires_sender_identity(msg: &traits::ChannelMessage) -> bool {
+    msg.channel == "wecom" && msg.reply_target.starts_with("group--")
+}
+
 fn llm_user_content_with_sender_identity(msg: &traits::ChannelMessage, content: &str) -> String {
-    if msg.channel != "wecom" || !msg.reply_target.starts_with("group--") {
+    if !wecom_group_requires_sender_identity(msg) {
         return content.to_string();
     }
 
@@ -399,7 +403,7 @@ fn llm_user_content_with_sender_identity(msg: &traits::ChannelMessage, content: 
 }
 
 fn persisted_channel_user_content(msg: &traits::ChannelMessage, content: &str) -> String {
-    if msg.channel == "wecom" && msg.reply_target.starts_with("group--") {
+    if wecom_group_requires_sender_identity(msg) {
         return llm_user_content_with_sender_identity(msg, content);
     }
 
@@ -658,10 +662,14 @@ fn normalize_cached_channel_turns(turns: Vec<ChatMessage>) -> Vec<ChatMessage> {
 }
 
 fn supports_runtime_model_switch(channel_name: &str) -> bool {
-    matches!(channel_name, "telegram" | "discord" | "matrix")
+    matches!(channel_name, "telegram" | "discord" | "matrix" | "wecom")
 }
 
 fn parse_runtime_command(channel_name: &str, content: &str) -> Option<ChannelRuntimeCommand> {
+    if !supports_runtime_model_switch(channel_name) {
+        return None;
+    }
+
     let trimmed = content.trim();
     if !trimmed.starts_with('/') {
         return None;
@@ -676,8 +684,7 @@ fn parse_runtime_command(channel_name: &str, content: &str) -> Option<ChannelRun
         .to_ascii_lowercase();
 
     match base_command.as_str() {
-        "/new" => Some(ChannelRuntimeCommand::NewSession),
-        "/models" if supports_runtime_model_switch(channel_name) => {
+        "/models" => {
             if let Some(provider) = parts.next() {
                 Some(ChannelRuntimeCommand::SetProvider(
                     provider.trim().to_string(),
@@ -686,7 +693,7 @@ fn parse_runtime_command(channel_name: &str, content: &str) -> Option<ChannelRun
                 Some(ChannelRuntimeCommand::ShowProviders)
             }
         }
-        "/model" if supports_runtime_model_switch(channel_name) => {
+        "/model" => {
             let model = parts.collect::<Vec<_>>().join(" ").trim().to_string();
             if model.is_empty() {
                 Some(ChannelRuntimeCommand::ShowModel)
@@ -694,6 +701,7 @@ fn parse_runtime_command(channel_name: &str, content: &str) -> Option<ChannelRun
                 Some(ChannelRuntimeCommand::SetModel(model))
             }
         }
+        "/new" => Some(ChannelRuntimeCommand::NewSession),
         _ => None,
     }
 }
@@ -1826,16 +1834,19 @@ async fn process_channel_message(
         .unwrap_or_else(|e| e.into_inner())
         .get(&history_key)
         .is_some_and(|turns| !turns.is_empty());
-
-    let llm_user_content = llm_user_content_with_sender_identity(&msg, &msg.content);
-    let persisted_user_content = persisted_channel_user_content(&msg, &msg.content);
+    let wecom_group_sender_identity = wecom_group_requires_sender_identity(&msg);
 
     // Preserve user turn before the LLM call so interrupted requests keep context.
-    append_sender_turn(
-        ctx.as_ref(),
-        &history_key,
-        ChatMessage::user(&persisted_user_content),
-    );
+    if wecom_group_sender_identity {
+        let persisted_user_content = persisted_channel_user_content(&msg, &msg.content);
+        append_sender_turn(
+            ctx.as_ref(),
+            &history_key,
+            ChatMessage::user(&persisted_user_content),
+        );
+    } else {
+        append_sender_turn(ctx.as_ref(), &history_key, ChatMessage::user(&msg.content));
+    }
 
     // Build history from per-sender conversation cache.
     let prior_turns_raw = ctx
@@ -1847,25 +1858,31 @@ async fn process_channel_message(
         .unwrap_or_default();
     let mut prior_turns = normalize_cached_channel_turns(prior_turns_raw);
 
-    if let Some(last_turn) = prior_turns.last_mut() {
-        if last_turn.role == "user" {
-            if let Some(prefix) = last_turn.content.strip_suffix(&persisted_user_content) {
-                last_turn.content = format!("{prefix}{llm_user_content}");
-            } else {
-                last_turn.content = llm_user_content.clone();
+    if wecom_group_sender_identity {
+        let llm_user_content = llm_user_content_with_sender_identity(&msg, &msg.content);
+        let persisted_user_content = persisted_channel_user_content(&msg, &msg.content);
+        if let Some(last_turn) = prior_turns.last_mut() {
+            if last_turn.role == "user" {
+                if let Some(prefix) = last_turn.content.strip_suffix(&persisted_user_content) {
+                    last_turn.content = format!("{prefix}{llm_user_content}");
+                } else {
+                    last_turn.content = llm_user_content;
+                }
             }
+        }
+    }
 
-            // Only enrich with memory context when there is no prior conversation
-            // history. Follow-up turns already include context from previous messages.
-            if !had_prior_history {
-                let memory_context = build_memory_context(
-                    ctx.memory.as_ref(),
-                    &msg.content,
-                    ctx.min_relevance_score,
-                )
-                .await;
-                if !memory_context.is_empty() {
+    // Only enrich with memory context when there is no prior conversation
+    // history. Follow-up turns already include context from previous messages.
+    if !had_prior_history {
+        let memory_context =
+            build_memory_context(ctx.memory.as_ref(), &msg.content, ctx.min_relevance_score).await;
+        if let Some(last_turn) = prior_turns.last_mut() {
+            if last_turn.role == "user" && !memory_context.is_empty() {
+                if wecom_group_sender_identity {
                     last_turn.content = format!("{memory_context}{}", last_turn.content);
+                } else {
+                    last_turn.content = format!("{memory_context}{}", msg.content);
                 }
             }
         }
@@ -6169,12 +6186,12 @@ BTC is currently around $65,000 based on latest tool output."#
     }
 
     #[test]
-    fn parse_runtime_command_keeps_provider_switch_scoped_to_supported_channels() {
-        assert!(parse_runtime_command("wecom", "/models openrouter").is_none());
+    fn parse_runtime_command_scopes_provider_switch_to_supported_channels() {
         assert!(matches!(
-            parse_runtime_command("telegram", "/models openrouter"),
+            parse_runtime_command("wecom", "/models openrouter"),
             Some(ChannelRuntimeCommand::SetProvider(provider)) if provider == "openrouter"
         ));
+        assert!(parse_runtime_command("slack", "/models openrouter").is_none());
     }
 
     #[tokio::test]
@@ -6402,6 +6419,7 @@ BTC is currently around $65,000 based on latest tool output."#
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
+            tool_call_dedup_exempt: Arc::new(Vec::new()),
             model_routes: Arc::new(Vec::new()),
         });
 

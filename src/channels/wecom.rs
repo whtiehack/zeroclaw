@@ -575,11 +575,6 @@ impl WeComChannel {
 
         // Clear session
         if is_clear_session_command(&stop_text) {
-            let msg = "\u{4f1a}\u{8bdd}\u{5df2}\u{6e05}\u{9664}\u{ff0c}\u{5f00}\u{59cb}\u{65b0}\u{5bf9}\u{8bdd}\u{3002}";
-            let stream_id = next_stream_id();
-            let _ = self
-                .ws_send_respond_msg(&req_id, &stream_id, msg, true, &[])
-                .await;
             tracing::info!(
                 "WeCom session cleared: scope={} msg_id={}",
                 scopes.conversation_scope,
@@ -593,7 +588,7 @@ impl WeComChannel {
                     content: "/new".to_string(),
                     channel: "wecom".to_string(),
                     timestamp: bytes_timestamp_now(),
-                    thread_ts: None,
+                    thread_ts: Some(req_id),
                 })
                 .await;
             return;
@@ -616,6 +611,27 @@ impl WeComChannel {
                     channel: "wecom".to_string(),
                     timestamp: bytes_timestamp_now(),
                     thread_ts: None,
+                })
+                .await;
+            return;
+        }
+
+        if let Some(runtime_command) = extract_runtime_model_switch_command(&stop_text) {
+            tracing::info!(
+                "WeCom runtime command forwarded: scope={} msg_id={} command={}",
+                scopes.conversation_scope,
+                parsed.msg_id,
+                runtime_command
+            );
+            let _ = tx
+                .send(ChannelMessage {
+                    id: parsed.msg_id.clone(),
+                    sender: parsed.sender_userid.clone(),
+                    reply_target: scopes.conversation_scope.clone(),
+                    content: runtime_command,
+                    channel: "wecom".to_string(),
+                    timestamp: bytes_timestamp_now(),
+                    thread_ts: Some(req_id),
                 })
                 .await;
             return;
@@ -1270,25 +1286,15 @@ impl WeComChannel {
             AttachmentKind::File => Ok(format!("[Document: {}]", abs.display())),
         }
     }
-}
 
-// ── Channel trait impl ───────────────────────────────────────────────
-
-#[async_trait]
-impl Channel for WeComChannel {
-    fn name(&self) -> &str {
-        "wecom"
-    }
-
-    async fn send(&self, message: &SendMessage) -> Result<()> {
-        let scope = &message.recipient;
+    async fn send_markdown_chunks_to_scope(&self, scope: &str, content: &str) -> Result<()> {
         let (chat_type, chatid) = parse_scope(scope)?;
-        let chunks = split_markdown_chunks(&message.content);
+        let chunks = split_markdown_chunks(content);
 
         tracing::info!(
             "WeCom: sending message to scope={}, len={}, chunks={}",
             scope,
-            message.content.len(),
+            content.len(),
             chunks.len()
         );
 
@@ -1319,6 +1325,43 @@ impl Channel for WeComChannel {
         }
 
         Ok(())
+    }
+}
+
+// ── Channel trait impl ───────────────────────────────────────────────
+
+#[async_trait]
+impl Channel for WeComChannel {
+    fn name(&self) -> &str {
+        "wecom"
+    }
+
+    async fn send(&self, message: &SendMessage) -> Result<()> {
+        if let Some(req_id) = message
+            .thread_ts
+            .as_deref()
+            .filter(|req_id| !req_id.is_empty())
+        {
+            let stream_id = next_stream_id();
+            let (text_without_images, image_paths) = parse_image_markers(&message.content);
+            let images = prepare_stream_images(&image_paths).await;
+            let (stream_content, overflow) =
+                split_stream_content_and_overflow(&text_without_images);
+
+            self.ws_send_respond_msg(req_id, &stream_id, &stream_content, true, &images)
+                .await?;
+
+            if let Some(extra) = overflow {
+                let extra_msg = format!("[补充消息]\n{extra}");
+                self.send_markdown_chunks_to_scope(&message.recipient, &extra_msg)
+                    .await?;
+            }
+
+            return Ok(());
+        }
+
+        self.send_markdown_chunks_to_scope(&message.recipient, &message.content)
+            .await
     }
 
     async fn listen(&self, tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> Result<()> {
@@ -1922,6 +1965,21 @@ fn contains_stop_command(text: &str) -> bool {
 fn is_clear_session_command(text: &str) -> bool {
     let stripped = strip_edge_mentions(text);
     stripped.eq_ignore_ascii_case("/clear") || stripped.eq_ignore_ascii_case("/new")
+}
+
+fn extract_runtime_model_switch_command(text: &str) -> Option<String> {
+    let stripped = strip_edge_mentions(text);
+    if stripped.is_empty() || !stripped.starts_with('/') {
+        return None;
+    }
+
+    let command_token = stripped.split_whitespace().next()?;
+    let base_command = command_token.split('@').next().unwrap_or(command_token);
+    if base_command.eq_ignore_ascii_case("/model") || base_command.eq_ignore_ascii_case("/models") {
+        Some(stripped)
+    } else {
+        None
+    }
 }
 
 fn strip_edge_mentions(text: &str) -> String {
@@ -2653,6 +2711,32 @@ mod tests {
     }
 
     #[test]
+    fn runtime_model_switch_command_with_mentions() {
+        assert_eq!(
+            extract_runtime_model_switch_command("@bot /model gpt-5 @other"),
+            Some("/model gpt-5".to_string())
+        );
+        assert_eq!(
+            extract_runtime_model_switch_command("@bot /models openrouter"),
+            Some("/models openrouter".to_string())
+        );
+        assert_eq!(
+            extract_runtime_model_switch_command(" /MODEL@zeroclaw qwen-max "),
+            Some("/MODEL@zeroclaw qwen-max".to_string())
+        );
+    }
+
+    #[test]
+    fn runtime_model_switch_command_rejects_non_commands() {
+        assert_eq!(extract_runtime_model_switch_command("/new"), None);
+        assert_eq!(
+            extract_runtime_model_switch_command("please /model gpt-5"),
+            None
+        );
+        assert_eq!(extract_runtime_model_switch_command(""), None);
+    }
+
+    #[test]
     fn floor_char_boundary_handles_multibyte() {
         let s = "Hello \u{4f60}\u{597d}\u{4e16}\u{754c}";
         let boundary = floor_char_boundary(s, 8);
@@ -2794,6 +2878,116 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn send_with_req_id_uses_respond_msg_when_stream_mode_off() {
+        let mut cfg = test_wecom_config();
+        cfg.stream_mode = StreamMode::Off;
+        let channel = WeComChannel::new(&cfg, Path::new("/tmp")).unwrap();
+
+        let (ws_tx, mut ws_rx) = mpsc::channel::<WsOutbound>(4);
+        *channel.ws_tx.lock().await = Some(ws_tx);
+
+        let responder_channel = channel.clone();
+        let responder = tokio::spawn(async move {
+            let Some(WsOutbound::Frame(frame)) = ws_rx.recv().await else {
+                panic!("expected respond_msg frame");
+            };
+            let req_id = frame
+                .get("headers")
+                .and_then(|headers| headers.get("req_id"))
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            responder_channel
+                .maybe_handle_command_response(&serde_json::json!({
+                    "headers": { "req_id": req_id },
+                    "errcode": 0,
+                    "errmsg": "ok"
+                }))
+                .await;
+            frame
+        });
+
+        channel
+            .send(
+                &SendMessage::new("runtime ok", "user--zeroclaw_user")
+                    .in_thread(Some("req-runtime".to_string())),
+            )
+            .await
+            .unwrap();
+
+        let frame = responder.await.unwrap();
+        assert_eq!(
+            frame.get("cmd").and_then(Value::as_str),
+            Some("aibot_respond_msg")
+        );
+        assert_eq!(
+            frame
+                .get("headers")
+                .and_then(|headers| headers.get("req_id"))
+                .and_then(Value::as_str),
+            Some("req-runtime")
+        );
+        assert_eq!(
+            frame
+                .pointer("/body/stream/content")
+                .and_then(Value::as_str),
+            Some("runtime ok")
+        );
+        assert_eq!(
+            frame
+                .pointer("/body/stream/finish")
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+    }
+
+    #[tokio::test]
+    async fn send_without_req_id_uses_send_msg() {
+        let channel = WeComChannel::new(&test_wecom_config(), Path::new("/tmp")).unwrap();
+
+        let (ws_tx, mut ws_rx) = mpsc::channel::<WsOutbound>(4);
+        *channel.ws_tx.lock().await = Some(ws_tx);
+
+        let responder_channel = channel.clone();
+        let responder = tokio::spawn(async move {
+            let Some(WsOutbound::Frame(frame)) = ws_rx.recv().await else {
+                panic!("expected send_msg frame");
+            };
+            let req_id = frame
+                .get("headers")
+                .and_then(|headers| headers.get("req_id"))
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            responder_channel
+                .maybe_handle_command_response(&serde_json::json!({
+                    "headers": { "req_id": req_id },
+                    "errcode": 0,
+                    "errmsg": "ok"
+                }))
+                .await;
+            frame
+        });
+
+        channel
+            .send(&SendMessage::new("hello proactive", "user--zeroclaw_user"))
+            .await
+            .unwrap();
+
+        let frame = responder.await.unwrap();
+        assert_eq!(
+            frame.get("cmd").and_then(Value::as_str),
+            Some("aibot_send_msg")
+        );
+        assert_eq!(
+            frame
+                .pointer("/body/markdown/content")
+                .and_then(Value::as_str),
+            Some("hello proactive")
+        );
+    }
+
+    #[tokio::test]
     async fn command_response_resolves_waiter_successfully() {
         let config = test_wecom_config();
         let channel = WeComChannel::new(&config, Path::new("/tmp")).unwrap();
@@ -2841,6 +3035,82 @@ mod tests {
         let err = rx.await.unwrap().unwrap_err().to_string();
         assert!(err.contains("errcode=93001"));
         assert!(err.contains("session not allowed"));
+    }
+
+    #[tokio::test]
+    async fn handle_ws_message_consumes_command_ack_without_forwarding() {
+        let config = test_wecom_config();
+        let channel = WeComChannel::new(&config, Path::new("/tmp")).unwrap();
+
+        let (waiter, ack_rx) = tokio::sync::oneshot::channel();
+        channel
+            .pending_responses
+            .lock()
+            .await
+            .insert("req-ack".to_string(), waiter);
+
+        let (tx, mut rx) = mpsc::channel::<ChannelMessage>(1);
+        let should_reconnect = channel
+            .handle_ws_message(
+                serde_json::json!({
+                    "cmd": "aibot_respond_msg",
+                    "headers": { "req_id": "req-ack" },
+                    "errcode": 0,
+                    "errmsg": "ok"
+                }),
+                &tx,
+            )
+            .await;
+
+        assert!(!should_reconnect);
+        assert!(ack_rx.await.unwrap().is_ok());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), rx.recv())
+                .await
+                .is_err(),
+            "command ack must not be forwarded as an inbound channel message"
+        );
+    }
+
+    #[tokio::test]
+    async fn clear_command_forwards_runtime_new_session_without_immediate_ws_reply() {
+        let mut config = test_wecom_config();
+        config.allowed_users = vec!["zeroclaw_user".to_string()];
+        let channel = WeComChannel::new(&config, Path::new("/tmp")).unwrap();
+
+        let (ws_tx, mut ws_rx) = mpsc::channel::<WsOutbound>(1);
+        *channel.ws_tx.lock().await = Some(ws_tx);
+
+        let (tx, mut rx) = mpsc::channel::<ChannelMessage>(1);
+        channel
+            .handle_msg_callback(
+                serde_json::json!({
+                    "headers": { "req_id": "req-clear" },
+                    "body": {
+                        "msgtype": "text",
+                        "msgid": "msg-clear",
+                        "chattype": "single",
+                        "from": { "userid": "zeroclaw_user" },
+                        "text": { "content": "/clear" }
+                    }
+                }),
+                &tx,
+            )
+            .await;
+
+        let forwarded = tokio::time::timeout(Duration::from_millis(100), rx.recv())
+            .await
+            .expect("clear command should be forwarded promptly")
+            .expect("clear command should produce a framework message");
+        assert_eq!(forwarded.content, "/new");
+        assert_eq!(forwarded.thread_ts.as_deref(), Some("req-clear"));
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), ws_rx.recv())
+                .await
+                .is_err(),
+            "clear command should not emit an immediate websocket reply"
+        );
     }
 
     #[tokio::test]
