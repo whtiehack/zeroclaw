@@ -72,6 +72,16 @@ Branch/commit/PR rules:
 - Follow `.github/pull_request_template.md` fully.
 - Never commit secrets, personal data, or real identity information (see `@docs/contributing/pr-discipline.md`).
 
+### `master_wecom` 分支提交规则
+
+- `master_wecom` 是长期主开发分支，不等同于上游 `master`。
+- 所有提交都必须按“可独立 cherry-pick”拆分；一个 commit 只处理一个清晰主题，不能混合多个目的。
+- 可回馈上游的通用改动，必须单独提交；提交内容应尽量以“可从 `master_wecom` 直接 cherry-pick 到以上游 `master` 为 base 的分支”为标准整理。
+- 本地定制需求、个人工作流调整、仅服务 `master_wecom` 的分支特有改动，必须与上游通用改动分开提交。
+- `docs/master_wecom/` 目录只用于记录 `master_wecom` 分支专属的开发文档、操作记录和设计说明；该目录下的改动必须单独提交，不能和代码改动或上游通用文档混在同一个 commit 中。
+- 如果一次工作同时包含“上游通用改动”“本地定制改动”“`docs/master_wecom/` 文档”，至少拆成 3 个独立提交。
+- 准备给上游提 PR 时，应优先挑选上游通用提交；不要把 `docs/master_wecom/` 文档提交和本地定制提交一起带入上游 PR。
+
 ## Anti-Patterns
 
 - Do not add heavy dependencies for minor convenience.
