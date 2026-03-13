@@ -2674,12 +2674,7 @@ pub async fn run(
     ));
 
     // ── Memory (the brain) ────────────────────────────────────────
-    let mem: Arc<dyn Memory> = Arc::from(memory::create_memory_with_storage(
-        &config.memory,
-        Some(&config.storage.provider.config),
-        &config.workspace_dir,
-        config.api_key.as_deref(),
-    )?);
+    let mem: Arc<dyn Memory> = Arc::from(memory::create_memory_from_config(&config)?);
     let cron = crate::cron::current_log_fields();
     tracing::info!(
         backend = mem.name(),
@@ -3410,12 +3405,7 @@ pub async fn process_message_with_session(
         &config.autonomy,
         &config.workspace_dir,
     ));
-    let mem: Arc<dyn Memory> = Arc::from(memory::create_memory_with_storage(
-        &config.memory,
-        Some(&config.storage.provider.config),
-        &config.workspace_dir,
-        config.api_key.as_deref(),
-    )?);
+    let mem: Arc<dyn Memory> = Arc::from(memory::create_memory_from_config(&config)?);
 
     let (composio_key, composio_entity_id) = if config.composio.enabled {
         (

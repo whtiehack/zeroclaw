@@ -38,7 +38,7 @@ pub use traits::Memory;
 #[allow(unused_imports)]
 pub use traits::{MemoryCategory, MemoryEntry};
 
-use crate::config::{EmbeddingRouteConfig, MemoryConfig, StorageProviderConfig};
+use crate::config::{Config, EmbeddingRouteConfig, MemoryConfig, StorageProviderConfig};
 use anyhow::Context;
 use std::path::Path;
 use std::sync::Arc;
@@ -208,6 +208,17 @@ pub fn create_memory_with_storage(
     api_key: Option<&str>,
 ) -> anyhow::Result<Box<dyn Memory>> {
     create_memory_with_storage_and_routes(config, &[], storage_provider, workspace_dir, api_key)
+}
+
+/// Factory: create memory from the full application config, including embedding routes.
+pub fn create_memory_from_config(config: &Config) -> anyhow::Result<Box<dyn Memory>> {
+    create_memory_with_storage_and_routes(
+        &config.memory,
+        &config.embedding_routes,
+        Some(&config.storage.provider.config),
+        &config.workspace_dir,
+        config.api_key.as_deref(),
+    )
 }
 
 /// Factory: create memory with optional storage-provider override and embedding routes.
@@ -721,5 +732,46 @@ mod tests {
                 api_key: Some("base-key".into()),
             }
         );
+    }
+
+    #[tokio::test]
+    async fn create_memory_from_config_uses_embedding_routes() {
+        let tmp = TempDir::new().unwrap();
+        let config = Config {
+            workspace_dir: tmp.path().to_path_buf(),
+            embedding_routes: vec![EmbeddingRouteConfig {
+                hint: "semantic".into(),
+                provider: "none".into(),
+                model: "unused".into(),
+                dimensions: Some(1),
+                api_key: None,
+            }],
+            memory: MemoryConfig {
+                backend: "sqlite".into(),
+                embedding_provider: "custom:http://127.0.0.1:9/v1".into(),
+                embedding_model: "hint:semantic".into(),
+                embedding_dimensions: 1024,
+                ..MemoryConfig::default()
+            },
+            ..Config::default()
+        };
+
+        let memory = create_memory_from_config(&config).unwrap();
+        memory
+            .store(
+                "route-check",
+                "embedding route applied",
+                MemoryCategory::Conversation,
+                None,
+            )
+            .await
+            .expect("route-backed noop embedder should avoid network failures");
+
+        let recalled = memory
+            .recall("embedding route applied", 5, None)
+            .await
+            .expect("keyword recall should still work");
+        assert_eq!(recalled.len(), 1);
+        assert_eq!(recalled[0].key, "route-check");
     }
 }

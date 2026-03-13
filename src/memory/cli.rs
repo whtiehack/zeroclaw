@@ -307,7 +307,7 @@ async fn handle_reindex(config: &Config, yes: bool, progress: bool) -> Result<()
     use std::sync::Arc;
 
     // Reindex requires full memory backend with embeddings
-    let mem = super::create_memory(&config.memory, &config.workspace_dir, None)?;
+    let mem = super::create_memory_from_config(config)?;
 
     // Get total count for confirmation
     let total = mem.count().await?;
