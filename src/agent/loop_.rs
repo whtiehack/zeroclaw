@@ -124,9 +124,36 @@ fn filter_primary_agent_tools_or_fail(
 fn retain_visible_tool_descriptions<'a>(
     tool_descs: &mut Vec<(&'a str, &'a str)>,
     tools_registry: &[Box<dyn Tool>],
+    excluded_tools: &[String],
 ) {
     let visible_tools: HashSet<&str> = tools_registry.iter().map(|tool| tool.name()).collect();
     tool_descs.retain(|(name, _)| visible_tools.contains(*name));
+    if !excluded_tools.is_empty() {
+        tool_descs.retain(|(name, _)| !excluded_tools.iter().any(|excluded| excluded == name));
+    }
+}
+
+fn effective_runtime_excluded_tools(config: &Config, channel_name: &str) -> Vec<String> {
+    if channel_name == "cli" {
+        Vec::new()
+    } else {
+        config.autonomy.non_cli_excluded_tools.clone()
+    }
+}
+
+fn filtered_tool_specs_for_runtime(
+    tools_registry: &[Box<dyn Tool>],
+    excluded_tools: &[String],
+) -> Vec<crate::tools::ToolSpec> {
+    tools_registry
+        .iter()
+        .filter(|tool| {
+            !excluded_tools
+                .iter()
+                .any(|excluded| excluded == tool.name())
+        })
+        .map(|tool| tool.spec())
+        .collect()
 }
 
 fn should_treat_provider_as_vision_capable(provider_name: &str, provider: &dyn Provider) -> bool {
@@ -995,8 +1022,10 @@ pub(crate) async fn agent_turn(
     model: &str,
     temperature: f64,
     silent: bool,
+    channel_name: &str,
     multimodal_config: &crate::config::MultimodalConfig,
     max_tool_iterations: usize,
+    excluded_tools: &[String],
 ) -> Result<String> {
     TOOL_LOOP_CANARY_TOKENS_ENABLED
         .scope(
@@ -1011,13 +1040,13 @@ pub(crate) async fn agent_turn(
                 temperature,
                 silent,
                 None,
-                "channel",
+                channel_name,
                 multimodal_config,
                 max_tool_iterations,
                 None,
                 None,
                 None,
-                &[],
+                excluded_tools,
             ),
         )
         .await
@@ -2914,7 +2943,9 @@ pub async fn run(
             "Query connected hardware for reported GPIO pins and LED pin. Use when: user asks what pins are available.",
         ));
     }
-    retain_visible_tool_descriptions(&mut tool_descs, &tools_registry);
+    let channel_name = if interactive { "cli" } else { "daemon" };
+    let excluded_tools = effective_runtime_excluded_tools(&config, channel_name);
+    retain_visible_tool_descriptions(&mut tool_descs, &tools_registry, &excluded_tools);
     let bootstrap_max_chars = if config.agent.compact_context {
         Some(6000)
     } else {
@@ -2934,7 +2965,8 @@ pub async fn run(
 
     // Append structured tool-use instructions with schemas (only for non-native providers)
     if !native_tools {
-        system_prompt.push_str(&build_tool_instructions(&tools_registry));
+        let filtered_specs = filtered_tool_specs_for_runtime(&tools_registry, &excluded_tools);
+        system_prompt.push_str(&build_tool_instructions_from_specs(&filtered_specs));
     }
     system_prompt.push_str(&build_shell_policy_instructions(&config.autonomy));
 
@@ -2947,8 +2979,6 @@ pub async fn run(
     } else {
         None
     };
-    let channel_name = if interactive { "cli" } else { "daemon" };
-
     // ── Execute ──────────────────────────────────────────────────
     let start = Instant::now();
     let cost_enforcement_context =
@@ -3023,7 +3053,7 @@ pub async fn run(
                             None,
                             None,
                             effective_hooks,
-                            &[],
+                            &excluded_tools,
                         ),
                     ),
                 ),
@@ -3252,7 +3282,7 @@ pub async fn run(
                                 None,
                                 None,
                                 effective_hooks,
-                                &[],
+                                &excluded_tools,
                             ),
                         ),
                     ),
@@ -3536,7 +3566,8 @@ pub async fn process_message_with_session(
             "Query connected hardware for reported GPIO pins and LED pin. Use when user asks what pins are available.",
         ));
     }
-    retain_visible_tool_descriptions(&mut tool_descs, &tools_registry);
+    let excluded_tools = effective_runtime_excluded_tools(&config, "channel");
+    retain_visible_tool_descriptions(&mut tool_descs, &tools_registry, &excluded_tools);
     let bootstrap_max_chars = if config.agent.compact_context {
         Some(6000)
     } else {
@@ -3554,7 +3585,8 @@ pub async fn process_message_with_session(
         config.skills.prompt_injection_mode,
     );
     if !native_tools {
-        system_prompt.push_str(&build_tool_instructions(&tools_registry));
+        let filtered_specs = filtered_tool_specs_for_runtime(&tools_registry, &excluded_tools);
+        system_prompt.push_str(&build_tool_instructions_from_specs(&filtered_specs));
     }
     system_prompt.push_str(&build_shell_policy_instructions(&config.autonomy));
 
@@ -3606,8 +3638,10 @@ pub async fn process_message_with_session(
                 &model_name,
                 config.default_temperature,
                 true,
+                "channel",
                 &config.multimodal,
                 config.agent.max_tool_iterations,
+                &excluded_tools,
             ),
         ),
     )
@@ -6543,6 +6577,36 @@ Tail"#;
         assert!(instructions.contains("shell"));
         assert!(instructions.contains("file_read"));
         assert!(instructions.contains("file_write"));
+    }
+
+    #[test]
+    fn effective_runtime_excluded_tools_only_applies_to_non_cli() {
+        let config = Config::default();
+
+        assert!(effective_runtime_excluded_tools(&config, "cli").is_empty());
+        assert_eq!(
+            effective_runtime_excluded_tools(&config, "daemon"),
+            config.autonomy.non_cli_excluded_tools
+        );
+        assert_eq!(
+            effective_runtime_excluded_tools(&config, "channel"),
+            config.autonomy.non_cli_excluded_tools
+        );
+    }
+
+    #[test]
+    fn filtered_tool_specs_for_runtime_omits_excluded_tools() {
+        use crate::security::SecurityPolicy;
+        let security = Arc::new(SecurityPolicy::from_config(
+            &crate::config::AutonomyConfig::default(),
+            std::path::Path::new("/tmp"),
+        ));
+        let tools = tools::default_tools(security);
+        let filtered = filtered_tool_specs_for_runtime(&tools, &["shell".to_string()]);
+        let tool_names: Vec<&str> = filtered.iter().map(|spec| spec.name.as_str()).collect();
+
+        assert!(!tool_names.contains(&"shell"));
+        assert!(tool_names.contains(&"file_read"));
     }
 
     #[test]
