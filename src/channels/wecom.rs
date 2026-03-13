@@ -360,7 +360,7 @@ impl WeComChannel {
         let message = build_access_denied_message(inbound, decision);
         let stream_id = next_stream_id();
         if let Err(err) = self
-            .ws_send_respond_msg(req_id, &stream_id, &message, true, &[])
+            .ws_queue_respond_msg(req_id, &stream_id, &message, true, &[])
             .await
         {
             tracing::warn!(
@@ -374,14 +374,13 @@ impl WeComChannel {
     }
 
     /// Send an `aibot_respond_msg` streaming frame.
-    async fn ws_send_respond_msg(
-        &self,
+    fn build_respond_msg_frame(
         req_id: &str,
         stream_id: &str,
         content: &str,
         finish: bool,
         images: &[StreamImageItem],
-    ) -> Result<()> {
+    ) -> Value {
         let stream_obj = serde_json::json!({
             "id": stream_id,
             "finish": finish,
@@ -398,14 +397,37 @@ impl WeComChannel {
                 "WeCom WS stream replies do not currently support msg_item images; dropping images"
             );
         }
-        let frame = serde_json::json!({
+        serde_json::json!({
             "cmd": "aibot_respond_msg",
             "headers": { "req_id": req_id },
             "body": {
                 "msgtype": "stream",
                 "stream": stream_obj,
             },
-        });
+        })
+    }
+
+    async fn ws_queue_respond_msg(
+        &self,
+        req_id: &str,
+        stream_id: &str,
+        content: &str,
+        finish: bool,
+        images: &[StreamImageItem],
+    ) -> Result<()> {
+        let frame = Self::build_respond_msg_frame(req_id, stream_id, content, finish, images);
+        self.ws_send_frame(frame).await
+    }
+
+    async fn ws_send_respond_msg(
+        &self,
+        req_id: &str,
+        stream_id: &str,
+        content: &str,
+        finish: bool,
+        images: &[StreamImageItem],
+    ) -> Result<()> {
+        let frame = Self::build_respond_msg_frame(req_id, stream_id, content, finish, images);
         if req_id.is_empty() {
             return self.ws_send_frame(frame).await;
         }
@@ -478,7 +500,13 @@ impl WeComChannel {
 
         match cmd {
             "aibot_msg_callback" => {
-                self.handle_msg_callback(frame, tx).await;
+                // Keep the WS loop responsive while callback handling waits on
+                // framework backpressure or local control-path replies.
+                let channel = self.clone();
+                let tx = tx.clone();
+                tokio::spawn(async move {
+                    channel.handle_msg_callback(frame, &tx).await;
+                });
                 false
             }
             "aibot_event_callback" => self.handle_event_callback(frame).await,
@@ -600,7 +628,7 @@ impl WeComChannel {
                 "\u{5df2}\u{505c}\u{6b62}\u{5f53}\u{524d}\u{6d88}\u{606f}\u{5904}\u{7406}\u{3002}";
             let stream_id = next_stream_id();
             let _ = self
-                .ws_send_respond_msg(&req_id, &stream_id, msg, true, &[])
+                .ws_queue_respond_msg(&req_id, &stream_id, msg, true, &[])
                 .await;
             let _ = tx
                 .send(ChannelMessage {
@@ -645,7 +673,7 @@ impl WeComChannel {
             );
             let stream_id = next_stream_id();
             let _ = self
-                .ws_send_respond_msg(&req_id, &stream_id, &msg, true, &[])
+                .ws_queue_respond_msg(&req_id, &stream_id, &msg, true, &[])
                 .await;
             return;
         }
@@ -679,7 +707,7 @@ impl WeComChannel {
                     );
                     let stream_id = next_stream_id();
                     let _ = channel_self
-                        .ws_send_respond_msg(&req_id, &stream_id, &msg, true, &[])
+                        .ws_queue_respond_msg(&req_id, &stream_id, &msg, true, &[])
                         .await;
                     return;
                 }
@@ -687,7 +715,7 @@ impl WeComChannel {
                     let msg = "\u{6682}\u{4e0d}\u{652f}\u{6301}\u{8be5}\u{6d88}\u{606f}\u{7c7b}\u{578b}\u{3002}";
                     let stream_id = next_stream_id();
                     let _ = channel_self
-                        .ws_send_respond_msg(&req_id, &stream_id, msg, true, &[])
+                        .ws_queue_respond_msg(&req_id, &stream_id, msg, true, &[])
                         .await;
                     return;
                 }
@@ -3114,6 +3142,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn clear_command_ws_dispatch_does_not_block_when_framework_queue_is_full() {
+        let mut config = test_wecom_config();
+        config.allowed_users = vec!["zeroclaw_user".to_string()];
+        let channel = WeComChannel::new(&config, Path::new("/tmp")).unwrap();
+
+        let (tx, mut rx) = mpsc::channel::<ChannelMessage>(1);
+        tx.send(ChannelMessage {
+            id: "prefill-clear".to_string(),
+            sender: "tester".to_string(),
+            reply_target: "user--zeroclaw_user".to_string(),
+            content: "prefill".to_string(),
+            channel: "wecom".to_string(),
+            timestamp: bytes_timestamp_now(),
+            thread_ts: None,
+        })
+        .await
+        .unwrap();
+
+        let should_reconnect = tokio::time::timeout(
+            Duration::from_millis(100),
+            channel.handle_ws_message(
+                serde_json::json!({
+                    "cmd": "aibot_msg_callback",
+                    "headers": { "req_id": "req-clear-dispatch" },
+                    "body": {
+                        "msgtype": "text",
+                        "msgid": "msg-clear-dispatch",
+                        "chattype": "single",
+                        "from": { "userid": "zeroclaw_user" },
+                        "text": { "content": "/clear" }
+                    }
+                }),
+                &tx,
+            ),
+        )
+        .await
+        .expect("clear dispatch should not block the websocket loop");
+
+        assert!(!should_reconnect);
+
+        let first = tokio::time::timeout(Duration::from_millis(100), rx.recv())
+            .await
+            .expect("prefilled framework message should be readable")
+            .expect("prefilled framework message should exist");
+        assert_eq!(first.id, "prefill-clear");
+
+        let forwarded = tokio::time::timeout(Duration::from_millis(100), rx.recv())
+            .await
+            .expect("clear command should forward once queue space is available")
+            .expect("clear command should produce a framework message");
+        assert_eq!(forwarded.content, "/new");
+        assert_eq!(forwarded.thread_ts.as_deref(), Some("req-clear-dispatch"));
+    }
+
+    #[tokio::test]
     async fn unauthorized_group_message_replies_with_chatid_and_does_not_forward() {
         let config = test_wecom_config();
         let channel = WeComChannel::new(&config, Path::new("/tmp")).unwrap();
@@ -3176,6 +3259,151 @@ mod tests {
         assert!(denied.contains("zeroclaw_group"));
         assert!(denied.contains("zeroclaw_user"));
         assert!(denied.contains("allowed_groups"));
+    }
+
+    #[tokio::test]
+    async fn unauthorized_message_ws_dispatch_returns_without_waiting_for_ack() {
+        let config = test_wecom_config();
+        let channel = WeComChannel::new(&config, Path::new("/tmp")).unwrap();
+
+        let (ws_tx, mut ws_rx) = mpsc::channel::<WsOutbound>(4);
+        *channel.ws_tx.lock().await = Some(ws_tx);
+
+        let (tx, mut rx) = mpsc::channel::<ChannelMessage>(1);
+        let should_reconnect = tokio::time::timeout(
+            Duration::from_millis(100),
+            channel.handle_ws_message(
+                serde_json::json!({
+                    "cmd": "aibot_msg_callback",
+                    "headers": { "req_id": "req-denied-no-ack" },
+                    "body": {
+                        "msgtype": "text",
+                        "msgid": "msg-denied-no-ack",
+                        "chattype": "single",
+                        "from": { "userid": "zeroclaw_user" },
+                        "text": { "content": "@bot hello" }
+                    }
+                }),
+                &tx,
+            ),
+        )
+        .await
+        .expect("access-denied dispatch should not block on websocket ack");
+
+        assert!(!should_reconnect);
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), rx.recv())
+                .await
+                .is_err(),
+            "unauthorized message must not reach framework"
+        );
+
+        let Some(WsOutbound::Frame(frame)) =
+            tokio::time::timeout(Duration::from_millis(100), ws_rx.recv())
+                .await
+                .expect("access-denied reply should be queued promptly")
+        else {
+            panic!("expected access-denied response frame");
+        };
+
+        assert_eq!(
+            frame.get("cmd").and_then(Value::as_str),
+            Some("aibot_respond_msg")
+        );
+        assert_eq!(
+            frame
+                .get("headers")
+                .and_then(|headers| headers.get("req_id"))
+                .and_then(Value::as_str),
+            Some("req-denied-no-ack")
+        );
+        assert!(
+            frame
+                .pointer("/body/stream/content")
+                .and_then(Value::as_str)
+                .is_some_and(|content| content.contains("allowed_users")),
+            "access-denied reply should explain how to configure the allowlist"
+        );
+    }
+
+    #[tokio::test]
+    async fn stop_command_ws_dispatch_returns_without_waiting_for_ack() {
+        let mut config = test_wecom_config();
+        config.allowed_users = vec!["zeroclaw_user".to_string()];
+        let channel = WeComChannel::new(&config, Path::new("/tmp")).unwrap();
+
+        let (ws_tx, mut ws_rx) = mpsc::channel::<WsOutbound>(4);
+        *channel.ws_tx.lock().await = Some(ws_tx);
+
+        let (tx, mut rx) = mpsc::channel::<ChannelMessage>(1);
+        tx.send(ChannelMessage {
+            id: "prefill-stop".to_string(),
+            sender: "tester".to_string(),
+            reply_target: "user--zeroclaw_user".to_string(),
+            content: "prefill".to_string(),
+            channel: "wecom".to_string(),
+            timestamp: bytes_timestamp_now(),
+            thread_ts: None,
+        })
+        .await
+        .unwrap();
+
+        let should_reconnect = tokio::time::timeout(
+            Duration::from_millis(100),
+            channel.handle_ws_message(
+                serde_json::json!({
+                    "cmd": "aibot_msg_callback",
+                    "headers": { "req_id": "req-stop-dispatch" },
+                    "body": {
+                        "msgtype": "text",
+                        "msgid": "msg-stop-dispatch",
+                        "chattype": "single",
+                        "from": { "userid": "zeroclaw_user" },
+                        "text": { "content": "/stop" }
+                    }
+                }),
+                &tx,
+            ),
+        )
+        .await
+        .expect("stop dispatch should not block on websocket ack");
+
+        assert!(!should_reconnect);
+
+        let Some(WsOutbound::Frame(frame)) =
+            tokio::time::timeout(Duration::from_millis(100), ws_rx.recv())
+                .await
+                .expect("stop reply should be queued promptly")
+        else {
+            panic!("expected stop response frame");
+        };
+
+        assert_eq!(
+            frame.get("cmd").and_then(Value::as_str),
+            Some("aibot_respond_msg")
+        );
+        assert_eq!(
+            frame
+                .pointer("/body/stream/content")
+                .and_then(Value::as_str),
+            Some(
+                "\u{5df2}\u{505c}\u{6b62}\u{5f53}\u{524d}\u{6d88}\u{606f}\u{5904}\u{7406}\u{3002}"
+            )
+        );
+
+        let first = tokio::time::timeout(Duration::from_millis(100), rx.recv())
+            .await
+            .expect("prefilled framework message should be readable")
+            .expect("prefilled framework message should exist");
+        assert_eq!(first.id, "prefill-stop");
+
+        let forwarded = tokio::time::timeout(Duration::from_millis(100), rx.recv())
+            .await
+            .expect("stop command should reset the runtime session once queue space is available")
+            .expect("stop command should produce a framework message");
+        assert_eq!(forwarded.content, "/new");
+        assert_eq!(forwarded.thread_ts, None);
     }
 
     #[tokio::test]
