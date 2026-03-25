@@ -52,3 +52,4 @@ lcov.info
 
 # Wrangler cache
 .wrangler/
+.ace-tool/
