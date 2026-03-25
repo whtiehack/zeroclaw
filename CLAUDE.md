@@ -2,6 +2,7 @@
 
 > **Shared instructions live in [`AGENTS.md`](./AGENTS.md).**
 > This file contains only Claude Code-specific directives.
+> On `temp/upstream-master-wecom-port`, read [`docs/master_wecom/session-bootstrap.md`](./docs/master_wecom/session-bootstrap.md) before editing.
 
 ## Claude Code Settings
 
