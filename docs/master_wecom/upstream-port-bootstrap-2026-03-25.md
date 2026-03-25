@@ -75,7 +75,7 @@
 
 ### 阶段 2：最小接入 `wecom_ws`
 
-状态：进行中
+状态：已完成
 
 - 先让 `wecom_ws` 以最小可编译形式接入 channel registry 和配置层
 - 再补齐核心收发链路，不预先搬运非必要增强
@@ -101,7 +101,7 @@
 
 ### 阶段 3：补必要公共层差异
 
-状态：进行中
+状态：已完成
 
 - 只处理 `wecom_ws` 无法工作的公共层缺口
 - 优先补配置接线、注册入口、必要 runtime hook
@@ -117,16 +117,17 @@
   - native tools 模式下跳过重复 tools summary
   - `disable_shell_policy` 配置、schema、security policy、shell tool 验证链路已接回
   - OpenAI-compatible transport error 不再触发 `/responses` fallback
+  - prompt 时间上下文已拆分：系统提示仅保留当前日期和时区偏移，消息入历史前继续保留精确本地时间戳 `[{now}]`
+  - 工具调用日志增强已补回：`execute_one_tool` 现在记录脱敏后的参数、执行时长、成功输出或失败原因
 - 当前仍缺且值得继续做的公共层差异：
-  - 暂无明确阻塞 `wecom_ws` 工作的高优先公共层缺口
+  - 暂无
 - 当前保留为低优先级观察项：
-  - prompt 时间上下文拆分
-  - 工具调用日志增强
-- 当前判断：阶段 3 主干缺口已基本完成；后续只在验证或真实使用暴露问题时，再决定是否继续搬运低优先级补丁
+  - 继续观察是否需要把本地 `disable_shell_policy` 语义同步到 prompt summary
+- 当前判断：阶段 3 列出的公共层差异已全部完成；后续只在真实使用暴露问题时再新增迁移项
 
 ### 阶段 4：验证与收口
 
-状态：进行中
+状态：已完成
 
 - 先跑最小范围验证，再决定是否跑全量
 - 对失败项先区分是迁移缺口、上游现有问题还是环境问题
@@ -134,12 +135,13 @@
 
 2026-03-25 当前验证补充：
 
-- 已跑 `cargo test`
-- 当前失败项与本轮 `wecom_ws` 迁移无直接关系：
-  - `providers::bedrock::tests::bearer_token_precedence`
-  - `providers::bedrock::tests::chat_fails_without_credentials`
-- 当前分支相对 `upstream/master` 未修改 `src/providers/bedrock.rs`
-- 因此当前进入后续迁移时，应把 `bedrock` 失败视为上游基线问题或独立问题，不阻塞 `wecom_ws` 后续公共层补丁判断
+- 已补充通过：
+  - `cargo test execute_one_tool --lib`
+  - `cargo test scrub_credentials --lib`
+  - `cargo test date_section_includes_date_and_offset --lib`
+  - `cargo test build_channel_system_prompt_rewrites_datetime_section_to_date_only --lib`
+  - `cargo test enriched_prompt_includes_tools_workspace_datetime --lib`
+  - `cargo test prompt_contains_all_sections --lib`
 - 本轮 `non_cli_excluded_tools` 补丁已补充通过：
   - `cargo fmt --all -- --check`
   - `cargo clippy --all-targets -- -D warnings`
@@ -157,6 +159,14 @@
   - `cargo fmt --all -- --check`
   - `cargo clippy --all-targets -- -D warnings`
   - `cargo test transport_error_does_not_attempt_responses_fallback --lib`
+- 本轮时间上下文拆分与工具日志增强补丁已补充通过：
+  - `cargo fmt --all -- --check`
+  - `cargo clippy --all-targets -- -D warnings`
+  - `cargo test`
+- 全量回归过程中额外对齐了一条旧测试断言：
+  - `agent::loop_::tests::native_tools_system_prompt_contains_zero_xml`
+  - 原因是该测试仍要求 native tools prompt 显式列出工具名，与当前“native tools 模式跳过重复 tools summary”的既有语义不一致
+- 当前分支最新状态：`cargo test` 已全量通过
 
 ## 5. 当前已知优先级
 
@@ -166,8 +176,7 @@
 
 ### P1
 
-- prompt 时间上下文拆分
-- 工具调用日志增强
+- 暂无
 
 ### P2
 
