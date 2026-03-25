@@ -721,6 +721,23 @@ fn build_channel_system_prompt(
         prompt.push_str(&context);
     }
 
+    if channel_name == "wecom_ws" && !reply_target.is_empty() {
+        let chat_type = if reply_target.starts_with("group--") {
+            "group"
+        } else {
+            "single"
+        };
+        let mut lines = vec![
+            "\n\n[WECOM_WS_STATIC_CONTEXT_V1]".to_string(),
+            format!("chat_type={chat_type}"),
+            format!("conversation_scope={reply_target}"),
+        ];
+        if let Some(userid) = reply_target.strip_prefix("user--") {
+            lines.push(format!("sender_userid={userid}"));
+        }
+        prompt.push_str(&lines.join("\n"));
+    }
+
     prompt
 }
 
@@ -8189,6 +8206,23 @@ BTC is currently around $65,000 based on latest tool output."#
         assert!(!prompt.contains("## Current Date & Time\n\n"));
         assert!(!prompt.contains("10:11:12"));
         assert!(prompt.contains("## Runtime"));
+    }
+
+    #[test]
+    fn build_channel_system_prompt_includes_wecom_group_static_context() {
+        let prompt = build_channel_system_prompt("Base", "wecom_ws", "group--project-room");
+        assert!(prompt.contains("[WECOM_WS_STATIC_CONTEXT_V1]"));
+        assert!(prompt.contains("chat_type=group"));
+        assert!(prompt.contains("conversation_scope=group--project-room"));
+    }
+
+    #[test]
+    fn build_channel_system_prompt_includes_wecom_single_static_context() {
+        let prompt = build_channel_system_prompt("Base", "wecom_ws", "user--zeroclaw_user");
+        assert!(prompt.contains("[WECOM_WS_STATIC_CONTEXT_V1]"));
+        assert!(prompt.contains("chat_type=single"));
+        assert!(prompt.contains("conversation_scope=user--zeroclaw_user"));
+        assert!(prompt.contains("sender_userid=zeroclaw_user"));
     }
 
     #[test]
