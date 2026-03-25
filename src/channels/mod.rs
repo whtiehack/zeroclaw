@@ -483,8 +483,13 @@ fn conversation_memory_key(msg: &traits::ChannelMessage) -> String {
 }
 
 fn conversation_history_key(msg: &traits::ChannelMessage) -> String {
-    // Include reply_target for per-channel isolation (e.g. distinct Discord/Slack
-    // channels) and thread_ts for per-topic isolation in forum groups.
+    // For most channels thread_ts identifies a real thread/topic and should
+    // isolate history. wecom_ws reuses thread_ts as a transport req_id, so it
+    // must be ignored there or every inbound message becomes a new session.
+    if msg.channel == "wecom_ws" {
+        return format!("{}_{}_{}", msg.channel, msg.reply_target, msg.sender);
+    }
+
     match &msg.thread_ts {
         Some(tid) => format!(
             "{}_{}_{}_{}",
@@ -8810,6 +8815,37 @@ BTC is currently around $65,000 based on latest tool output."#
     }
 
     #[test]
+    fn conversation_history_key_wecom_ws_ignores_req_id_thread_ts() {
+        let msg_a = traits::ChannelMessage {
+            id: "msg_a".into(),
+            sender: "group--g1".into(),
+            reply_target: "group--g1".into(),
+            content: "hello".into(),
+            channel: "wecom_ws".into(),
+            timestamp: 1,
+            thread_ts: Some("req-1".into()),
+            interruption_scope_id: None,
+            attachments: vec![],
+        };
+        let msg_b = traits::ChannelMessage {
+            id: "msg_b".into(),
+            sender: "group--g1".into(),
+            reply_target: "group--g1".into(),
+            content: "follow up".into(),
+            channel: "wecom_ws".into(),
+            timestamp: 2,
+            thread_ts: Some("req-2".into()),
+            interruption_scope_id: None,
+            attachments: vec![],
+        };
+
+        assert_eq!(
+            conversation_history_key(&msg_a),
+            conversation_history_key(&msg_b)
+        );
+    }
+
+    #[test]
     fn followup_thread_id_prefers_thread_ts() {
         let msg = traits::ChannelMessage {
             id: "slack_C123_1741234567.123456".into(),
@@ -9090,6 +9126,107 @@ BTC is currently around $65,000 based on latest tool output."#
         assert_eq!(calls[1][1].0, "user");
         assert_eq!(calls[1][2].0, "assistant");
         assert_eq!(calls[1][3].0, "user");
+        assert!(calls[1][1].1.contains("hello"));
+        assert!(calls[1][2].1.contains("response-1"));
+        assert!(calls[1][3].1.contains("follow up"));
+    }
+
+    #[tokio::test]
+    async fn process_channel_message_restores_wecom_ws_history_across_req_ids() {
+        let provider_impl = Arc::new(HistoryCaptureProvider::default());
+
+        let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            channels_by_name: Arc::new(HashMap::new()),
+            provider: provider_impl.clone(),
+            default_provider: Arc::new("test-provider".to_string()),
+            memory: Arc::new(NoopMemory),
+            tools_registry: Arc::new(vec![]),
+            observer: Arc::new(NoopObserver),
+            system_prompt: Arc::new("test-system-prompt".to_string()),
+            model: Arc::new("test-model".to_string()),
+            temperature: 0.0,
+            auto_save_memory: false,
+            max_tool_iterations: 5,
+            min_relevance_score: 0.0,
+            conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
+            provider_cache: Arc::new(Mutex::new(HashMap::new())),
+            route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            api_key: None,
+            api_url: None,
+            reliability: Arc::new(crate::config::ReliabilityConfig::default()),
+            provider_runtime_options: providers::ProviderRuntimeOptions::default(),
+            workspace_dir: Arc::new(std::env::temp_dir()),
+            prompt_config: Arc::new(crate::config::Config::default()),
+            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            interrupt_on_new_message: InterruptOnNewMessageConfig {
+                telegram: false,
+                slack: false,
+                discord: false,
+                mattermost: false,
+                matrix: false,
+            },
+            multimodal: crate::config::MultimodalConfig::default(),
+            media_pipeline: crate::config::MediaPipelineConfig::default(),
+            transcription_config: crate::config::TranscriptionConfig::default(),
+            hooks: None,
+            non_cli_excluded_tools: Arc::new(Vec::new()),
+            autonomy_level: AutonomyLevel::default(),
+            tool_call_dedup_exempt: Arc::new(Vec::new()),
+            model_routes: Arc::new(Vec::new()),
+            query_classification: crate::config::QueryClassificationConfig::default(),
+            ack_reactions: true,
+            show_tool_calls: true,
+            session_store: None,
+            approval_manager: Arc::new(ApprovalManager::for_non_interactive(
+                &crate::config::AutonomyConfig::default(),
+            )),
+            activated_tools: None,
+            cost_tracking: None,
+            pacing: crate::config::PacingConfig::default(),
+        });
+
+        process_channel_message(
+            runtime_ctx.clone(),
+            traits::ChannelMessage {
+                id: "msg-a".to_string(),
+                sender: "group--zeroclaw_group".to_string(),
+                reply_target: "group--zeroclaw_group".to_string(),
+                content: "[sender_userid=u1] hello".to_string(),
+                channel: "wecom_ws".to_string(),
+                timestamp: 1,
+                thread_ts: Some("req-a".to_string()),
+                interruption_scope_id: None,
+                attachments: vec![],
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+        process_channel_message(
+            runtime_ctx,
+            traits::ChannelMessage {
+                id: "msg-b".to_string(),
+                sender: "group--zeroclaw_group".to_string(),
+                reply_target: "group--zeroclaw_group".to_string(),
+                content: "[sender_userid=u1] follow up".to_string(),
+                channel: "wecom_ws".to_string(),
+                timestamp: 2,
+                thread_ts: Some("req-b".to_string()),
+                interruption_scope_id: None,
+                attachments: vec![],
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+        let calls = provider_impl
+            .calls
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].len(), 2);
+        assert_eq!(calls[1].len(), 4);
         assert!(calls[1][1].1.contains("hello"));
         assert!(calls[1][2].1.contains("response-1"));
         assert!(calls[1][3].1.contains("follow up"));
