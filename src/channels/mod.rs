@@ -667,6 +667,17 @@ fn channel_delivery_instructions(channel_name: &str) -> Option<&'static str> {
              - Voice supports .wav, .mp3, .silk formats only. Other audio formats use [DOCUMENT:]\n\
              - Keep normal text outside markers and never wrap markers in code fences.\n",
         ),
+        "wecom_ws" => Some(
+            "When responding on WeCom WS (企业微信长连接):\n\
+             - Use standard markdown for formatting: **bold**, *italic*, `code`, code blocks, lists, links.\n\
+             - Be concise and direct. Skip filler phrases.\n\
+             - Structure longer answers clearly.\n\
+             - For media attachments use markers: [IMAGE:<absolute-path>], [FILE:<absolute-path>], [VOICE:<absolute-path>], or [VIDEO:<absolute-path>]\n\
+             - You may also reply with a single absolute local file path by itself to send that file directly.\n\
+             - Use local absolute paths (or file:///absolute/path) only; do not use remote URLs.\n\
+             - Keep normal text outside markers and never wrap markers in code fences.\n\
+             - Use tool results silently: answer the latest user message directly, and do not narrate delayed/internal tool execution bookkeeping.",
+        ),
         _ => None,
     }
 }
@@ -8223,6 +8234,14 @@ BTC is currently around $65,000 based on latest tool output."#
         assert!(prompt.contains("chat_type=single"));
         assert!(prompt.contains("conversation_scope=user--zeroclaw_user"));
         assert!(prompt.contains("sender_userid=zeroclaw_user"));
+    }
+
+    #[test]
+    fn build_channel_system_prompt_includes_wecom_delivery_instructions() {
+        let prompt = build_channel_system_prompt("Base", "wecom_ws", "group--project-room");
+        assert!(prompt.contains("When responding on WeCom WS"));
+        assert!(prompt.contains("[IMAGE:<absolute-path>]"));
+        assert!(prompt.contains("single absolute local file path"));
     }
 
     #[test]
