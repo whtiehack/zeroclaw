@@ -115,13 +115,13 @@
 - 已完成迁移：
   - `non_cli_excluded_tools` 在 channel 路径的非 CLI `full` 模式继续生效
   - native tools 模式下跳过重复 tools summary
+  - `disable_shell_policy` 配置、schema、security policy、shell tool 验证链路已接回
 - 当前仍缺且值得继续做的公共层差异：
-  - `disable_shell_policy` 配置开关
   - OpenAI-compatible transport error 不应触发 `/responses` fallback
 - 当前保留为低优先级观察项：
   - prompt 时间上下文拆分
   - 工具调用日志增强
-- 当前判断：阶段 3 下一步转入 `disable_shell_policy`，因为该配置项在旧分支里已有明确使用语义，而当前上游基线完全缺失 schema 与 policy 接线
+- 当前判断：阶段 3 下一步转入 OpenAI-compatible transport error fallback 收紧，因为当前上游仍会在 transport error 时误触发 `/responses` fallback
 
 ### 阶段 4：验证与收口
 
@@ -147,21 +147,26 @@
   - `cargo fmt --all -- --check`
   - `cargo clippy --all-targets -- -D warnings`
   - `cargo test native_tools_prompt_skips_duplicate_tools_summary --lib`
+- 本轮 `disable_shell_policy` 补丁已补充通过：
+  - `cargo fmt --all -- --check`
+  - `cargo clippy --all-targets -- -D warnings`
+  - `cargo test disable_shell_policy --lib`
+  - `cargo test shell_policy_disabled --lib`
 
 ## 5. 当前已知优先级
 
 ### P0
 
-- `disable_shell_policy` 开关
+- OpenAI-compatible transport error fallback 收紧
 
 ### P1
 
-- OpenAI-compatible transport error fallback 收紧
+- prompt 时间上下文拆分
+- 工具调用日志增强
 
 ### P2
 
-- prompt 时间上下文拆分
-- 工具调用日志增强
+- 继续观察是否需要把本地 `disable_shell_policy` 语义同步到 prompt summary
 
 ## 6. 禁止事项
 
