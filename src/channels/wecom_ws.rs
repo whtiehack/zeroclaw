@@ -33,6 +33,7 @@ const WECOM_STREAM_CONFLICT_MAX_RETRIES: usize = 3;
 const WECOM_STREAM_CONFLICT_RETRY_BASE_MILLIS: u64 = 150;
 const WECOM_EXPIRED_STREAM_REQ_TTL_SECS: u64 = 3600;
 const WECOM_DRAFT_UPDATE_MAX_LINES: usize = 10;
+const WECOM_POSTCLEAR_DRAFT_UPDATE_INTERVAL_MILLIS: u64 = 1200;
 
 const WECOM_MARKDOWN_MAX_BYTES: usize = 20_480;
 const WECOM_MARKDOWN_CHUNK_BYTES: usize = 8_000;
@@ -213,6 +214,7 @@ struct StreamDraftState {
     preclear_body: String,
     preclear_content: String,
     after_clear: bool,
+    after_clear_last_flush_at: Option<Instant>,
 }
 
 // ── MediaDecryptor (per-attachment AES key) ──────────────────────────
@@ -543,6 +545,15 @@ impl WeComWsChannel {
     }
 
     fn note_progress_update(&self, message_id: &str, text: &str) -> Option<String> {
+        self.note_progress_update_at(message_id, text, Instant::now())
+    }
+
+    fn note_progress_update_at(
+        &self,
+        message_id: &str,
+        text: &str,
+        now: Instant,
+    ) -> Option<String> {
         let mut states = self.draft_states.lock();
         let state = states.entry(message_id.to_string()).or_default();
 
@@ -550,6 +561,7 @@ impl WeComWsChannel {
             state.preclear_body.clear();
             state.preclear_content.clear();
             state.after_clear = true;
+            state.after_clear_last_flush_at = Some(now);
             return None;
         }
 
@@ -561,12 +573,30 @@ impl WeComWsChannel {
         Some(render_wecom_preclear_draft_body(&state.preclear_body))
     }
 
-    fn note_content_update(&self, message_id: &str, content: &str) -> String {
+    fn note_content_update(&self, message_id: &str, content: &str) -> Option<String> {
+        self.note_content_update_at(message_id, content, Instant::now())
+    }
+
+    fn note_content_update_at(
+        &self,
+        message_id: &str,
+        content: &str,
+        now: Instant,
+    ) -> Option<String> {
         let mut states = self.draft_states.lock();
         let state = states.entry(message_id.to_string()).or_default();
 
         if state.after_clear {
-            return sanitize_outbound_draft_content(content);
+            let should_flush = state.after_clear_last_flush_at.is_none_or(|last_flush_at| {
+                now.duration_since(last_flush_at)
+                    >= Duration::from_millis(WECOM_POSTCLEAR_DRAFT_UPDATE_INTERVAL_MILLIS)
+            });
+            if !should_flush {
+                return None;
+            }
+
+            state.after_clear_last_flush_at = Some(now);
+            return Some(sanitize_outbound_draft_content(content));
         }
 
         let delta = content
@@ -578,7 +608,7 @@ impl WeComWsChannel {
             state.preclear_body.push_str(delta);
         }
 
-        render_wecom_preclear_draft_body(&state.preclear_body)
+        Some(render_wecom_preclear_draft_body(&state.preclear_body))
     }
 
     async fn fail_pending_responses(&self, reason: &str) {
@@ -2244,7 +2274,9 @@ impl Channel for WeComWsChannel {
             self.clear_draft_state(message_id);
             return Ok(());
         }
-        let draft_content = self.note_content_update(message_id, content);
+        let Some(draft_content) = self.note_content_update(message_id, content) else {
+            return Ok(());
+        };
         match self
             .ws_send_respond_msg(&req_id, message_id, &draft_content, false)
             .await
@@ -3595,28 +3627,52 @@ mod tests {
     #[test]
     fn draft_state_merges_progress_and_preclear_content_until_clear() {
         let channel = WeComWsChannel::new(&test_wecom_ws_config(), Path::new("/tmp")).unwrap();
+        let now = Instant::now();
         channel
             .draft_states
             .lock()
             .insert("stream-1".to_string(), StreamDraftState::default());
 
         let progress = channel
-            .note_progress_update("stream-1", "⏳ shell: ls -la\n")
+            .note_progress_update_at("stream-1", "⏳ shell: ls -la\n", now)
             .expect("progress should render");
         assert!(progress.contains("shell: ls -la"));
 
-        let merged = channel.note_content_update("stream-1", "Task started.\n");
+        let merged = channel
+            .note_content_update_at("stream-1", "Task started.\n", now)
+            .expect("pre-clear content should render");
         assert!(merged.contains("shell: ls -la"));
         assert!(merged.contains("Task started."));
 
         assert!(
             channel
-                .note_progress_update("stream-1", super::super::WECOM_WS_DRAFT_CLEAR_SENTINEL)
+                .note_progress_update_at(
+                    "stream-1",
+                    super::super::WECOM_WS_DRAFT_CLEAR_SENTINEL,
+                    now,
+                )
                 .is_none(),
             "clear sentinel should reset local draft state without emitting a body"
         );
 
-        let final_body = channel.note_content_update("stream-1", "Final answer");
+        assert!(
+            channel
+                .note_content_update_at(
+                    "stream-1",
+                    "Final answer",
+                    now + Duration::from_millis(200),
+                )
+                .is_none(),
+            "post-clear content should wait for the throttling interval"
+        );
+
+        let final_body = channel
+            .note_content_update_at(
+                "stream-1",
+                "Final answer",
+                now + Duration::from_millis(WECOM_POSTCLEAR_DRAFT_UPDATE_INTERVAL_MILLIS + 1),
+            )
+            .expect("post-clear content should render after the throttling interval");
         assert_eq!(final_body, "Final answer");
     }
 
@@ -4987,9 +5043,92 @@ mod tests {
                 .draft_states
                 .lock()
                 .get("stream-clear")
-                .is_some_and(|state| state.after_clear),
+                .is_some_and(|state| {
+                    state.after_clear && state.after_clear_last_flush_at.is_some()
+                }),
             "clear sentinel should flip the local draft state into final mode"
         );
+    }
+
+    #[tokio::test]
+    async fn update_draft_throttles_post_clear_content_until_interval() {
+        let config = test_wecom_ws_config();
+        let channel = WeComWsChannel::new(&config, Path::new("/tmp")).unwrap();
+
+        let (tx, mut rx) = mpsc::channel::<WsOutbound>(4);
+        *channel.ws_tx.lock().await = Some(tx);
+        channel
+            .req_id_map
+            .lock()
+            .insert("stream-postclear".to_string(), "req-postclear".to_string());
+        channel.draft_states.lock().insert(
+            "stream-postclear".to_string(),
+            StreamDraftState {
+                after_clear: true,
+                after_clear_last_flush_at: Some(Instant::now()),
+                ..StreamDraftState::default()
+            },
+        );
+
+        channel
+            .update_draft("user--zeroclaw_user", "stream-postclear", "tiny")
+            .await
+            .unwrap();
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), rx.recv())
+                .await
+                .is_err(),
+            "post-clear content should not emit a websocket frame before the throttling interval"
+        );
+
+        channel
+            .draft_states
+            .lock()
+            .entry("stream-postclear".to_string())
+            .and_modify(|state| {
+                state.after_clear_last_flush_at = Some(
+                    Instant::now()
+                        - Duration::from_millis(WECOM_POSTCLEAR_DRAFT_UPDATE_INTERVAL_MILLIS + 1),
+                );
+            });
+
+        let updater = {
+            let channel = channel.clone();
+            tokio::spawn(async move {
+                channel
+                    .update_draft(
+                        "user--zeroclaw_user",
+                        "stream-postclear",
+                        "final answer body",
+                    )
+                    .await
+            })
+        };
+
+        let Some(WsOutbound::Frame(frame)) =
+            tokio::time::timeout(Duration::from_millis(250), rx.recv())
+                .await
+                .expect("post-clear content should send a frame after the throttling interval")
+        else {
+            panic!("expected respond_msg frame");
+        };
+        assert_eq!(
+            frame
+                .pointer("/body/stream/content")
+                .and_then(Value::as_str),
+            Some("final answer body")
+        );
+
+        channel
+            .maybe_handle_command_response(&serde_json::json!({
+                "headers": { "req_id": frame_req_id(&frame) },
+                "errcode": 0,
+                "errmsg": "ok"
+            }))
+            .await;
+
+        updater.await.unwrap().unwrap();
     }
 
     #[tokio::test]
