@@ -215,6 +215,21 @@
    - 下一步：
      - 继续按真实使用反馈补漏，不扩大 `mod.rs` 对 `wecom_ws` 的特判面
 
+6. 已完成：`wecom_ws` 在 `clear` 之后改为按时间窗节流刷新最终答案草稿
+   - 修改：
+     - `wecom_ws` 本地 draft state 新增 post-clear flush 时间记录
+     - 收到 clear sentinel 后，最终答案阶段不再每个 content 增量都立刻推送
+     - 改为在 `wecom_ws` 内部按约 1.2 秒时间窗刷新一次，最后仍由 `finalize_draft()` 发 `finish=true`
+   - 原因：
+     - 上游 `DraftEvent::Content` 颗粒度较细，`clear` 后继续逐块推送会在企业微信侧形成高频小段刷屏
+     - 这类节流只影响 `wecom_ws` 的展示体验，适合留在通道层本地处理，不继续扩散到公共 draft 框架
+   - 验证：
+     - `cargo test wecom_ws --lib`
+   - 当前剩余：
+     - 暂无新的 `wecom_ws` 草稿流缺口
+   - 下一步：
+     - 根据真实测试结果再调整时间窗，不改动公共层接口
+
 ### 阶段 4：验证与收口
 
 状态：已完成
