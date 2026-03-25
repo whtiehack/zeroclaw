@@ -116,12 +116,13 @@
   - `non_cli_excluded_tools` 在 channel 路径的非 CLI `full` 模式继续生效
   - native tools 模式下跳过重复 tools summary
   - `disable_shell_policy` 配置、schema、security policy、shell tool 验证链路已接回
+  - OpenAI-compatible transport error 不再触发 `/responses` fallback
 - 当前仍缺且值得继续做的公共层差异：
-  - OpenAI-compatible transport error 不应触发 `/responses` fallback
+  - 暂无明确阻塞 `wecom_ws` 工作的高优先公共层缺口
 - 当前保留为低优先级观察项：
   - prompt 时间上下文拆分
   - 工具调用日志增强
-- 当前判断：阶段 3 下一步转入 OpenAI-compatible transport error fallback 收紧，因为当前上游仍会在 transport error 时误触发 `/responses` fallback
+- 当前判断：阶段 3 主干缺口已基本完成；后续只在验证或真实使用暴露问题时，再决定是否继续搬运低优先级补丁
 
 ### 阶段 4：验证与收口
 
@@ -152,12 +153,16 @@
   - `cargo clippy --all-targets -- -D warnings`
   - `cargo test disable_shell_policy --lib`
   - `cargo test shell_policy_disabled --lib`
+- 本轮 provider transport error fallback 收紧已补充通过：
+  - `cargo fmt --all -- --check`
+  - `cargo clippy --all-targets -- -D warnings`
+  - `cargo test transport_error_does_not_attempt_responses_fallback --lib`
 
 ## 5. 当前已知优先级
 
 ### P0
 
-- OpenAI-compatible transport error fallback 收紧
+- 暂无新的 P0 公共层缺口
 
 ### P1
 
