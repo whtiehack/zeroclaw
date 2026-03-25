@@ -101,37 +101,60 @@
 
 ### 阶段 3：补必要公共层差异
 
-状态：待执行
+状态：进行中
 
 - 只处理 `wecom_ws` 无法工作的公共层缺口
 - 优先补配置接线、注册入口、必要 runtime hook
 - 对公共层补丁逐条说明“为什么上游现状不够”
 
+2026-03-25 当前判定：
+
+- 上游已覆盖，无需重搬：
+  - tool-call 文本 relay
+  - draft sender 显式 `drop(delta_tx)` 收口
+- 当前仍缺且值得继续做的公共层差异：
+  - `non_cli_excluded_tools` 在 `AutonomyLevel::Full` 的非 CLI 通道仍应生效
+  - native tools 模式下跳过重复 tools summary
+  - `disable_shell_policy` 配置开关
+  - OpenAI-compatible transport error 不应触发 `/responses` fallback
+- 当前保留为低优先级观察项：
+  - prompt 时间上下文拆分
+  - 工具调用日志增强
+- 当前判断：阶段 3 下一步先做 `non_cli_excluded_tools`，因为它直接影响 `wecom_ws` 这类非 CLI 长连接通道在 `full` 模式下的工具暴露和执行边界
+
 ### 阶段 4：验证与收口
 
-状态：待执行
+状态：进行中
 
 - 先跑最小范围验证，再决定是否跑全量
 - 对失败项先区分是迁移缺口、上游现有问题还是环境问题
 - 形成新的同步记录或迁移记录，避免再次回到口头判断
 
+2026-03-25 当前验证补充：
+
+- 已跑 `cargo test`
+- 当前失败项与本轮 `wecom_ws` 迁移无直接关系：
+  - `providers::bedrock::tests::bearer_token_precedence`
+  - `providers::bedrock::tests::chat_fails_without_credentials`
+- 当前分支相对 `upstream/master` 未修改 `src/providers/bedrock.rs`
+- 因此当前进入后续迁移时，应把 `bedrock` 失败视为上游基线问题或独立问题，不阻塞 `wecom_ws` 后续公共层补丁判断
+
 ## 5. 当前已知优先级
 
 ### P0
 
-- `wecom_ws` 通道本体
-- `wecom_ws` 配置 schema 和注册入口
-- `cron -> wecom_ws` 的最小必要接线
+- `non_cli_excluded_tools` 在非 CLI `full` 模式生效
+- native tools 模式去掉重复 tools summary
 
 ### P1
 
-- `wecom_ws` 的 stop / interrupt
-- 附件标记出站
-- 流式草稿过期兜底
+- `disable_shell_policy` 开关
+- OpenAI-compatible transport error fallback 收紧
 
 ### P2
 
-- 仅在验证期暴露缺口时，再评估是否恢复 `disable_shell_policy`、日志增强、prompt 时间上下文等公共层补丁
+- prompt 时间上下文拆分
+- 工具调用日志增强
 
 ## 6. 禁止事项
 
