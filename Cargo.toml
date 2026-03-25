@@ -71,6 +71,9 @@ prometheus = { version = "0.14", default-features = false, optional = true }
 # Base64 encoding (screenshots, image data)
 base64 = "0.22"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+md5 = "0.7"
+aes = "0.8"
+cbc = "0.1"
 
 # URL encoding for web search
 urlencoding = "2.1"

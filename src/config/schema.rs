@@ -6076,6 +6076,8 @@ pub struct ChannelsConfig {
     pub dingtalk: Option<DingTalkConfig>,
     /// WeCom (WeChat Enterprise) Bot Webhook channel configuration.
     pub wecom: Option<WeComConfig>,
+    /// WeCom AI Bot WebSocket channel configuration.
+    pub wecom_ws: Option<WeComWsConfig>,
     /// QQ Official Bot channel configuration.
     pub qq: Option<QQConfig>,
     /// X/Twitter channel configuration.
@@ -6202,6 +6204,10 @@ impl ChannelsConfig {
                 self.wecom.is_some(),
             ),
             (
+                Box::new(ConfigWrapper::new(self.wecom_ws.as_ref())),
+                self.wecom_ws.is_some(),
+            ),
+            (
                 Box::new(ConfigWrapper::new(self.qq.as_ref())),
                 self.qq.is_some()
             ),
@@ -6272,6 +6278,7 @@ impl Default for ChannelsConfig {
             feishu: None,
             dingtalk: None,
             wecom: None,
+            wecom_ws: None,
             qq: None,
             twitter: None,
             mochat: None,
@@ -7569,6 +7576,62 @@ impl ChannelConfig for WeComConfig {
     }
     fn desc() -> &'static str {
         "WeCom Bot Webhook"
+    }
+}
+
+fn default_wecom_ws_file_retention_days() -> u32 {
+    7
+}
+
+fn default_wecom_ws_max_file_size_mb() -> u64 {
+    20
+}
+
+fn default_wecom_ws_history_max_turns() -> usize {
+    50
+}
+
+fn default_wecom_ws_stream_mode() -> StreamMode {
+    StreamMode::Partial
+}
+
+/// WeCom AI Bot WebSocket configuration.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct WeComWsConfig {
+    /// Bot ID for WeCom WebSocket subscription.
+    pub bot_id: String,
+    /// Secret for WeCom WebSocket subscription authentication.
+    pub secret: String,
+    /// Allowed WeCom user IDs. Empty = deny all, "*" = allow all users.
+    #[serde(default)]
+    pub allowed_users: Vec<String>,
+    /// Allowed WeCom group chat IDs. Empty = deny all groups, "*" = allow all groups.
+    #[serde(default)]
+    pub allowed_groups: Vec<String>,
+    /// File retention days for downloaded WeCom attachments under workspace cache.
+    #[serde(default = "default_wecom_ws_file_retention_days")]
+    pub file_retention_days: u32,
+    /// Maximum accepted file size (MiB) for WeCom attachment download attempts.
+    #[serde(default = "default_wecom_ws_max_file_size_mb")]
+    pub max_file_size_mb: u64,
+    /// Maximum retained turns per WeCom conversation scope.
+    #[serde(default = "default_wecom_ws_history_max_turns")]
+    pub history_max_turns: usize,
+    /// When true, a newer WeCom WS message from the same sender in the same conversation
+    /// cancels the in-flight request and starts a fresh response with preserved history.
+    #[serde(default)]
+    pub interrupt_on_new_message: bool,
+    /// Streaming mode for progressive draft delivery over the WeCom long connection.
+    #[serde(default = "default_wecom_ws_stream_mode")]
+    pub stream_mode: StreamMode,
+}
+
+impl ChannelConfig for WeComWsConfig {
+    fn name() -> &'static str {
+        "WeCom WS"
+    }
+    fn desc() -> &'static str {
+        "WeCom AI Bot (WebSocket)"
     }
 }
 
@@ -9117,6 +9180,13 @@ impl Config {
                     "config.channels_config.wecom.webhook_key",
                 )?;
             }
+            if let Some(ref mut wc_ws) = config.channels_config.wecom_ws {
+                decrypt_secret(
+                    &store,
+                    &mut wc_ws.secret,
+                    "config.channels_config.wecom_ws.secret",
+                )?;
+            }
             if let Some(ref mut qq) = config.channels_config.qq {
                 decrypt_secret(
                     &store,
@@ -10584,6 +10654,13 @@ impl Config {
                 "config.channels_config.wecom.webhook_key",
             )?;
         }
+        if let Some(ref mut wc_ws) = config_to_save.channels_config.wecom_ws {
+            encrypt_secret(
+                &store,
+                &mut wc_ws.secret,
+                "config.channels_config.wecom_ws.secret",
+            )?;
+        }
         if let Some(ref mut qq) = config_to_save.channels_config.qq {
             encrypt_secret(
                 &store,
@@ -11324,6 +11401,7 @@ auto_save = true
                 feishu: None,
                 dingtalk: None,
                 wecom: None,
+                wecom_ws: None,
                 qq: None,
                 twitter: None,
                 mochat: None,
@@ -12347,6 +12425,7 @@ allowed_users = ["@ops:matrix.org"]
             feishu: None,
             dingtalk: None,
             wecom: None,
+            wecom_ws: None,
             qq: None,
             twitter: None,
             mochat: None,
@@ -12713,6 +12792,7 @@ channel_ids = ["C123", "D456"]
             feishu: None,
             dingtalk: None,
             wecom: None,
+            wecom_ws: None,
             qq: None,
             twitter: None,
             mochat: None,

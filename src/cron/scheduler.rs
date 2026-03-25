@@ -3,8 +3,8 @@ use crate::channels::MatrixChannel;
 #[cfg(feature = "whatsapp-web")]
 use crate::channels::WhatsAppWebChannel;
 use crate::channels::{
-    Channel, DiscordChannel, MattermostChannel, QQChannel, SendMessage, SignalChannel,
-    SlackChannel, TelegramChannel,
+    get_live_channel, Channel, DiscordChannel, MattermostChannel, QQChannel, SendMessage,
+    SignalChannel, SlackChannel, TelegramChannel,
 };
 use crate::config::schema::{CronJobDecl, CronScheduleDecl};
 use crate::config::Config;
@@ -569,6 +569,20 @@ pub(crate) async fn deliver_announcement(
             #[cfg(not(feature = "channel-matrix"))]
             {
                 anyhow::bail!("matrix delivery channel requires `channel-matrix` feature");
+            }
+        }
+        "wecom_ws" => {
+            config
+                .channels_config
+                .wecom_ws
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("wecom_ws channel not configured"))?;
+            if let Some(live_channel) = get_live_channel("wecom_ws") {
+                live_channel
+                    .send(&SendMessage::new(safe_output.as_str(), target))
+                    .await?;
+            } else {
+                anyhow::bail!("wecom_ws channel is not connected");
             }
         }
         "whatsapp" | "whatsapp-web" | "whatsapp_web" => {

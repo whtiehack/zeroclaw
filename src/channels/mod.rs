@@ -56,6 +56,7 @@ pub mod voice_wake;
 pub mod wati;
 pub mod webhook;
 pub mod wecom;
+pub mod wecom_ws;
 pub mod whatsapp;
 #[cfg(feature = "whatsapp-web")]
 pub mod whatsapp_storage;
@@ -99,6 +100,7 @@ pub use voice_wake::VoiceWakeChannel;
 pub use wati::WatiChannel;
 pub use webhook::WebhookChannel;
 pub use wecom::WeComChannel;
+pub use wecom_ws::WeComWsChannel;
 pub use whatsapp::WhatsAppChannel;
 #[cfg(feature = "whatsapp-web")]
 pub use whatsapp_web::WhatsAppWebChannel;
@@ -229,6 +231,31 @@ const CHANNEL_HOOK_MAX_OUTBOUND_CHARS: usize = 20_000;
 
 type ProviderCacheMap = Arc<Mutex<HashMap<String, Arc<dyn Provider>>>>;
 type RouteSelectionMap = Arc<Mutex<HashMap<String, ChannelRouteSelection>>>;
+
+fn live_channels_registry() -> &'static Mutex<HashMap<String, Arc<dyn Channel>>> {
+    static STORE: OnceLock<Mutex<HashMap<String, Arc<dyn Channel>>>> = OnceLock::new();
+    STORE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn register_live_channels(channels_by_name: &HashMap<String, Arc<dyn Channel>>) {
+    let mut guard = live_channels_registry()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    guard.clear();
+    guard.extend(
+        channels_by_name
+            .iter()
+            .map(|(name, channel)| (name.clone(), Arc::clone(channel))),
+    );
+}
+
+pub(crate) fn get_live_channel(name: &str) -> Option<Arc<dyn Channel>> {
+    live_channels_registry()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(name)
+        .cloned()
+}
 
 fn effective_channel_message_timeout_secs(configured: u64) -> u64 {
     configured.max(MIN_CHANNEL_MESSAGE_TIMEOUT_SECS)
@@ -749,7 +776,10 @@ fn strip_tool_summary_prefix(text: &str) -> String {
 }
 
 fn supports_runtime_model_switch(channel_name: &str) -> bool {
-    matches!(channel_name, "telegram" | "discord" | "matrix" | "slack")
+    matches!(
+        channel_name,
+        "telegram" | "discord" | "matrix" | "slack" | "wecom_ws"
+    )
 }
 
 fn parse_runtime_command(channel_name: &str, content: &str) -> Option<ChannelRuntimeCommand> {
@@ -3311,7 +3341,14 @@ async fn run_message_dispatch_loop(
             let _permit = permit;
             let interrupt_enabled = worker_ctx
                 .interrupt_on_new_message
-                .enabled_for_channel(msg.channel.as_str());
+                .enabled_for_channel(msg.channel.as_str())
+                || (msg.channel == "wecom_ws"
+                    && worker_ctx
+                        .prompt_config
+                        .channels_config
+                        .wecom_ws
+                        .as_ref()
+                        .is_some_and(|wc| wc.interrupt_on_new_message));
             let sender_scope_key = interruption_scope_key(&msg);
             let cancellation_token = CancellationToken::new();
             let completion = Arc::new(InFlightTaskCompletion::new());
@@ -4077,7 +4114,7 @@ struct ConfiguredChannel {
 fn collect_configured_channels(
     config: &Config,
     matrix_skip_context: &str,
-) -> Vec<ConfiguredChannel> {
+) -> Result<Vec<ConfiguredChannel>> {
     let _ = matrix_skip_context;
     let mut channels = Vec::new();
 
@@ -4497,6 +4534,13 @@ fn collect_configured_channels(
         });
     }
 
+    if let Some(ref wc_ws) = config.channels_config.wecom_ws {
+        channels.push(ConfiguredChannel {
+            display_name: "WeCom WS",
+            channel: Arc::new(WeComWsChannel::new(wc_ws, &config.workspace_dir)?),
+        });
+    }
+
     if let Some(ref ct) = config.channels_config.clawdtalk {
         channels.push(ConfiguredChannel {
             display_name: "ClawdTalk",
@@ -4580,13 +4624,13 @@ fn collect_configured_channels(
         });
     }
 
-    channels
+    Ok(channels)
 }
 
 /// Run health checks for configured channels.
 pub async fn doctor_channels(config: Config) -> Result<()> {
     #[allow(unused_mut)]
-    let mut channels = collect_configured_channels(&config, "health check");
+    let mut channels = collect_configured_channels(&config, "health check")?;
 
     #[cfg(feature = "channel-nostr")]
     if let Some(ref ns) = config.channels_config.nostr {
@@ -4942,7 +4986,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
     // Collect active channels from a shared builder to keep startup and doctor parity.
     #[allow(unused_mut)]
     let mut channels: Vec<Arc<dyn Channel>> =
-        collect_configured_channels(&config, "runtime startup")
+        collect_configured_channels(&config, "runtime startup")?
             .into_iter()
             .map(|configured| configured.channel)
             .collect();
@@ -5013,6 +5057,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
             .map(|ch| (ch.name().to_string(), Arc::clone(ch)))
             .collect::<HashMap<_, _>>(),
     );
+    register_live_channels(channels_by_name.as_ref());
 
     // Populate the reaction tool's channel map now that channels are initialized.
     if let Some(ref handle) = reaction_handle_ch {
@@ -9527,7 +9572,7 @@ This is an example JSON object for profile settings."#;
             proxy_url: None,
         });
 
-        let channels = collect_configured_channels(&config, "test");
+        let channels = collect_configured_channels(&config, "test").unwrap();
 
         assert!(channels
             .iter()
@@ -10545,6 +10590,26 @@ This is an example JSON object for profile settings."#;
             matrix: false,
         };
         assert!(!cfg.enabled_for_channel("discord"));
+    }
+
+    #[test]
+    fn parse_runtime_command_allows_new_session_and_models_for_wecom_ws() {
+        assert_eq!(
+            parse_runtime_command("wecom_ws", "/new"),
+            Some(ChannelRuntimeCommand::NewSession)
+        );
+        assert_eq!(
+            parse_runtime_command("wecom_ws", "/models"),
+            Some(ChannelRuntimeCommand::ShowProviders)
+        );
+        assert_eq!(
+            parse_runtime_command("wecom_ws", "/model claude-sonnet"),
+            Some(ChannelRuntimeCommand::SetModel("claude-sonnet".to_string()))
+        );
+        assert_eq!(
+            parse_runtime_command("wecom_ws", "/config"),
+            Some(ChannelRuntimeCommand::ShowConfig)
+        );
     }
 
     // ── interruption_scope_key tests ──────────────────────────────────────
