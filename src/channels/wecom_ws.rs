@@ -5,6 +5,7 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use base64::Engine as _;
 use cbc::cipher::{block_padding::NoPadding, BlockDecryptMut, KeyIvInit};
+use chrono::Local;
 use futures_util::{SinkExt, StreamExt};
 use md5 as md5_crate;
 use parking_lot::Mutex;
@@ -800,7 +801,7 @@ impl WeComWsChannel {
             let _ = tx
                 .send(ChannelMessage {
                     id: parsed.msg_id.clone(),
-                    sender: parsed.sender_userid.clone(),
+                    sender: framework_sender_identity(&parsed, &scopes),
                     reply_target: scopes.conversation_scope.clone(),
                     content: "/new".to_string(),
                     channel: "wecom_ws".to_string(),
@@ -814,11 +815,11 @@ impl WeComWsChannel {
         }
 
         // Stop command
-        if contains_stop_command(&stop_text) {
+        if is_stop_runtime_command(&stop_text) {
             let _ = tx
                 .send(ChannelMessage {
                     id: parsed.msg_id.clone(),
-                    sender: parsed.sender_userid.clone(),
+                    sender: framework_sender_identity(&parsed, &scopes),
                     reply_target: scopes.conversation_scope.clone(),
                     content: "/stop".to_string(),
                     channel: "wecom_ws".to_string(),
@@ -841,7 +842,7 @@ impl WeComWsChannel {
             let _ = tx
                 .send(ChannelMessage {
                     id: parsed.msg_id.clone(),
-                    sender: parsed.sender_userid.clone(),
+                    sender: framework_sender_identity(&parsed, &scopes),
                     reply_target: scopes.conversation_scope.clone(),
                     content: runtime_command,
                     channel: "wecom_ws".to_string(),
@@ -911,7 +912,7 @@ impl WeComWsChannel {
                 NormalizedMessage::Ready(content) => content,
             };
 
-            let composed = compose_content_for_framework(&inbound, &content);
+            let composed = compose_content_for_framework(&inbound, &scopes, &content);
 
             tracing::info!(
                 "WeCom: forwarding to framework: msg_id={} req_id={} scope={}",
@@ -923,7 +924,7 @@ impl WeComWsChannel {
             let _ = tx
                 .send(ChannelMessage {
                     id: inbound.msg_id.clone(),
-                    sender: inbound.sender_userid.clone(),
+                    sender: framework_sender_identity(&inbound, &scopes),
                     reply_target: scopes.conversation_scope.clone(),
                     content: composed,
                     channel: "wecom_ws".to_string(),
@@ -2459,13 +2460,39 @@ fn build_access_denied_message(inbound: &ParsedInbound, decision: AccessDecision
     }
 }
 
-/// Compose content for framework: quote context (if any) + normalized user text.
-/// Sender prefix and static context are handled by the framework (mod.rs).
-fn compose_content_for_framework(inbound: &ParsedInbound, normalized: &str) -> String {
+/// Map WeCom inbound identity to the framework sender field.
+///
+/// For group chats we deliberately collapse sender to the conversation scope so
+/// the existing framework history key logic naturally becomes group-shared.
+fn framework_sender_identity(inbound: &ParsedInbound, scopes: &ScopeDecision) -> String {
+    if scopes.shared_group_history {
+        scopes.conversation_scope.clone()
+    } else {
+        inbound.sender_userid.clone()
+    }
+}
+
+/// Compose content for framework: quote context (if any) + normalized user text,
+/// then inject local timestamp and optional sender marker directly at the
+/// channel boundary so no framework-wide WeCom-specific prompt/history logic is needed.
+fn compose_content_for_framework(
+    inbound: &ParsedInbound,
+    scopes: &ScopeDecision,
+    normalized: &str,
+) -> String {
     let quote_context = extract_quote_context(&inbound.raw_payload);
-    match quote_context {
+    let base = match quote_context {
         Some(quote) => format!("{quote}\n\n{normalized}"),
         None => normalized.to_string(),
+    };
+
+    let now = Local::now().format("%Y-%m-%d %H:%M:%S %Z");
+    let timestamped = format!("[{now}] {base}");
+
+    if scopes.shared_group_history && !inbound.sender_userid.trim().is_empty() {
+        format!("[sender_userid={}] {timestamped}", inbound.sender_userid)
+    } else {
+        timestamped
     }
 }
 
@@ -2565,8 +2592,15 @@ fn next_stream_id() -> String {
     format!("zs_{}", random_ascii_token(20))
 }
 
-fn contains_stop_command(text: &str) -> bool {
-    text.contains("\u{505c}\u{6b62}") || text.to_ascii_lowercase().contains("stop")
+fn is_stop_runtime_command(text: &str) -> bool {
+    let stripped = strip_edge_mentions(text);
+    if stripped.is_empty() {
+        return false;
+    }
+
+    let command_token = stripped.split_whitespace().next().unwrap_or("");
+    let base_command = command_token.split('@').next().unwrap_or(command_token);
+    base_command.eq_ignore_ascii_case("/stop")
 }
 
 fn is_clear_session_command(text: &str) -> bool {
@@ -3152,6 +3186,40 @@ mod tests {
     }
 
     #[test]
+    fn framework_sender_identity_uses_group_scope_for_group_chat() {
+        let inbound = ParsedInbound {
+            msg_id: "m1".to_string(),
+            msg_type: "text".to_string(),
+            chat_type: "group".to_string(),
+            chat_id: Some("g1".to_string()),
+            sender_userid: "u1".to_string(),
+            aibot_id: "b1".to_string(),
+            raw_payload: serde_json::json!({}),
+        };
+
+        let scopes = compute_scopes(&inbound);
+        assert_eq!(framework_sender_identity(&inbound, &scopes), "group--g1");
+    }
+
+    #[test]
+    fn compose_content_for_framework_group_injects_sender_and_timestamp() {
+        let inbound = ParsedInbound {
+            msg_id: "m1".to_string(),
+            msg_type: "text".to_string(),
+            chat_type: "group".to_string(),
+            chat_id: Some("g1".to_string()),
+            sender_userid: "u1".to_string(),
+            aibot_id: "b1".to_string(),
+            raw_payload: serde_json::json!({}),
+        };
+
+        let scopes = compute_scopes(&inbound);
+        let content = compose_content_for_framework(&inbound, &scopes, "hello");
+        assert!(content.starts_with("[sender_userid=u1] ["));
+        assert!(content.contains("] hello"));
+    }
+
+    #[test]
     fn split_markdown_chunks_preserves_large_input() {
         let input = "a".repeat(WECOM_MARKDOWN_CHUNK_BYTES * 3 + 100);
         let chunks = split_markdown_chunks(&input);
@@ -3194,10 +3262,15 @@ mod tests {
     }
 
     #[test]
-    fn stop_command_detection_supports_cn_and_en() {
-        assert!(contains_stop_command("\u{505c}\u{6b62}"));
-        assert!(contains_stop_command("Please STOP now"));
-        assert!(!contains_stop_command("\u{7ee7}\u{7eed}\u{5904}\u{7406}"));
+    fn stop_command_requires_slash_with_optional_mentions() {
+        assert!(is_stop_runtime_command("/stop"));
+        assert!(is_stop_runtime_command("/STOP"));
+        assert!(is_stop_runtime_command("@bot /stop"));
+        assert!(is_stop_runtime_command("/stop @bot"));
+        assert!(is_stop_runtime_command(" /stop@zeroclaw "));
+        assert!(!is_stop_runtime_command("stop"));
+        assert!(!is_stop_runtime_command("\u{505c}\u{6b62}"));
+        assert!(!is_stop_runtime_command("please /stop now"));
     }
 
     #[test]
@@ -4161,6 +4234,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn group_clear_command_forwards_group_scoped_sender() {
+        let mut config = test_wecom_ws_config();
+        config.allowed_groups = vec!["zeroclaw_group".to_string()];
+        let channel = WeComWsChannel::new(&config, Path::new("/tmp")).unwrap();
+
+        let (ws_tx, mut ws_rx) = mpsc::channel::<WsOutbound>(1);
+        *channel.ws_tx.lock().await = Some(ws_tx);
+
+        let (tx, mut rx) = mpsc::channel::<ChannelMessage>(1);
+        channel
+            .handle_msg_callback(
+                serde_json::json!({
+                    "headers": { "req_id": "req-clear-group" },
+                    "body": {
+                        "msgtype": "text",
+                        "msgid": "msg-clear-group",
+                        "chattype": "group",
+                        "chatid": "zeroclaw_group",
+                        "from": { "userid": "zeroclaw_user" },
+                        "text": { "content": "@bot /clear" }
+                    }
+                }),
+                &tx,
+            )
+            .await;
+
+        let forwarded = tokio::time::timeout(Duration::from_millis(100), rx.recv())
+            .await
+            .expect("group clear command should be forwarded promptly")
+            .expect("group clear command should produce a framework message");
+        assert_eq!(forwarded.content, "/new");
+        assert_eq!(forwarded.sender, "group--zeroclaw_group");
+        assert_eq!(forwarded.reply_target, "group--zeroclaw_group");
+        assert_eq!(forwarded.thread_ts.as_deref(), Some("req-clear-group"));
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), ws_rx.recv())
+                .await
+                .is_err(),
+            "group clear command should not emit an immediate websocket reply"
+        );
+    }
+
+    #[tokio::test]
     async fn stop_command_forwards_stop_to_framework() {
         let mut config = test_wecom_ws_config();
         config.allowed_users = vec!["zeroclaw_user".to_string()];
@@ -4179,7 +4296,7 @@ mod tests {
                         "msgid": "msg-stop",
                         "chattype": "single",
                         "from": { "userid": "zeroclaw_user" },
-                        "text": { "content": "stop" }
+                        "text": { "content": "/stop" }
                     }
                 }),
                 &tx,
@@ -4199,6 +4316,121 @@ mod tests {
                 .is_err(),
             "stop command should not emit an immediate websocket reply"
         );
+    }
+
+    #[tokio::test]
+    async fn group_text_message_forwards_group_scoped_sender_and_prefixed_content() {
+        let mut config = test_wecom_ws_config();
+        config.allowed_groups = vec!["zeroclaw_group".to_string()];
+        let channel = WeComWsChannel::new(&config, Path::new("/tmp")).unwrap();
+
+        let (tx, mut rx) = mpsc::channel::<ChannelMessage>(1);
+        channel
+            .handle_msg_callback(
+                serde_json::json!({
+                    "headers": { "req_id": "req-group" },
+                    "body": {
+                        "msgtype": "text",
+                        "msgid": "msg-group",
+                        "chattype": "group",
+                        "chatid": "zeroclaw_group",
+                        "from": { "userid": "zeroclaw_user" },
+                        "text": { "content": "@bot hello" }
+                    }
+                }),
+                &tx,
+            )
+            .await;
+
+        let forwarded = tokio::time::timeout(Duration::from_millis(100), rx.recv())
+            .await
+            .expect("group message should be forwarded promptly")
+            .expect("group message should produce a framework message");
+        assert_eq!(forwarded.reply_target, "group--zeroclaw_group");
+        assert_eq!(forwarded.sender, "group--zeroclaw_group");
+        assert_eq!(forwarded.thread_ts.as_deref(), Some("req-group"));
+        assert!(forwarded
+            .content
+            .starts_with("[sender_userid=zeroclaw_user] ["));
+        assert!(forwarded.content.contains("@bot hello"));
+    }
+
+    #[tokio::test]
+    async fn group_stop_command_forwards_group_scoped_sender() {
+        let mut config = test_wecom_ws_config();
+        config.allowed_groups = vec!["zeroclaw_group".to_string()];
+        let channel = WeComWsChannel::new(&config, Path::new("/tmp")).unwrap();
+
+        let (ws_tx, mut ws_rx) = mpsc::channel::<WsOutbound>(1);
+        *channel.ws_tx.lock().await = Some(ws_tx);
+
+        let (tx, mut rx) = mpsc::channel::<ChannelMessage>(1);
+        channel
+            .handle_msg_callback(
+                serde_json::json!({
+                    "headers": { "req_id": "req-stop-group" },
+                    "body": {
+                        "msgtype": "text",
+                        "msgid": "msg-stop-group",
+                        "chattype": "group",
+                        "chatid": "zeroclaw_group",
+                        "from": { "userid": "zeroclaw_user" },
+                        "text": { "content": "/stop" }
+                    }
+                }),
+                &tx,
+            )
+            .await;
+
+        let forwarded = tokio::time::timeout(Duration::from_millis(100), rx.recv())
+            .await
+            .expect("group stop command should be forwarded promptly")
+            .expect("group stop command should produce a framework message");
+        assert_eq!(forwarded.content, "/stop");
+        assert_eq!(forwarded.sender, "group--zeroclaw_group");
+        assert_eq!(forwarded.reply_target, "group--zeroclaw_group");
+        assert_eq!(forwarded.thread_ts.as_deref(), Some("req-stop-group"));
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), ws_rx.recv())
+                .await
+                .is_err(),
+            "group stop command should not emit an immediate websocket reply"
+        );
+    }
+
+    #[tokio::test]
+    async fn group_model_command_forwards_group_scoped_sender() {
+        let mut config = test_wecom_ws_config();
+        config.allowed_groups = vec!["zeroclaw_group".to_string()];
+        let channel = WeComWsChannel::new(&config, Path::new("/tmp")).unwrap();
+
+        let (tx, mut rx) = mpsc::channel::<ChannelMessage>(1);
+        channel
+            .handle_msg_callback(
+                serde_json::json!({
+                    "headers": { "req_id": "req-model-group" },
+                    "body": {
+                        "msgtype": "text",
+                        "msgid": "msg-model-group",
+                        "chattype": "group",
+                        "chatid": "zeroclaw_group",
+                        "from": { "userid": "zeroclaw_user" },
+                        "text": { "content": "@bot /model qwen-max" }
+                    }
+                }),
+                &tx,
+            )
+            .await;
+
+        let forwarded = tokio::time::timeout(Duration::from_millis(100), rx.recv())
+            .await
+            .expect("group model command should be forwarded promptly")
+            .expect("group model command should produce a framework message");
+        assert_eq!(forwarded.content, "/model qwen-max");
+        assert_eq!(forwarded.sender, "group--zeroclaw_group");
+        assert_eq!(forwarded.reply_target, "group--zeroclaw_group");
+        assert_eq!(forwarded.thread_ts.as_deref(), Some("req-model-group"));
     }
 
     #[tokio::test]
