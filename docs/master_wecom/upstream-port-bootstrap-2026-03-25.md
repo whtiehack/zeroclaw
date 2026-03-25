@@ -112,15 +112,16 @@
 - 上游已覆盖，无需重搬：
   - tool-call 文本 relay
   - draft sender 显式 `drop(delta_tx)` 收口
+- 已完成迁移：
+  - `non_cli_excluded_tools` 在 channel 路径的非 CLI `full` 模式继续生效
 - 当前仍缺且值得继续做的公共层差异：
-  - `non_cli_excluded_tools` 在 `AutonomyLevel::Full` 的非 CLI 通道仍应生效
   - native tools 模式下跳过重复 tools summary
   - `disable_shell_policy` 配置开关
   - OpenAI-compatible transport error 不应触发 `/responses` fallback
 - 当前保留为低优先级观察项：
   - prompt 时间上下文拆分
   - 工具调用日志增强
-- 当前判断：阶段 3 下一步先做 `non_cli_excluded_tools`，因为它直接影响 `wecom_ws` 这类非 CLI 长连接通道在 `full` 模式下的工具暴露和执行边界
+- 当前判断：阶段 3 下一步先做 native tools 模式下的重复 tools summary 去重，继续收窄 `wecom_ws` 等非 CLI channel 在新基线下的无效 prompt 噪音
 
 ### 阶段 4：验证与收口
 
@@ -138,12 +139,15 @@
   - `providers::bedrock::tests::chat_fails_without_credentials`
 - 当前分支相对 `upstream/master` 未修改 `src/providers/bedrock.rs`
 - 因此当前进入后续迁移时，应把 `bedrock` 失败视为上游基线问题或独立问题，不阻塞 `wecom_ws` 后续公共层补丁判断
+- 本轮 `non_cli_excluded_tools` 补丁已补充通过：
+  - `cargo fmt --all -- --check`
+  - `cargo clippy --all-targets -- -D warnings`
+  - `cargo test non_cli_excluded_tools --lib`
 
 ## 5. 当前已知优先级
 
 ### P0
 
-- `non_cli_excluded_tools` 在非 CLI `full` 模式生效
 - native tools 模式去掉重复 tools summary
 
 ### P1
