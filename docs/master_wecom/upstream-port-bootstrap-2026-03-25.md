@@ -124,6 +124,7 @@
   - channel 历史精确时间戳保留
   - `wecom_ws` 静态 system context block
   - `wecom_ws` delivery instructions
+  - `wecom_ws` 工具调用进度继续并入同一条草稿流
 - 当前保留为低优先级观察项：
   - 继续观察是否需要把本地 `disable_shell_policy` 语义同步到 prompt summary
 - 当前执行方式：
@@ -191,9 +192,28 @@
      - `cargo test build_channel_system_prompt --lib`
      - `cargo test wecom_ws --lib`
    - 当前剩余：
+     - `wecom_ws` 工具调用进度继续并入同一条草稿流
+   - 下一步：
+     - 把上游 draft `Progress` / `Content` 拆分后丢掉的 `wecom_ws` 草稿体验补回
+
+5. 已完成：`wecom_ws` 工具调用进度继续并入同一条草稿流
+   - 修改：
+     - `mod.rs` 只增加一个最小公共层钩子：在 draft `Clear` 时给 `wecom_ws` 透传专用 clear sentinel
+     - 主要恢复逻辑下沉到 `wecom_ws`：
+       - 新增本地 draft state
+       - `update_draft_progress()` 直接把 thinking / tool start / tool done 进度并入同一条流式草稿正文
+       - 收到 clear sentinel 后切到 final 模式，后续最终答案重新覆盖前面的进度正文
+       - 预 final 阶段继续按旧语义仅保留最近若干行，避免草稿过长
+   - 原因：
+     - 上游把草稿流拆成 `Progress` / `Content` 两路后，`wecom_ws` 没有自己的 status bar，导致工具进度不再显示在同一条草稿里
+     - 这次恢复要求尽量少动公共层，所以只保留 clear 透传，具体 merge/clamp/final 切换都放回 `wecom_ws` 本地状态机
+   - 验证：
+     - `cargo fmt --all`
+     - `cargo test wecom_ws --lib`
+   - 当前剩余：
      - 暂无新的 `wecom_ws` 迁移缺口
    - 下一步：
-     - 按提交边界拆分公共层代码与文档提交
+     - 继续按真实使用反馈补漏，不扩大 `mod.rs` 对 `wecom_ws` 的特判面
 
 ### 阶段 4：验证与收口
 
