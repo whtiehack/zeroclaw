@@ -101,13 +101,13 @@
 
 ### 阶段 3：补必要公共层差异
 
-状态：已完成
+状态：已完成（2026-03-25 复核后按新策略收口）
 
 - 只处理 `wecom_ws` 无法工作的公共层缺口
 - 优先补配置接线、注册入口、必要 runtime hook
 - 对公共层补丁逐条说明“为什么上游现状不够”
 
-2026-03-25 当前判定：
+2026-03-25 复核后更正：
 
 - 上游已覆盖，无需重搬：
   - tool-call 文本 relay
@@ -117,13 +117,83 @@
   - native tools 模式下跳过重复 tools summary
   - `disable_shell_policy` 配置、schema、security policy、shell tool 验证链路已接回
   - OpenAI-compatible transport error 不再触发 `/responses` fallback
-  - prompt 时间上下文已拆分：系统提示仅保留当前日期和时区偏移，消息入历史前继续保留精确本地时间戳 `[{now}]`
   - 工具调用日志增强已补回：`execute_one_tool` 现在记录脱敏后的参数、执行时长、成功输出或失败原因
-- 当前仍缺且值得继续做的公共层差异：
-  - 暂无
+- 复核后确认的 `wecom_ws` 语义缺口已全部补完：
+  - 群聊历史按群共享
+  - 群消息发送者身份注入
+  - channel 历史精确时间戳保留
+  - `wecom_ws` 静态 system context block
+  - `wecom_ws` delivery instructions
 - 当前保留为低优先级观察项：
   - 继续观察是否需要把本地 `disable_shell_policy` 语义同步到 prompt summary
-- 当前判断：阶段 3 列出的公共层差异已全部完成；后续只在真实使用暴露问题时再新增迁移项
+- 当前执行方式：
+  - 优先把 `wecom_ws` 专有语义尽量下沉到通道层，不扩大框架层特判面
+  - 每修完一条立即把结论、原因和验证记录回写到本文件
+
+2026-03-25 当前逐条记录：
+
+1. 已完成：`wecom_ws` 群聊历史按群共享
+   - 修改：
+     - 没有继续改 `mod.rs` 的 `conversation_history_key()`
+     - 改为在 `wecom_ws` 入站时，群聊统一把发往框架的 `sender` 固定成 `group--{chatid}`
+   - 原因：
+     - 这样直接复用框架现有按 `reply_target + sender` 分桶的逻辑，即可自然得到群共享历史
+     - 同时避免继续扩大 `mod.rs` 里的 `wecom_ws` 专用分支
+   - 验证：
+     - `cargo fmt --all`
+     - `cargo test wecom_ws --lib`
+   - 当前剩余：
+     - `wecom_ws` 静态 system context block
+   - 下一步：
+     - 继续把 `wecom_ws` 静态 system context block 补回系统提示词路径
+
+2. 已完成：`wecom_ws` 群消息发送者身份与精确时间戳在通道层本地注入
+   - 修改：
+     - `wecom_ws` 在 `compose_content_for_framework()` 内直接把普通消息改写成带本地时间戳的内容
+     - 群聊消息额外补入 `[sender_userid=...]`
+     - 命令路径 `/clear` `/new` `/stop` `/model` `/models` 统一使用 group-scope sender；单聊仍要求 slash command 才转成运行时命令
+   - 原因：
+     - 把 `wecom_ws` 专属消息语义留在通道边界处理，避免把 sender/timestamp 注入逻辑扩散到所有 channel 公共路径
+     - 群聊命令和普通消息必须使用同一 sender 语义，否则 `/stop`、`/new` 无法命中同一个会话/中断作用域
+   - 验证：
+     - `cargo fmt --all`
+     - `cargo test wecom_ws --lib`
+   - 当前剩余：
+     - `wecom_ws` 静态 system context block
+   - 下一步：
+     - 补回 `wecom_ws` 静态 system context block
+
+3. 已完成：`wecom_ws` 静态 system context block
+   - 修改：
+     - 在 `build_channel_system_prompt()` 内补回 `[WECOM_WS_STATIC_CONTEXT_V1]`
+     - 群聊写入 `chat_type=group` 和 `conversation_scope=group--...`
+     - 单聊额外写入 `sender_userid=user--...` 解析后的 userid
+   - 原因：
+     - 这块属于系统提示词语义，不适合继续塞进用户消息正文
+     - 保持 `wecom_ws` 的通道层运行态注入与公共层 system prompt 注入分工清晰
+   - 验证：
+     - `cargo fmt --all -- --check`
+     - `cargo test build_channel_system_prompt --lib`
+   - 当前剩余：
+     - `wecom_ws` delivery instructions
+   - 下一步：
+     - 把 `channel_delivery_instructions()` 里的 `wecom_ws` 提示词补回
+
+4. 已完成：`wecom_ws` delivery instructions
+   - 修改：
+     - 在 `channel_delivery_instructions()` 中补回 `wecom_ws` 专用回复约束
+     - 恢复本地绝对路径文件发送、`[IMAGE:]` / `[FILE:]` / `[VOICE:]` / `[VIDEO:]` marker 和“工具结果静默使用”提示
+   - 原因：
+     - 旧分支对企业微信长连接的交付格式约束不在静态 context block，而是在 channel delivery instructions
+     - 只补 static context 不够，模型仍会丢失附件发送和输出格式约束
+   - 验证：
+     - `cargo fmt --all -- --check`
+     - `cargo test build_channel_system_prompt --lib`
+     - `cargo test wecom_ws --lib`
+   - 当前剩余：
+     - 暂无新的 `wecom_ws` 迁移缺口
+   - 下一步：
+     - 按提交边界拆分公共层代码与文档提交
 
 ### 阶段 4：验证与收口
 
@@ -133,7 +203,7 @@
 - 对失败项先区分是迁移缺口、上游现有问题还是环境问题
 - 形成新的同步记录或迁移记录，避免再次回到口头判断
 
-2026-03-25 当前验证补充：
+2026-03-25 历史验证补充：
 
 - 已补充通过：
   - `cargo test execute_one_tool --lib`
@@ -166,7 +236,18 @@
 - 全量回归过程中额外对齐了一条旧测试断言：
   - `agent::loop_::tests::native_tools_system_prompt_contains_zero_xml`
   - 原因是该测试仍要求 native tools prompt 显式列出工具名，与当前“native tools 模式跳过重复 tools summary”的既有语义不一致
-- 当前分支最新状态：`cargo test` 已全量通过
+- 注意：
+  - 以上全量验证结论是本轮重新开工前的历史状态
+  - 本轮按新策略补完后，已重新通过：
+    - `cargo fmt --all -- --check`
+    - `cargo test build_channel_system_prompt --lib`
+    - `cargo test wecom_ws --lib`
+    - `cargo clippy --all-targets -- -D warnings`
+  - 截至当前最新一次重跑：
+    - `cargo test` 失败于 `providers::bedrock::tests::bearer_token_precedence`
+    - `cargo test` 失败于 `providers::bedrock::tests::chat_fails_without_credentials`
+    - 当前没有证据表明这两条失败由本轮 `wecom_ws` / prompt 迁移引入，先记为上游现有或环境相关问题，后续单独排查
+  - 当前判断：本轮 `wecom_ws` 迁移缺口已完成收口；全量回归剩余阻塞点已收敛到与本轮改动无直接关系的 `bedrock` 测试
 
 ## 5. 当前已知优先级
 
