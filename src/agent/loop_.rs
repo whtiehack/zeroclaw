@@ -134,6 +134,7 @@ pub(crate) fn check_tool_loop_budget() -> Option<BudgetCheck> {
 const STREAM_CHUNK_MIN_CHARS: usize = 80;
 /// Rolling window size for detecting streamed tool-call payload markers.
 const STREAM_TOOL_MARKER_WINDOW_CHARS: usize = 512;
+const TOOL_SUCCESS_LOG_OUTPUT_MAX_CHARS: usize = 200;
 
 /// Default maximum agentic tool-use iterations per user message to prevent runaway loops.
 /// Used as a safe fallback when `max_tool_iterations` is unset or configured as zero.
@@ -2598,6 +2599,13 @@ async fn execute_one_tool(
     observer: &dyn Observer,
     cancellation_token: Option<&CancellationToken>,
 ) -> Result<ToolExecutionOutcome> {
+    let log_args = scrub_credentials(&call_arguments.to_string());
+    tracing::info!(
+        target: "zeroclaw::agent::loop_::execution",
+        tool = %call_name,
+        args = %log_args,
+        "tool call started"
+    );
     let args_summary = truncate_with_ellipsis(&call_arguments.to_string(), 300);
     observer.record_event(&ObserverEvent::ToolCallStart {
         tool: call_name.to_string(),
@@ -2614,15 +2622,23 @@ async fn execute_one_tool(
     let Some(tool) = static_tool.or(activated_arc.as_deref()) else {
         let reason = format!("Unknown tool: {call_name}");
         let duration = start.elapsed();
+        let scrubbed_reason = scrub_credentials(&reason);
         observer.record_event(&ObserverEvent::ToolCall {
             tool: call_name.to_string(),
             duration,
             success: false,
         });
+        tracing::info!(
+            target: "zeroclaw::agent::loop_::execution",
+            tool = %call_name,
+            duration_ms = duration.as_millis(),
+            output = %scrubbed_reason,
+            "tool call failed"
+        );
         return Ok(ToolExecutionOutcome {
             output: reason.clone(),
             success: false,
-            error_reason: Some(scrub_credentials(&reason)),
+            error_reason: Some(scrubbed_reason),
             duration,
         });
     };
@@ -2646,18 +2662,37 @@ async fn execute_one_tool(
                 success: r.success,
             });
             if r.success {
+                let scrubbed_output = scrub_credentials(&r.output);
+                tracing::info!(
+                    target: "zeroclaw::agent::loop_::execution",
+                    tool = %call_name,
+                    duration_ms = duration.as_millis(),
+                    output = %truncate_with_ellipsis(
+                        &scrubbed_output,
+                        TOOL_SUCCESS_LOG_OUTPUT_MAX_CHARS
+                    ),
+                    "tool call succeeded"
+                );
                 Ok(ToolExecutionOutcome {
-                    output: scrub_credentials(&r.output),
+                    output: scrubbed_output,
                     success: true,
                     error_reason: None,
                     duration,
                 })
             } else {
                 let reason = r.error.unwrap_or(r.output);
+                let scrubbed_reason = scrub_credentials(&reason);
+                tracing::info!(
+                    target: "zeroclaw::agent::loop_::execution",
+                    tool = %call_name,
+                    duration_ms = duration.as_millis(),
+                    output = %scrubbed_reason,
+                    "tool call failed"
+                );
                 Ok(ToolExecutionOutcome {
                     output: format!("Error: {reason}"),
                     success: false,
-                    error_reason: Some(scrub_credentials(&reason)),
+                    error_reason: Some(scrubbed_reason),
                     duration,
                 })
             }
@@ -2670,10 +2705,18 @@ async fn execute_one_tool(
                 success: false,
             });
             let reason = format!("Error executing {call_name}: {e}");
+            let scrubbed_reason = scrub_credentials(&reason);
+            tracing::info!(
+                target: "zeroclaw::agent::loop_::execution",
+                tool = %call_name,
+                duration_ms = duration.as_millis(),
+                output = %scrubbed_reason,
+                "tool call failed"
+            );
             Ok(ToolExecutionOutcome {
                 output: reason.clone(),
                 success: false,
-                error_reason: Some(scrub_credentials(&reason)),
+                error_reason: Some(scrubbed_reason),
                 duration,
             })
         }
