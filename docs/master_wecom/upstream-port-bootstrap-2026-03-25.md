@@ -114,14 +114,14 @@
   - draft sender 显式 `drop(delta_tx)` 收口
 - 已完成迁移：
   - `non_cli_excluded_tools` 在 channel 路径的非 CLI `full` 模式继续生效
-- 当前仍缺且值得继续做的公共层差异：
   - native tools 模式下跳过重复 tools summary
+- 当前仍缺且值得继续做的公共层差异：
   - `disable_shell_policy` 配置开关
   - OpenAI-compatible transport error 不应触发 `/responses` fallback
 - 当前保留为低优先级观察项：
   - prompt 时间上下文拆分
   - 工具调用日志增强
-- 当前判断：阶段 3 下一步先做 native tools 模式下的重复 tools summary 去重，继续收窄 `wecom_ws` 等非 CLI channel 在新基线下的无效 prompt 噪音
+- 当前判断：阶段 3 下一步转入 `disable_shell_policy`，因为该配置项在旧分支里已有明确使用语义，而当前上游基线完全缺失 schema 与 policy 接线
 
 ### 阶段 4：验证与收口
 
@@ -143,16 +143,19 @@
   - `cargo fmt --all -- --check`
   - `cargo clippy --all-targets -- -D warnings`
   - `cargo test non_cli_excluded_tools --lib`
+- 本轮 native tools summary 去重已补充通过：
+  - `cargo fmt --all -- --check`
+  - `cargo clippy --all-targets -- -D warnings`
+  - `cargo test native_tools_prompt_skips_duplicate_tools_summary --lib`
 
 ## 5. 当前已知优先级
 
 ### P0
 
-- native tools 模式去掉重复 tools summary
+- `disable_shell_policy` 开关
 
 ### P1
 
-- `disable_shell_policy` 开关
 - OpenAI-compatible transport error fallback 收紧
 
 ### P2
