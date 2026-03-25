@@ -208,6 +208,13 @@ struct WeComRuntimeConfig {
     stream_mode: StreamMode,
 }
 
+#[derive(Debug, Default, Clone)]
+struct StreamDraftState {
+    preclear_body: String,
+    preclear_content: String,
+    after_clear: bool,
+}
+
 // ── MediaDecryptor (per-attachment AES key) ──────────────────────────
 
 struct MediaDecryptor;
@@ -265,6 +272,7 @@ pub struct WeComWsChannel {
     idempotency: Arc<SimpleIdempotencyStore>,
     req_id_map: Arc<Mutex<HashMap<String, String>>>, // stream_id → req_id
     expired_stream_req_ids: Arc<Mutex<HashMap<String, Instant>>>,
+    draft_states: Arc<Mutex<HashMap<String, StreamDraftState>>>,
 }
 
 // ── Construction + WS helpers ────────────────────────────────────────
@@ -300,6 +308,7 @@ impl WeComWsChannel {
             idempotency: Arc::new(SimpleIdempotencyStore::new()),
             req_id_map: Arc::new(Mutex::new(HashMap::new())),
             expired_stream_req_ids: Arc::new(Mutex::new(HashMap::new())),
+            draft_states: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -527,6 +536,49 @@ impl WeComWsChannel {
 
         self.remember_expired_stream_req_id(req_id);
         self.cleanup_respond_msg_lock(req_id).await;
+    }
+
+    fn clear_draft_state(&self, message_id: &str) {
+        self.draft_states.lock().remove(message_id);
+    }
+
+    fn note_progress_update(&self, message_id: &str, text: &str) -> Option<String> {
+        let mut states = self.draft_states.lock();
+        let state = states.entry(message_id.to_string()).or_default();
+
+        if text == super::WECOM_WS_DRAFT_CLEAR_SENTINEL {
+            state.preclear_body.clear();
+            state.preclear_content.clear();
+            state.after_clear = true;
+            return None;
+        }
+
+        if state.after_clear {
+            return None;
+        }
+
+        state.preclear_body.push_str(text);
+        Some(render_wecom_preclear_draft_body(&state.preclear_body))
+    }
+
+    fn note_content_update(&self, message_id: &str, content: &str) -> String {
+        let mut states = self.draft_states.lock();
+        let state = states.entry(message_id.to_string()).or_default();
+
+        if state.after_clear {
+            return sanitize_outbound_draft_content(content);
+        }
+
+        let delta = content
+            .strip_prefix(&state.preclear_content)
+            .unwrap_or(content);
+        state.preclear_content.clear();
+        state.preclear_content.push_str(content);
+        if !delta.is_empty() {
+            state.preclear_body.push_str(delta);
+        }
+
+        render_wecom_preclear_draft_body(&state.preclear_body)
     }
 
     async fn fail_pending_responses(&self, reason: &str) {
@@ -2150,6 +2202,9 @@ impl Channel for WeComWsChannel {
         self.req_id_map
             .lock()
             .insert(stream_id.clone(), req_id.to_string());
+        self.draft_states
+            .lock()
+            .insert(stream_id.clone(), StreamDraftState::default());
 
         match self
             .ws_send_respond_msg(req_id, &stream_id, WECOM_STREAM_BOOTSTRAP_CONTENT, false)
@@ -2167,6 +2222,7 @@ impl Channel for WeComWsChannel {
             }
             Err(err) => {
                 self.req_id_map.lock().remove(&stream_id);
+                self.clear_draft_state(&stream_id);
                 Err(err)
             }
         }
@@ -2180,13 +2236,15 @@ impl Channel for WeComWsChannel {
             .cloned()
             .unwrap_or_default();
         if req_id.is_empty() {
+            self.clear_draft_state(message_id);
             return Ok(());
         }
         if self.is_expired_stream_req_id(&req_id) {
             self.req_id_map.lock().remove(message_id);
+            self.clear_draft_state(message_id);
             return Ok(());
         }
-        let draft_content = sanitize_outbound_draft_content(content);
+        let draft_content = self.note_content_update(message_id, content);
         match self
             .ws_send_respond_msg(&req_id, message_id, &draft_content, false)
             .await
@@ -2199,6 +2257,52 @@ impl Channel for WeComWsChannel {
                     "[wecom_ws] stream draft update expired; stopping further draft writes"
                 );
                 self.expire_stream_req_id(&req_id, Some(message_id)).await;
+                self.clear_draft_state(message_id);
+                Ok(())
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    async fn update_draft_progress(
+        &self,
+        _recipient: &str,
+        message_id: &str,
+        text: &str,
+    ) -> Result<()> {
+        let req_id = self
+            .req_id_map
+            .lock()
+            .get(message_id)
+            .cloned()
+            .unwrap_or_default();
+        if req_id.is_empty() {
+            self.clear_draft_state(message_id);
+            return Ok(());
+        }
+        if self.is_expired_stream_req_id(&req_id) {
+            self.req_id_map.lock().remove(message_id);
+            self.clear_draft_state(message_id);
+            return Ok(());
+        }
+
+        let Some(draft_content) = self.note_progress_update(message_id, text) else {
+            return Ok(());
+        };
+
+        match self
+            .ws_send_respond_msg(&req_id, message_id, &draft_content, false)
+            .await
+        {
+            Ok(()) => Ok(()),
+            Err(err) if is_wecom_stream_update_expired_error(&err) => {
+                tracing::info!(
+                    req_id = %req_id,
+                    stream_id = %message_id,
+                    "[wecom_ws] stream draft progress expired; stopping further draft writes"
+                );
+                self.expire_stream_req_id(&req_id, Some(message_id)).await;
+                self.clear_draft_state(message_id);
                 Ok(())
             }
             Err(err) => Err(err),
@@ -2214,12 +2318,14 @@ impl Channel for WeComWsChannel {
             .unwrap_or_default();
         if req_id.is_empty() {
             self.req_id_map.lock().remove(message_id);
+            self.clear_draft_state(message_id);
             return self
                 .send_final_content(recipient, None, None, content)
                 .await;
         }
         if self.is_expired_stream_req_id(&req_id) {
             self.req_id_map.lock().remove(message_id);
+            self.clear_draft_state(message_id);
             return self
                 .send_final_content(recipient, None, None, content)
                 .await;
@@ -2231,6 +2337,7 @@ impl Channel for WeComWsChannel {
         {
             Ok(()) => {
                 self.req_id_map.lock().remove(message_id);
+                self.clear_draft_state(message_id);
                 Ok(())
             }
             Err(err) if is_wecom_stream_update_expired_error(&err) => {
@@ -2240,11 +2347,13 @@ impl Channel for WeComWsChannel {
                     "[wecom_ws] stream final reply expired; falling back to standard message send"
                 );
                 self.expire_stream_req_id(&req_id, Some(message_id)).await;
+                self.clear_draft_state(message_id);
                 self.send_final_content(recipient, None, None, content)
                     .await
             }
             Err(err) => {
                 self.req_id_map.lock().remove(message_id);
+                self.clear_draft_state(message_id);
                 Err(err)
             }
         }
@@ -2258,6 +2367,7 @@ impl Channel for WeComWsChannel {
             .cloned()
             .unwrap_or_default();
         self.req_id_map.lock().remove(message_id);
+        self.clear_draft_state(message_id);
         if req_id.is_empty() || self.is_expired_stream_req_id(&req_id) {
             return Ok(());
         }
@@ -2883,6 +2993,23 @@ fn extract_outbound_attachments(message: &str) -> (String, Vec<OutboundAttachmen
     (message.to_string(), Vec::new())
 }
 
+fn retain_latest_lines(content: &str, max_lines: usize) -> String {
+    if content.is_empty() || max_lines == 0 {
+        return String::new();
+    }
+
+    let lines: Vec<&str> = content.lines().collect();
+    if lines.len() <= max_lines {
+        return content.to_string();
+    }
+
+    lines[lines.len() - max_lines..].join("\n")
+}
+
+fn render_wecom_preclear_draft_body(content: &str) -> String {
+    sanitize_outbound_draft_content(&retain_latest_lines(content, WECOM_DRAFT_UPDATE_MAX_LINES))
+}
+
 fn sanitize_outbound_draft_content(content: &str) -> String {
     let (cleaned, attachments) = extract_outbound_attachments(content);
     if attachments.is_empty() {
@@ -3463,6 +3590,58 @@ mod tests {
             .join("\n");
 
         assert_eq!(sanitize_outbound_draft_content(&input), expected);
+    }
+
+    #[test]
+    fn draft_state_merges_progress_and_preclear_content_until_clear() {
+        let channel = WeComWsChannel::new(&test_wecom_ws_config(), Path::new("/tmp")).unwrap();
+        channel
+            .draft_states
+            .lock()
+            .insert("stream-1".to_string(), StreamDraftState::default());
+
+        let progress = channel
+            .note_progress_update("stream-1", "⏳ shell: ls -la\n")
+            .expect("progress should render");
+        assert!(progress.contains("shell: ls -la"));
+
+        let merged = channel.note_content_update("stream-1", "Task started.\n");
+        assert!(merged.contains("shell: ls -la"));
+        assert!(merged.contains("Task started."));
+
+        assert!(
+            channel
+                .note_progress_update("stream-1", super::super::WECOM_WS_DRAFT_CLEAR_SENTINEL)
+                .is_none(),
+            "clear sentinel should reset local draft state without emitting a body"
+        );
+
+        let final_body = channel.note_content_update("stream-1", "Final answer");
+        assert_eq!(final_body, "Final answer");
+    }
+
+    #[test]
+    fn draft_state_limits_preclear_body_to_latest_lines() {
+        let channel = WeComWsChannel::new(&test_wecom_ws_config(), Path::new("/tmp")).unwrap();
+        channel
+            .draft_states
+            .lock()
+            .insert("stream-clip".to_string(), StreamDraftState::default());
+
+        let mut rendered = String::new();
+        for n in 1..=12 {
+            rendered = channel
+                .note_progress_update("stream-clip", &format!("line-{n}\n"))
+                .expect("progress should render");
+        }
+
+        assert_eq!(
+            rendered,
+            (3..=12)
+                .map(|n| format!("line-{n}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
     }
 
     #[test]
@@ -4688,6 +4867,129 @@ mod tests {
             }))
             .await;
         second.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn update_draft_progress_sends_progress_body_over_stream() {
+        let config = test_wecom_ws_config();
+        let channel = WeComWsChannel::new(&config, Path::new("/tmp")).unwrap();
+
+        let (tx, mut rx) = mpsc::channel::<WsOutbound>(4);
+        *channel.ws_tx.lock().await = Some(tx);
+        channel
+            .req_id_map
+            .lock()
+            .insert("stream-progress".to_string(), "req-progress".to_string());
+        channel
+            .draft_states
+            .lock()
+            .insert("stream-progress".to_string(), StreamDraftState::default());
+
+        let updater = {
+            let channel = channel.clone();
+            tokio::spawn(async move {
+                channel
+                    .update_draft_progress(
+                        "user--zeroclaw_user",
+                        "stream-progress",
+                        "⏳ shell: ls -la\n",
+                    )
+                    .await
+            })
+        };
+
+        let Some(WsOutbound::Frame(frame)) =
+            tokio::time::timeout(Duration::from_millis(250), rx.recv())
+                .await
+                .expect("progress update should send one stream frame")
+        else {
+            panic!("expected respond_msg frame");
+        };
+        assert_eq!(
+            frame
+                .pointer("/body/stream/content")
+                .and_then(Value::as_str),
+            Some("⏳ shell: ls -la\n")
+        );
+
+        channel
+            .maybe_handle_command_response(&serde_json::json!({
+                "headers": { "req_id": frame_req_id(&frame) },
+                "errcode": 0,
+                "errmsg": "ok"
+            }))
+            .await;
+
+        updater.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn update_draft_progress_clear_sentinel_resets_state_without_frame() {
+        let config = test_wecom_ws_config();
+        let channel = WeComWsChannel::new(&config, Path::new("/tmp")).unwrap();
+
+        let (tx, mut rx) = mpsc::channel::<WsOutbound>(4);
+        *channel.ws_tx.lock().await = Some(tx);
+        channel
+            .req_id_map
+            .lock()
+            .insert("stream-clear".to_string(), "req-clear".to_string());
+        channel
+            .draft_states
+            .lock()
+            .insert("stream-clear".to_string(), StreamDraftState::default());
+
+        let initial_update = {
+            let channel = channel.clone();
+            tokio::spawn(async move {
+                channel
+                    .update_draft_progress(
+                        "user--zeroclaw_user",
+                        "stream-clear",
+                        "⏳ shell: ls -la\n",
+                    )
+                    .await
+            })
+        };
+        let Some(WsOutbound::Frame(initial_frame)) =
+            tokio::time::timeout(Duration::from_millis(250), rx.recv())
+                .await
+                .expect("initial progress update should send a frame")
+        else {
+            panic!("expected initial respond_msg frame");
+        };
+        channel
+            .maybe_handle_command_response(&serde_json::json!({
+                "headers": { "req_id": frame_req_id(&initial_frame) },
+                "errcode": 0,
+                "errmsg": "ok"
+            }))
+            .await;
+        initial_update.await.unwrap().unwrap();
+
+        channel
+            .update_draft_progress(
+                "user--zeroclaw_user",
+                "stream-clear",
+                super::super::WECOM_WS_DRAFT_CLEAR_SENTINEL,
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), rx.recv())
+                .await
+                .is_err(),
+            "clear sentinel should not emit an extra websocket frame"
+        );
+        assert!(
+            channel
+                .draft_states
+                .lock()
+                .get("stream-clear")
+                .is_some_and(|state| state.after_clear),
+            "clear sentinel should flip the local draft state into final mode"
+        );
     }
 
     #[tokio::test]
