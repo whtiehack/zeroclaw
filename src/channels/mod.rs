@@ -261,6 +261,24 @@ fn effective_channel_message_timeout_secs(configured: u64) -> u64 {
     configured.max(MIN_CHANNEL_MESSAGE_TIMEOUT_SECS)
 }
 
+fn non_cli_excluded_tools_for_channel<'a>(channel: &str, excluded: &'a [String]) -> &'a [String] {
+    if channel == "cli" {
+        &[]
+    } else {
+        excluded
+    }
+}
+
+fn apply_non_cli_tool_desc_exclusions<'a>(
+    tool_descs: &mut Vec<(&'a str, &'a str)>,
+    excluded: &[String],
+) {
+    if excluded.is_empty() {
+        return;
+    }
+    tool_descs.retain(|(name, _)| !excluded.iter().any(|ex| ex == name));
+}
+
 fn channel_message_timeout_budget_secs(
     message_timeout_secs: u64,
     max_tool_iterations: usize,
@@ -2785,13 +2803,10 @@ async fn process_channel_message(
                         Some(cancellation_token.clone()),
                         delta_tx.clone(),
                         ctx.hooks.as_deref(),
-                        if msg.channel == "cli"
-                            || ctx.autonomy_level == AutonomyLevel::Full
-                        {
-                            &[]
-                        } else {
-                            ctx.non_cli_excluded_tools.as_ref()
-                        },
+                        non_cli_excluded_tools_for_channel(
+                            msg.channel.as_str(),
+                            ctx.non_cli_excluded_tools.as_ref(),
+                        ),
                         ctx.tool_call_dedup_exempt.as_ref(),
                         ctx.activated_tools.as_ref(),
                         Some(model_switch_callback.clone()),
@@ -2800,6 +2815,68 @@ async fn process_channel_message(
                     ),
                 ) => LlmExecutionResult::Completed(result),
             };
+    let llm_result = loop {
+        let loop_result = tokio::select! {
+            () = cancellation_token.cancelled() => LlmExecutionResult::Cancelled,
+            result = tokio::time::timeout(
+                Duration::from_secs(timeout_budget_secs),
+                crate::agent::loop_::TOOL_LOOP_COST_TRACKING_CONTEXT.scope(
+                    cost_tracking_context.clone(),
+                run_tool_call_loop(
+                    active_provider.as_ref(),
+                    &mut history,
+                    ctx.tools_registry.as_ref(),
+                    notify_observer.as_ref() as &dyn Observer,
+                    route.provider.as_str(),
+                    route.model.as_str(),
+                    runtime_defaults.temperature,
+                    true,
+                    Some(&*ctx.approval_manager),
+                    msg.channel.as_str(),
+                    Some(msg.reply_target.as_str()),
+                    &ctx.multimodal,
+                    ctx.max_tool_iterations,
+                    Some(cancellation_token.clone()),
+                    delta_tx.clone(),
+                    ctx.hooks.as_deref(),
+                    non_cli_excluded_tools_for_channel(
+                        msg.channel.as_str(),
+                        ctx.non_cli_excluded_tools.as_ref(),
+                    ),
+                    ctx.tool_call_dedup_exempt.as_ref(),
+                    ctx.activated_tools.as_ref(),
+                    Some(model_switch_callback.clone()),
+                    &ctx.pacing,
+                ),
+                ),
+            ) => LlmExecutionResult::Completed(result),
+        };
+
+        // Handle model switch: re-create the provider and retry
+        if let LlmExecutionResult::Completed(Ok(Err(ref e))) = loop_result {
+            if let Some((new_provider, new_model)) = is_model_switch_requested(e) {
+                tracing::info!(
+                    "Model switch requested, switching from {} {} to {} {}",
+                    route.provider,
+                    route.model,
+                    new_provider,
+                    new_model
+                );
+
+                    match create_resilient_provider_nonblocking(
+                        &new_provider,
+                        ctx.api_key.clone(),
+                        ctx.api_url.clone(),
+                        ctx.reliability.as_ref().clone(),
+                        ctx.provider_runtime_options.clone(),
+                    )
+                    .await
+                    {
+                        Ok(new_prov) => {
+                            active_provider = Arc::from(new_prov);
+                            route.provider = new_provider;
+                            route.model = new_model;
+                            clear_model_switch_request();
 
             // Handle model switch: re-create the provider and retry
             if let LlmExecutionResult::Completed(Ok(Err(ref e))) = loop_result {
@@ -4933,12 +5010,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
 
     // Filter out tools excluded for non-CLI channels so the system prompt
     // does not advertise them for channel-driven runs.
-    // Skip this filter when autonomy is `Full` — full-autonomy agents keep
-    // all tools available regardless of channel.
-    let excluded = &config.autonomy.non_cli_excluded_tools;
-    if !excluded.is_empty() && config.autonomy.level != AutonomyLevel::Full {
-        tool_descs.retain(|(name, _)| !excluded.iter().any(|ex| ex == name));
-    }
+    apply_non_cli_tool_desc_exclusions(&mut tool_descs, &config.autonomy.non_cli_excluded_tools);
 
     let bootstrap_max_chars = if config.agent.compact_context {
         Some(6000)
@@ -8523,6 +8595,36 @@ BTC is currently around $65,000 based on latest tool output."#
             prompt.contains("Prefer `trash` over `rm`"),
             "trash-over-rm hint must remain"
         );
+    }
+
+    #[test]
+    fn non_cli_excluded_tools_still_apply_for_full_autonomy_channels() {
+        let mut tool_descs = vec![
+            ("shell", "Run commands"),
+            ("memory_recall", "Search memory"),
+            ("web_search", "Search the web"),
+        ];
+        let excluded = vec!["shell".to_string(), "web_search".to_string()];
+
+        apply_non_cli_tool_desc_exclusions(&mut tool_descs, &excluded);
+
+        assert_eq!(tool_descs, vec![("memory_recall", "Search memory")]);
+    }
+
+    #[test]
+    fn runtime_non_cli_excluded_tools_apply_for_wecom_ws() {
+        let excluded = vec!["shell".to_string(), "web_search".to_string()];
+        let selected = non_cli_excluded_tools_for_channel("wecom_ws", &excluded);
+
+        assert_eq!(selected, excluded.as_slice());
+    }
+
+    #[test]
+    fn runtime_non_cli_excluded_tools_still_skip_cli() {
+        let excluded = vec!["shell".to_string()];
+        let selected = non_cli_excluded_tools_for_channel("cli", &excluded);
+
+        assert!(selected.is_empty());
     }
 
     #[test]
