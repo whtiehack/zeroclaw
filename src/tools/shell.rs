@@ -685,6 +685,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn shell_executes_when_shell_policy_disabled() {
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            allowed_commands: vec![],
+            disable_shell_policy: true,
+            workspace_dir: std::env::temp_dir(),
+            ..SecurityPolicy::default()
+        });
+        let tool = ShellTool::new(security, test_runtime());
+        let result = tool
+            .execute(json!({"command": "echo shell-policy-disabled"}))
+            .await
+            .expect("command should execute when shell policy is disabled");
+        assert!(result.success);
+        assert!(result.output.contains("shell-policy-disabled"));
+    }
+
+    #[tokio::test]
     async fn shell_handles_nonexistent_command() {
         let security = Arc::new(SecurityPolicy {
             autonomy: AutonomyLevel::Full,

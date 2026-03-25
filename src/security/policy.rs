@@ -79,6 +79,7 @@ impl Clone for ActionTracker {
 
 /// Security policy enforced on all tool executions
 #[derive(Debug, Clone)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct SecurityPolicy {
     pub autonomy: AutonomyLevel,
     pub workspace_dir: PathBuf,
@@ -90,6 +91,7 @@ pub struct SecurityPolicy {
     pub max_cost_per_day_cents: u32,
     pub require_approval_for_medium_risk: bool,
     pub block_high_risk_commands: bool,
+    pub disable_shell_policy: bool,
     pub shell_env_passthrough: Vec<String>,
     pub tracker: ActionTracker,
 }
@@ -222,6 +224,7 @@ impl Default for SecurityPolicy {
             max_cost_per_day_cents: 500,
             require_approval_for_medium_risk: true,
             block_high_risk_commands: true,
+            disable_shell_policy: false,
             shell_env_passthrough: vec![],
             tracker: ActionTracker::new(),
         }
@@ -848,6 +851,10 @@ impl SecurityPolicy {
         command: &str,
         approved: bool,
     ) -> Result<CommandRiskLevel, String> {
+        if self.disable_shell_policy {
+            return Ok(CommandRiskLevel::Low);
+        }
+
         if !self.is_command_allowed(command) {
             return Err(format!("Command not allowed by security policy: {command}"));
         }
@@ -1051,6 +1058,10 @@ impl SecurityPolicy {
     /// This is best-effort token parsing for shell commands and is intended
     /// as a safety gate before command execution.
     pub fn forbidden_path_argument(&self, command: &str) -> Option<String> {
+        if self.disable_shell_policy {
+            return None;
+        }
+
         let forbidden_candidate = |raw: &str| {
             let candidate = strip_wrapping_quotes(raw).trim();
             if candidate.is_empty() || candidate.contains("://") {
@@ -1392,6 +1403,7 @@ impl SecurityPolicy {
             max_cost_per_day_cents: autonomy_config.max_cost_per_day_cents,
             require_approval_for_medium_risk: autonomy_config.require_approval_for_medium_risk,
             block_high_risk_commands: autonomy_config.block_high_risk_commands,
+            disable_shell_policy: autonomy_config.disable_shell_policy,
             shell_env_passthrough: autonomy_config.shell_env_passthrough.clone(),
             tracker: ActionTracker::new(),
         }
@@ -1970,6 +1982,7 @@ mod tests {
             max_cost_per_day_cents: 1000,
             require_approval_for_medium_risk: false,
             block_high_risk_commands: false,
+            disable_shell_policy: true,
             shell_env_passthrough: vec!["DATABASE_URL".into()],
             ..crate::config::AutonomyConfig::default()
         };
@@ -1984,6 +1997,7 @@ mod tests {
         assert_eq!(policy.max_cost_per_day_cents, 1000);
         assert!(!policy.require_approval_for_medium_risk);
         assert!(!policy.block_high_risk_commands);
+        assert!(policy.disable_shell_policy);
         assert_eq!(policy.shell_env_passthrough, vec!["DATABASE_URL"]);
         assert_eq!(policy.workspace_dir, PathBuf::from("/tmp/test-workspace"));
     }
@@ -2028,7 +2042,32 @@ mod tests {
         assert!(p.max_cost_per_day_cents > 0);
         assert!(p.require_approval_for_medium_risk);
         assert!(p.block_high_risk_commands);
+        assert!(!p.disable_shell_policy);
         assert!(p.shell_env_passthrough.is_empty());
+    }
+
+    #[test]
+    fn disable_shell_policy_bypasses_command_validation() {
+        let p = SecurityPolicy {
+            allowed_commands: vec![],
+            disable_shell_policy: true,
+            ..SecurityPolicy::default()
+        };
+
+        assert_eq!(
+            p.validate_command_execution("rm -rf /", false),
+            Ok(CommandRiskLevel::Low)
+        );
+    }
+
+    #[test]
+    fn disable_shell_policy_skips_forbidden_path_argument() {
+        let p = SecurityPolicy {
+            disable_shell_policy: true,
+            ..SecurityPolicy::default()
+        };
+
+        assert_eq!(p.forbidden_path_argument("cat /etc/passwd"), None);
     }
 
     // ── ActionTracker / rate limiting ───────────────────────

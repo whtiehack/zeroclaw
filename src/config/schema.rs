@@ -5196,6 +5196,7 @@ impl Default for WebhookAuditConfig {
 /// risk approval gates, and per-policy budgets.
 #[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[allow(clippy::struct_excessive_bools)]
 #[serde(default)]
 pub struct AutonomyConfig {
     /// Autonomy level: `read_only`, `supervised` (default), or `full`.
@@ -5219,6 +5220,11 @@ pub struct AutonomyConfig {
     /// Block high-risk shell commands even if allowlisted.
     #[serde(default = "default_true")]
     pub block_high_risk_commands: bool,
+
+    /// Disable shell policy checks (allowlist, risk gate, forbidden path gate).
+    /// Action-rate limiting still remains active.
+    #[serde(default)]
+    pub disable_shell_policy: bool,
 
     /// Additional environment variables allowed for shell tool subprocesses.
     ///
@@ -5337,6 +5343,7 @@ impl Default for AutonomyConfig {
             max_cost_per_day_cents: 500,
             require_approval_for_medium_risk: true,
             block_high_risk_commands: true,
+            disable_shell_policy: false,
             shell_env_passthrough: vec![],
             auto_approve: default_auto_approve(),
             always_ask: default_always_ask(),
@@ -11121,6 +11128,7 @@ mod tests {
         assert_eq!(a.max_cost_per_day_cents, 500);
         assert!(a.require_approval_for_medium_risk);
         assert!(a.block_high_risk_commands);
+        assert!(!a.disable_shell_policy);
         assert!(a.shell_env_passthrough.is_empty());
     }
 
@@ -11336,6 +11344,7 @@ auto_save = true
                 max_cost_per_day_cents: 1000,
                 require_approval_for_medium_risk: false,
                 block_high_risk_commands: true,
+                disable_shell_policy: false,
                 shell_env_passthrough: vec!["DATABASE_URL".into()],
                 auto_approve: vec!["file_read".into()],
                 always_ask: vec![],
