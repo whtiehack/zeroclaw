@@ -54,19 +54,50 @@
 
 ### 阶段 1：需求与落点确认
 
-状态：待执行
+状态：已完成
 
 - 以 [branch-features.md](./branch-features.md) 列出必须保留的功能
 - 将功能拆成三类：`wecom_ws` 本体、必需公共补丁、可放弃历史补丁
 - 对每项功能先定位到当前上游代码落点，再开始写代码
 
+2026-03-25 当前结论：
+
+- `wecom_ws` 在上游不存在，需要新增独立 channel 文件并接入当前 channel factory
+- 上游已存在旧 `wecom` webhook channel，因此 `wecom_ws` 必须以新配置项并列接入，不能复用旧 `wecom` 配置
+- 最小接入落点已确认：
+  - `src/channels/mod.rs`
+  - `src/config/schema.rs`
+  - `src/cron/mod.rs`
+  - `src/cron/scheduler.rs`
+  - `src/channels/wecom_ws.rs`
+- 当前判断为“先接入 `wecom_ws` 本体 + 配置层 + cron announce 最小支持”，其余公共层补丁延后按缺口重判
+- 上游当前已有 streaming / draft / prompt / provider 新实现，因此旧 `master_wecom` 的相关公共补丁不作为首轮迁移目标
+
 ### 阶段 2：最小接入 `wecom_ws`
 
-状态：待执行
+状态：进行中
 
 - 先让 `wecom_ws` 以最小可编译形式接入 channel registry 和配置层
 - 再补齐核心收发链路，不预先搬运非必要增强
 - 如果旧实现依赖上游已变化的 draft/streaming 接口，按新接口重接，不回退上游实现
+
+2026-03-25 当前进展：
+
+- 已新增 `src/channels/wecom_ws.rs`
+- 已接入 `src/channels/mod.rs` 的 channel factory
+- 已新增 `ChannelsConfig.wecom_ws` 与 `WeComWsConfig`
+- 已补上 `wecom_ws` secret 的配置加解密路径
+- 已接入 `cron` 的 `delivery.channel = "wecom_ws"` 校验与运行态发送路径
+- 已恢复最小 live channel registry，供 `wecom_ws` 复用现有长连接
+- 已确认 `/new`、`/stop`、`/models`、`/model`、`/config` 在 `wecom_ws` 路径上具备运行时接线
+- 已确认 `interrupt_on_new_message` 在 `wecom_ws` 路径上生效
+
+已完成验证：
+
+- `cargo check`
+- `cargo fmt --all -- --check`
+- `cargo clippy --all-targets -- -D warnings`
+- `cargo test wecom_ws --lib`
 
 ### 阶段 3：补必要公共层差异
 
