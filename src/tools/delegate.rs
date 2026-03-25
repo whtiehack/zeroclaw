@@ -1995,7 +1995,7 @@ mod tests {
             "should contain workspace path"
         );
         assert!(
-            prompt.contains("## CRITICAL CONTEXT: CURRENT DATE & TIME"),
+            prompt.contains("## Current Date"),
             "should contain datetime section"
         );
         assert!(
