@@ -230,6 +230,24 @@
    - 下一步：
      - 根据真实测试结果再调整时间窗，不改动公共层接口
 
+7. 已完成：`wecom_ws` 对话历史不再被每次 `req_id` 切成新会话
+   - 修改：
+     - 在公共层 `conversation_history_key()` 增加最小 `wecom_ws` 特判
+     - `wecom_ws` 继续保留 `thread_ts=req_id` 作为回复锚点
+     - 但历史分桶对 `wecom_ws` 不再使用 `thread_ts`
+   - 原因：
+     - `wecom_ws` 的 `thread_ts` 不是像 Slack 那样的真实线程 id，而是每次入站都会变化的 transport req_id
+     - 如果继续把它并入 history key，就会导致每条消息都命中新 key，表现为“每次对话都是新的”
+     - 这次按用户要求收窄为 `wecom_ws` 特判，不扩大到所有 channel 的 history key 语义调整
+   - 验证：
+     - `cargo test conversation_history_key_wecom_ws_ignores_req_id_thread_ts --lib`
+     - `cargo test process_channel_message_restores_wecom_ws_history_across_req_ids --lib`
+     - `cargo test wecom_ws --lib`
+   - 当前剩余：
+     - 继续观察 `wecom_ws` 是否还有其他“回复锚点字段参与公共层逻辑”的回归点
+   - 下一步：
+     - 如无新反馈，保持该特判不再扩散
+
 ### 阶段 4：验证与收口
 
 状态：已完成
