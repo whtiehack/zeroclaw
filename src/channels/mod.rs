@@ -280,6 +280,48 @@ fn apply_non_cli_tool_desc_exclusions<'a>(
     tool_descs.retain(|(name, _)| !excluded.iter().any(|ex| ex == name));
 }
 
+fn autosave_message_chars(channel: &str, content: &str) -> usize {
+    if channel == "wecom_ws" {
+        strip_wecom_ws_autosave_prefixes(content).chars().count()
+    } else {
+        content.chars().count()
+    }
+}
+
+fn strip_wecom_ws_autosave_prefixes(content: &str) -> &str {
+    let mut remaining = content.trim_start();
+
+    if remaining.starts_with("[sender_userid=") {
+        remaining = strip_wecom_ws_line_prefix(remaining).unwrap_or(remaining);
+        remaining = remaining.trim_start();
+    }
+
+    if remaining.starts_with('[') && !remaining.starts_with("[WECOM_QUOTE]") {
+        remaining = strip_wecom_ws_line_prefix(remaining).unwrap_or(remaining);
+        remaining = remaining.trim_start();
+    }
+
+    if remaining.starts_with("[WECOM_QUOTE]") {
+        remaining = strip_wecom_ws_quote_prefix(remaining).unwrap_or(remaining);
+        remaining = remaining.trim_start();
+    }
+
+    remaining
+}
+
+fn strip_wecom_ws_line_prefix(content: &str) -> Option<&str> {
+    let line_end = content.find('\n').unwrap_or(content.len());
+    let line = &content[..line_end];
+    let end_idx = line.find(']')?;
+    Some(&content[end_idx + 1..])
+}
+
+fn strip_wecom_ws_quote_prefix(content: &str) -> Option<&str> {
+    let rest = content.strip_prefix("[WECOM_QUOTE]")?;
+    let end_idx = rest.find("[/WECOM_QUOTE]")?;
+    Some(&rest[end_idx + "[/WECOM_QUOTE]".len()..])
+}
+
 fn channel_message_timeout_budget_secs(
     message_timeout_secs: u64,
     max_tool_iterations: usize,
@@ -2477,18 +2519,9 @@ async fn process_channel_message(
             return;
         }
     };
-    let autosave_min_chars = if msg.channel == "wecom_ws" {
-        AUTOSAVE_MIN_MESSAGE_CHARS
-            + if msg.reply_target.starts_with("group--") {
-                60
-            } else {
-                29
-            }
-    } else {
-        AUTOSAVE_MIN_MESSAGE_CHARS
-    };
+    let autosave_content_chars = autosave_message_chars(&msg.channel, &msg.content);
     if ctx.auto_save_memory
-        && msg.content.chars().count() >= autosave_min_chars
+        && autosave_content_chars >= AUTOSAVE_MIN_MESSAGE_CHARS
         && !memory::should_skip_autosave_content(&msg.content)
     {
         let autosave_key = conversation_memory_key(&msg);
@@ -3107,7 +3140,7 @@ async fn process_channel_message(
             );
 
             // Fire-and-forget LLM-driven memory consolidation.
-            if ctx.auto_save_memory && msg.content.chars().count() >= autosave_min_chars {
+            if ctx.auto_save_memory && autosave_content_chars >= AUTOSAVE_MIN_MESSAGE_CHARS {
                 let provider = Arc::clone(&ctx.provider);
                 let model = ctx.model.to_string();
                 let memory = Arc::clone(&ctx.memory);
