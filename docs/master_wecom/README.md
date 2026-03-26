@@ -62,7 +62,7 @@
 
 | 文件 | 说明 |
 |------|------|
-| [branch-features.md](./branch-features.md) | 分支独有功能清单 |
+| [branch-features.md](./branch-features.md) | 功能清单（新增功能时先登记，链接到详细文档） |
 | [TEMPLATE-master-sync.md](./TEMPLATE-master-sync.md) | 合并记录模板 |
 
 ### 历史参考
