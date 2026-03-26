@@ -3,6 +3,8 @@ use crate::config::StreamMode;
 use aes::Aes256;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
+#[cfg(unix)]
+use axum::{extract::State, http::StatusCode, routing::post, Json, Router};
 use base64::Engine as _;
 use cbc::cipher::{block_padding::NoPadding, BlockDecryptMut, KeyIvInit};
 use chrono::Local;
@@ -10,11 +12,15 @@ use futures_util::{SinkExt, StreamExt};
 use md5 as md5_crate;
 use parking_lot::Mutex;
 use rand::RngExt;
+#[cfg(unix)]
+use serde::Deserialize;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+#[cfg(unix)]
+use tokio::net::UnixListener;
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 
@@ -58,6 +64,57 @@ const WECOM_STREAM_BOOTSTRAP_CONTENT: &str =
 
 enum WsOutbound {
     Frame(Value),
+}
+
+#[cfg(unix)]
+#[derive(Debug, Deserialize)]
+struct WeComLocalSendRequest {
+    recipient: String,
+    message: String,
+}
+
+#[cfg(unix)]
+async fn handle_wecom_local_send(
+    State(channel): State<WeComWsChannel>,
+    Json(payload): Json<WeComLocalSendRequest>,
+) -> (StatusCode, Json<Value>) {
+    let recipient = payload.recipient.trim();
+    if recipient.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "ok": false,
+                "error": "recipient is required"
+            })),
+        );
+    }
+
+    let message = payload.message.trim();
+    if message.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "ok": false,
+                "error": "message is required"
+            })),
+        );
+    }
+
+    match channel.send(&SendMessage::new(message, recipient)).await {
+        Ok(()) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "ok": true
+            })),
+        ),
+        Err(err) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "ok": false,
+                "error": err.to_string()
+            })),
+        ),
+    }
 }
 
 // ── Internal types ───────────────────────────────────────────────────
@@ -336,6 +393,56 @@ impl WeComWsChannel {
         tx.send(WsOutbound::Frame(frame))
             .await
             .map_err(|_| anyhow::anyhow!("WeCom WS outbound channel closed"))
+    }
+
+    #[cfg(unix)]
+    fn local_send_socket_path(&self) -> PathBuf {
+        std::env::temp_dir().join("zeroclaw-wecom_ws.sock")
+    }
+
+    #[cfg(unix)]
+    async fn start_local_send_socket(&self) {
+        let socket_path = self.local_send_socket_path();
+
+        if let Err(err) = tokio::fs::remove_file(&socket_path).await {
+            if err.kind() != std::io::ErrorKind::NotFound {
+                tracing::warn!(
+                    path = %socket_path.display(),
+                    "[wecom_ws] failed to remove stale local send socket: {err:#}"
+                );
+                return;
+            }
+        }
+
+        let listener = match UnixListener::bind(&socket_path) {
+            Ok(listener) => listener,
+            Err(err) => {
+                tracing::warn!(
+                    path = %socket_path.display(),
+                    "[wecom_ws] failed to bind local send socket: {err:#}"
+                );
+                return;
+            }
+        };
+
+        tracing::info!(
+            path = %socket_path.display(),
+            "[wecom_ws] local send socket ready"
+        );
+
+        let app = Router::new()
+            .route("/send", post(handle_wecom_local_send))
+            .with_state(self.clone());
+
+        tokio::spawn(async move {
+            if let Err(err) = axum::serve(listener, app).await {
+                tracing::warn!(
+                    path = %socket_path.display(),
+                    "[wecom_ws] local send socket stopped: {err:#}"
+                );
+            }
+            let _ = tokio::fs::remove_file(&socket_path).await;
+        });
     }
 
     async fn ws_send_frame_and_wait_for_response(
@@ -2005,6 +2112,9 @@ impl Channel for WeComWsChannel {
             "[wecom_ws] starting WebSocket listener (bot_id={})",
             self.bot_id
         );
+
+        #[cfg(unix)]
+        self.start_local_send_socket().await;
 
         let mut backoff = WECOM_BACKOFF_INITIAL_SECS;
 
