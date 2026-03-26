@@ -2463,6 +2463,11 @@ impl Channel for WeComWsChannel {
     }
 
     async fn finalize_draft(&self, recipient: &str, message_id: &str, content: &str) -> Result<()> {
+        let content = if content.trim().is_empty() {
+            "\u{26a0}\u{fe0f} LLM \u{8fd4}\u{56de}\u{4e86}\u{7a7a}\u{6587}\u{672c}\u{ff0c}\u{53ef}\u{80fd}\u{6267}\u{884c}\u{51fa}\u{9519}"
+        } else {
+            content
+        };
         let req_id = self
             .req_id_map
             .lock()
