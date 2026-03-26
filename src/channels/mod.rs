@@ -2482,8 +2482,18 @@ async fn process_channel_message(
             return;
         }
     };
+    let autosave_min_chars = if msg.channel == "wecom_ws" {
+        AUTOSAVE_MIN_MESSAGE_CHARS
+            + if msg.reply_target.starts_with("group--") {
+                60
+            } else {
+                29
+            }
+    } else {
+        AUTOSAVE_MIN_MESSAGE_CHARS
+    };
     if ctx.auto_save_memory
-        && msg.content.chars().count() >= AUTOSAVE_MIN_MESSAGE_CHARS
+        && msg.content.chars().count() >= autosave_min_chars
         && !memory::should_skip_autosave_content(&msg.content)
     {
         let autosave_key = conversation_memory_key(&msg);
@@ -3166,7 +3176,7 @@ async fn process_channel_message(
             );
 
             // Fire-and-forget LLM-driven memory consolidation.
-            if ctx.auto_save_memory && msg.content.chars().count() >= AUTOSAVE_MIN_MESSAGE_CHARS {
+            if ctx.auto_save_memory && msg.content.chars().count() >= autosave_min_chars {
                 let provider = Arc::clone(&ctx.provider);
                 let model = ctx.model.to_string();
                 let memory = Arc::clone(&ctx.memory);
