@@ -695,25 +695,20 @@ fn build_channel_system_prompt(
 ) -> String {
     let mut prompt = base_prompt.to_string();
 
-    // Refresh the cached date section so prompt caching is stable across turns
-    // while still keeping the current day available in the system prompt.
+    // Refresh the stale datetime in the cached system prompt
     {
         let now = chrono::Local::now();
         let fresh = format!(
-            "## Current Date\n\n{} ({})\n",
-            now.format("%Y-%m-%d"),
-            now.format("%:z"),
+            "## Current Date & Time\n\n{} ({})\n",
+            now.format("%Y-%m-%d %H:%M:%S"),
+            now.format("%Z"),
         );
-        let headings = ["## Current Date\n\n", "## Current Date & Time\n\n"];
-        if let Some((start, heading)) = headings
-            .iter()
-            .find_map(|heading| prompt.find(heading).map(|start| (start, *heading)))
-        {
+        if let Some(start) = prompt.find("## Current Date & Time\n\n") {
             // Find the end of this section (next "## " heading or end of string)
-            let rest = &prompt[start + heading.len()..];
+            let rest = &prompt[start + 24..]; // skip past "## Current Date & Time\n\n"
             let section_end = rest
                 .find("\n## ")
-                .map(|i| start + heading.len() + i)
+                .map(|i| start + 24 + i)
                 .unwrap_or(prompt.len());
             prompt.replace_range(start..section_end, fresh.trim_end());
         }
@@ -3752,13 +3747,13 @@ pub fn build_system_prompt_with_mode_and_autonomy(
         load_openclaw_bootstrap_files(&mut prompt, workspace_dir, max_chars);
     }
 
-    // ── 6. Date ──────────────────────────────────────────
+    // ── 6. Date & Time ──────────────────────────────────────────
     let now = chrono::Local::now();
     let _ = writeln!(
         prompt,
-        "## Current Date\n\n{} ({})\n",
-        now.format("%Y-%m-%d"),
-        now.format("%:z")
+        "## Current Date & Time\n\n{} ({})\n",
+        now.format("%Y-%m-%d %H:%M:%S"),
+        now.format("%Z")
     );
 
     // ── 7. Runtime ──────────────────────────────────────────────
@@ -8163,22 +8158,11 @@ BTC is currently around $65,000 based on latest tool output."#
             prompt.contains("## Project Context"),
             "missing Project Context"
         );
-        assert!(prompt.contains("## Current Date"), "missing Date");
-        assert!(prompt.contains("## Runtime"), "missing Runtime section");
-    }
-
-    #[test]
-    fn build_channel_system_prompt_rewrites_datetime_section_to_date_only() {
-        let prompt = build_channel_system_prompt(
-            "Base\n\n## Current Date & Time\n\n2026-03-01 10:11:12 (CST)\n\n## Runtime\n\nHost: h",
-            "telegram",
-            "chat-1",
+        assert!(
+            prompt.contains("## Current Date & Time"),
+            "missing Date/Time"
         );
-
-        assert!(prompt.contains("## Current Date\n\n"));
-        assert!(!prompt.contains("## Current Date & Time\n\n"));
-        assert!(!prompt.contains("10:11:12"));
-        assert!(prompt.contains("## Runtime"));
+        assert!(prompt.contains("## Runtime"), "missing Runtime section");
     }
 
     #[test]
