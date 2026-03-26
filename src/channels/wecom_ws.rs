@@ -397,12 +397,22 @@ impl WeComWsChannel {
 
     #[cfg(unix)]
     fn local_send_socket_path(&self) -> PathBuf {
-        std::env::temp_dir().join("zeroclaw-wecom_ws.sock")
+        self.cfg.workspace_dir.join("tmp/zeroclaw-wecom_ws.sock")
     }
 
     #[cfg(unix)]
     async fn start_local_send_socket(&self) {
         let socket_path = self.local_send_socket_path();
+
+        if let Some(parent) = socket_path.parent() {
+            if let Err(err) = tokio::fs::create_dir_all(parent).await {
+                tracing::warn!(
+                    path = %parent.display(),
+                    "[wecom_ws] failed to create local send socket directory: {err:#}"
+                );
+                return;
+            }
+        }
 
         if let Err(err) = tokio::fs::remove_file(&socket_path).await {
             if err.kind() != std::io::ErrorKind::NotFound {
