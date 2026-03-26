@@ -700,7 +700,7 @@ fn build_channel_system_prompt(
         let now = chrono::Local::now();
         let fresh = format!(
             "## Current Date & Time\n\n{} ({})\n",
-            now.format("%Y-%m-%d %H:%M:%S"),
+            now.format("%Y-%m-%d"),
             now.format("%Z"),
         );
         if let Some(start) = prompt.find("## Current Date & Time\n\n") {
@@ -3752,7 +3752,7 @@ pub fn build_system_prompt_with_mode_and_autonomy(
     let _ = writeln!(
         prompt,
         "## Current Date & Time\n\n{} ({})\n",
-        now.format("%Y-%m-%d %H:%M:%S"),
+        now.format("%Y-%m-%d"),
         now.format("%Z")
     );
 
