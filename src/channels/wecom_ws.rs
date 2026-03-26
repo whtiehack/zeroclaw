@@ -3900,7 +3900,7 @@ mod tests {
         );
         assert_eq!(
             extract_runtime_routing_command(" /CONFIG@zeroclaw "),
-            Some("/CONFIG@zeroclaw".to_string())
+            Some("/CONFIG".to_string())
         );
     }
 
