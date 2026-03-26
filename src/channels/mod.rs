@@ -2696,8 +2696,6 @@ async fn process_channel_message(
     } else {
         None
     };
-
-<<<<<<< HEAD
     // Spawn the appropriate handler for the delta channel.
     let draft_updater = if use_draft_streaming {
         // Partial: accumulate text and edit a single draft message.
@@ -2874,68 +2872,6 @@ async fn process_channel_message(
                     ),
                 ) => LlmExecutionResult::Completed(result),
             };
-    let llm_result = loop {
-        let loop_result = tokio::select! {
-            () = cancellation_token.cancelled() => LlmExecutionResult::Cancelled,
-            result = tokio::time::timeout(
-                Duration::from_secs(timeout_budget_secs),
-                crate::agent::loop_::TOOL_LOOP_COST_TRACKING_CONTEXT.scope(
-                    cost_tracking_context.clone(),
-                run_tool_call_loop(
-                    active_provider.as_ref(),
-                    &mut history,
-                    ctx.tools_registry.as_ref(),
-                    notify_observer.as_ref() as &dyn Observer,
-                    route.provider.as_str(),
-                    route.model.as_str(),
-                    runtime_defaults.temperature,
-                    true,
-                    Some(&*ctx.approval_manager),
-                    msg.channel.as_str(),
-                    Some(msg.reply_target.as_str()),
-                    &ctx.multimodal,
-                    ctx.max_tool_iterations,
-                    Some(cancellation_token.clone()),
-                    delta_tx.clone(),
-                    ctx.hooks.as_deref(),
-                    non_cli_excluded_tools_for_channel(
-                        msg.channel.as_str(),
-                        ctx.non_cli_excluded_tools.as_ref(),
-                    ),
-                    ctx.tool_call_dedup_exempt.as_ref(),
-                    ctx.activated_tools.as_ref(),
-                    Some(model_switch_callback.clone()),
-                    &ctx.pacing,
-                ),
-                ),
-            ) => LlmExecutionResult::Completed(result),
-        };
-
-        // Handle model switch: re-create the provider and retry
-        if let LlmExecutionResult::Completed(Ok(Err(ref e))) = loop_result {
-            if let Some((new_provider, new_model)) = is_model_switch_requested(e) {
-                tracing::info!(
-                    "Model switch requested, switching from {} {} to {} {}",
-                    route.provider,
-                    route.model,
-                    new_provider,
-                    new_model
-                );
-
-                    match create_resilient_provider_nonblocking(
-                        &new_provider,
-                        ctx.api_key.clone(),
-                        ctx.api_url.clone(),
-                        ctx.reliability.as_ref().clone(),
-                        ctx.provider_runtime_options.clone(),
-                    )
-                    .await
-                    {
-                        Ok(new_prov) => {
-                            active_provider = Arc::from(new_prov);
-                            route.provider = new_provider;
-                            route.model = new_model;
-                            clear_model_switch_request();
 
             // Handle model switch: re-create the provider and retry
             if let LlmExecutionResult::Completed(Ok(Err(ref e))) = loop_result {
