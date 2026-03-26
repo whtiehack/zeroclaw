@@ -2526,7 +2526,7 @@ impl Channel for WeComWsChannel {
         }
 
         match self
-            .ws_send_respond_msg(&req_id, message_id, "", true)
+            .ws_send_respond_msg(&req_id, message_id, "消息已中断", true)
             .await
         {
             Ok(()) => Ok(()),
@@ -5179,6 +5179,63 @@ mod tests {
                     state.after_clear && state.after_clear_last_flush_at.is_some()
                 }),
             "clear sentinel should flip the local draft state into final mode"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancel_draft_sends_interrupted_message_and_finishes_stream() {
+        let config = test_wecom_ws_config();
+        let channel = WeComWsChannel::new(&config, Path::new("/tmp")).unwrap();
+
+        let (tx, mut rx) = mpsc::channel::<WsOutbound>(4);
+        *channel.ws_tx.lock().await = Some(tx);
+        channel
+            .req_id_map
+            .lock()
+            .insert("stream-cancel".to_string(), "req-cancel".to_string());
+        channel
+            .draft_states
+            .lock()
+            .insert("stream-cancel".to_string(), StreamDraftState::default());
+
+        let cancel = {
+            let channel = channel.clone();
+            tokio::spawn(async move { channel.cancel_draft("user--zeroclaw_user", "stream-cancel").await })
+        };
+
+        let Some(WsOutbound::Frame(frame)) =
+            tokio::time::timeout(Duration::from_millis(250), rx.recv())
+                .await
+                .expect("cancel_draft should send a websocket frame")
+        else {
+            panic!("expected cancel_draft respond_msg frame");
+        };
+
+        assert_eq!(
+            frame.pointer("/body/stream/content").and_then(Value::as_str),
+            Some("消息已中断")
+        );
+        assert_eq!(
+            frame.pointer("/body/stream/finish").and_then(Value::as_bool),
+            Some(true)
+        );
+
+        channel
+            .maybe_handle_command_response(&serde_json::json!({
+                "headers": { "req_id": frame_req_id(&frame) },
+                "errcode": 0,
+                "errmsg": "ok"
+            }))
+            .await;
+        cancel.await.unwrap().unwrap();
+
+        assert!(
+            channel.req_id_map.lock().get("stream-cancel").is_none(),
+            "cancel_draft should drop the req_id mapping"
+        );
+        assert!(
+            channel.draft_states.lock().get("stream-cancel").is_none(),
+            "cancel_draft should clear local draft state"
         );
     }
 
