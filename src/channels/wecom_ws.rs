@@ -1032,7 +1032,7 @@ impl WeComWsChannel {
             return;
         }
 
-        if let Some(runtime_command) = extract_runtime_model_switch_command(&stop_text) {
+        if let Some(runtime_command) = extract_runtime_routing_command(&stop_text) {
             tracing::info!(
                 "WeCom runtime command forwarded: scope={} msg_id={} command={}",
                 scopes.conversation_scope,
@@ -2884,10 +2884,21 @@ fn is_stop_runtime_command(text: &str) -> bool {
 
 fn is_clear_session_command(text: &str) -> bool {
     let stripped = strip_edge_mentions(text);
-    stripped.eq_ignore_ascii_case("/clear") || stripped.eq_ignore_ascii_case("/new")
+    if stripped.is_empty() {
+        return false;
+    }
+
+    let mut parts = stripped.split_whitespace();
+    let command_token = parts.next().unwrap_or("");
+    if parts.next().is_some() {
+        return false;
+    }
+
+    let base_command = command_token.split('@').next().unwrap_or(command_token);
+    base_command.eq_ignore_ascii_case("/clear") || base_command.eq_ignore_ascii_case("/new")
 }
 
-fn extract_runtime_model_switch_command(text: &str) -> Option<String> {
+fn extract_runtime_routing_command(text: &str) -> Option<String> {
     let stripped = strip_edge_mentions(text);
     if stripped.is_empty() || !stripped.starts_with('/') {
         return None;
@@ -2895,7 +2906,10 @@ fn extract_runtime_model_switch_command(text: &str) -> Option<String> {
 
     let command_token = stripped.split_whitespace().next()?;
     let base_command = command_token.split('@').next().unwrap_or(command_token);
-    if base_command.eq_ignore_ascii_case("/model") || base_command.eq_ignore_ascii_case("/models") {
+    if base_command.eq_ignore_ascii_case("/model")
+        || base_command.eq_ignore_ascii_case("/models")
+        || base_command.eq_ignore_ascii_case("/config")
+    {
         Some(stripped)
     } else {
         None
@@ -3852,6 +3866,8 @@ mod tests {
         assert!(is_clear_session_command("/clear @bot"));
         assert!(is_clear_session_command("@bot1 @bot2 /new"));
         assert!(is_clear_session_command("@bot /new @other"));
+        assert!(is_clear_session_command("/clear@zeroclaw"));
+        assert!(is_clear_session_command("/new@zeroclaw"));
     }
 
     #[test]
@@ -3865,29 +3881,34 @@ mod tests {
     }
 
     #[test]
-    fn runtime_model_switch_command_with_mentions() {
+    fn runtime_routing_command_with_mentions() {
         assert_eq!(
-            extract_runtime_model_switch_command("@bot /model gpt-5 @other"),
+            extract_runtime_routing_command("@bot /model gpt-5 @other"),
             Some("/model gpt-5".to_string())
         );
         assert_eq!(
-            extract_runtime_model_switch_command("@bot /models openrouter"),
+            extract_runtime_routing_command("@bot /models openrouter"),
             Some("/models openrouter".to_string())
         );
         assert_eq!(
-            extract_runtime_model_switch_command(" /MODEL@zeroclaw qwen-max "),
+            extract_runtime_routing_command(" /MODEL@zeroclaw qwen-max "),
             Some("/MODEL@zeroclaw qwen-max".to_string())
+        );
+        assert_eq!(
+            extract_runtime_routing_command("@bot /config @other"),
+            Some("/config".to_string())
+        );
+        assert_eq!(
+            extract_runtime_routing_command(" /CONFIG@zeroclaw "),
+            Some("/CONFIG@zeroclaw".to_string())
         );
     }
 
     #[test]
-    fn runtime_model_switch_command_rejects_non_commands() {
-        assert_eq!(extract_runtime_model_switch_command("/new"), None);
-        assert_eq!(
-            extract_runtime_model_switch_command("please /model gpt-5"),
-            None
-        );
-        assert_eq!(extract_runtime_model_switch_command(""), None);
+    fn runtime_routing_command_rejects_non_commands() {
+        assert_eq!(extract_runtime_routing_command("/new"), None);
+        assert_eq!(extract_runtime_routing_command("please /model gpt-5"), None);
+        assert_eq!(extract_runtime_routing_command(""), None);
     }
 
     #[test]
@@ -4806,6 +4827,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn group_config_command_forwards_group_scoped_sender() {
+        let mut config = test_wecom_ws_config();
+        config.allowed_groups = vec!["zeroclaw_group".to_string()];
+        let channel = WeComWsChannel::new(&config, Path::new("/tmp")).unwrap();
+
+        let (tx, mut rx) = mpsc::channel::<ChannelMessage>(1);
+        channel
+            .handle_msg_callback(
+                serde_json::json!({
+                    "headers": { "req_id": "req-config-group" },
+                    "body": {
+                        "msgtype": "text",
+                        "msgid": "msg-config-group",
+                        "chattype": "group",
+                        "chatid": "zeroclaw_group",
+                        "from": { "userid": "zeroclaw_user" },
+                        "text": { "content": "@bot /config" }
+                    }
+                }),
+                &tx,
+            )
+            .await;
+
+        let forwarded = tokio::time::timeout(Duration::from_millis(100), rx.recv())
+            .await
+            .expect("group config command should be forwarded promptly")
+            .expect("group config command should produce a framework message");
+        assert_eq!(forwarded.content, "/config");
+        assert_eq!(forwarded.sender, "group--zeroclaw_group");
+        assert_eq!(forwarded.reply_target, "group--zeroclaw_group");
+        assert_eq!(forwarded.thread_ts.as_deref(), Some("req-config-group"));
+    }
+
+    #[tokio::test]
     async fn unauthorized_group_message_replies_with_chatid_and_does_not_forward() {
         let config = test_wecom_ws_config();
         let channel = WeComWsChannel::new(&config, Path::new("/tmp")).unwrap();
@@ -5205,7 +5260,11 @@ mod tests {
 
         let cancel = {
             let channel = channel.clone();
-            tokio::spawn(async move { channel.cancel_draft("user--zeroclaw_user", "stream-cancel").await })
+            tokio::spawn(async move {
+                channel
+                    .cancel_draft("user--zeroclaw_user", "stream-cancel")
+                    .await
+            })
         };
 
         let Some(WsOutbound::Frame(frame)) =
@@ -5217,11 +5276,15 @@ mod tests {
         };
 
         assert_eq!(
-            frame.pointer("/body/stream/content").and_then(Value::as_str),
+            frame
+                .pointer("/body/stream/content")
+                .and_then(Value::as_str),
             Some("消息已中断")
         );
         assert_eq!(
-            frame.pointer("/body/stream/finish").and_then(Value::as_bool),
+            frame
+                .pointer("/body/stream/finish")
+                .and_then(Value::as_bool),
             Some(true)
         );
 
