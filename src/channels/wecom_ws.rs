@@ -403,11 +403,12 @@ impl WeComWsChannel {
     #[cfg(unix)]
     async fn start_local_send_socket(&self) {
         let socket_path = self.local_send_socket_path();
+        let socket_log_path = absolute_log_path(&socket_path);
 
         if let Some(parent) = socket_path.parent() {
             if let Err(err) = tokio::fs::create_dir_all(parent).await {
                 tracing::warn!(
-                    path = %parent.display(),
+                    path = %absolute_log_path(parent).display(),
                     "[wecom_ws] failed to create local send socket directory: {err:#}"
                 );
                 return;
@@ -417,7 +418,7 @@ impl WeComWsChannel {
         if let Err(err) = tokio::fs::remove_file(&socket_path).await {
             if err.kind() != std::io::ErrorKind::NotFound {
                 tracing::warn!(
-                    path = %socket_path.display(),
+                    path = %socket_log_path.display(),
                     "[wecom_ws] failed to remove stale local send socket: {err:#}"
                 );
                 return;
@@ -428,7 +429,7 @@ impl WeComWsChannel {
             Ok(listener) => listener,
             Err(err) => {
                 tracing::warn!(
-                    path = %socket_path.display(),
+                    path = %socket_log_path.display(),
                     "[wecom_ws] failed to bind local send socket: {err:#}"
                 );
                 return;
@@ -436,7 +437,7 @@ impl WeComWsChannel {
         };
 
         tracing::info!(
-            path = %socket_path.display(),
+            path = %socket_log_path.display(),
             "[wecom_ws] local send socket ready"
         );
 
@@ -447,7 +448,7 @@ impl WeComWsChannel {
         tokio::spawn(async move {
             if let Err(err) = axum::serve(listener, app).await {
                 tracing::warn!(
-                    path = %socket_path.display(),
+                    path = %socket_log_path.display(),
                     "[wecom_ws] local send socket stopped: {err:#}"
                 );
             }
@@ -2852,6 +2853,17 @@ fn random_ascii_token(len: usize) -> String {
 
 fn next_stream_id() -> String {
     format!("zs_{}", random_ascii_token(20))
+}
+
+#[cfg(unix)]
+fn absolute_log_path(path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join(path)
+    }
 }
 
 fn is_stop_runtime_command(text: &str) -> bool {
