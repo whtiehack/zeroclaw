@@ -4,9 +4,7 @@
 
 ## 分支语境
 
-- 当前分支基于 `upstream/master` 重建，不是旧 `master_wecom` 的直接延续
-- 功能需求以 [branch-features.md](./branch-features.md) 为唯一来源
-- 后续同步上游优先使用 `rebase`
+- `master_wecom` 是企业微信 AI Bot 通道（`wecom_ws`）的主开发分支
 
 ## 开发约束
 
@@ -32,9 +30,7 @@
 
 ### Prompt 与时间
 
-- 对 prompt/time/date 的改动遵循最小必要原则
-- `## Current Date & Time` 只去掉时分秒，保留标题和 `%Z` 时区缩写
-- 其他时间链路不顺手联动修改
+- prompt/time 改动遵循最小必要原则，不顺手联动修改其他时间链路
 
 ### 构建与测试
 
@@ -45,6 +41,15 @@
 
 - 公共层、`wecom_ws`、`docs/master_wecom/` 三类提交分开
 - 文档驱动开发：先记文档、列待办，再按文档推进
+
+### 上游交互
+
+- 向上游提 PR / issue 时，不得带入 `wecom_ws` 分支语境，因为上游没有 `wecom_ws`
+- 涉及公共层问题时，用上游已有的 channel（如 `telegram`）举例，日志和路径一律脱敏
+
+### 新功能记录
+
+- 在本分支添加新功能时，须在 `docs/master_wecom/` 下新建独立文档记录
 
 ### 协作
 
@@ -57,7 +62,7 @@
 
 | 文件 | 说明 |
 |------|------|
-| [branch-features.md](./branch-features.md) | 分支独有功能清单（唯一需求来源） |
+| [branch-features.md](./branch-features.md) | 分支独有功能清单 |
 | [TEMPLATE-master-sync.md](./TEMPLATE-master-sync.md) | 合并记录模板 |
 
 ### 历史参考
