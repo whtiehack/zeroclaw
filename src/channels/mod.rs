@@ -415,6 +415,7 @@ struct InterruptOnNewMessageConfig {
     discord: bool,
     mattermost: bool,
     matrix: bool,
+    wecom_ws: bool,
 }
 
 impl InterruptOnNewMessageConfig {
@@ -425,6 +426,7 @@ impl InterruptOnNewMessageConfig {
             "discord" => self.discord,
             "mattermost" => self.mattermost,
             "matrix" => self.matrix,
+            "wecom_ws" => self.wecom_ws,
             _ => false,
         }
     }
@@ -5380,6 +5382,11 @@ pub async fn start_channels(config: Config) -> Result<()> {
         .matrix
         .as_ref()
         .is_some_and(|mx| mx.interrupt_on_new_message);
+    let interrupt_on_new_message_wecom_ws = config
+        .channels_config
+        .wecom_ws
+        .as_ref()
+        .is_some_and(|wc| wc.interrupt_on_new_message);
 
     let runtime_ctx = Arc::new(ChannelRuntimeContext {
         channels_by_name,
@@ -5411,6 +5418,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
             discord: interrupt_on_new_message_discord,
             mattermost: interrupt_on_new_message_mattermost,
             matrix: interrupt_on_new_message_matrix,
+            wecom_ws: interrupt_on_new_message_wecom_ws,
         },
         multimodal: config.multimodal.clone(),
         media_pipeline: config.media_pipeline.clone(),
@@ -11305,6 +11313,7 @@ This is an example JSON object for profile settings."#;
             discord: false,
             mattermost: true,
             matrix: false,
+            wecom_ws: false,
         };
         assert!(cfg.enabled_for_channel("mattermost"));
     }
@@ -11317,6 +11326,7 @@ This is an example JSON object for profile settings."#;
             discord: false,
             mattermost: false,
             matrix: false,
+            wecom_ws: false,
         };
         assert!(!cfg.enabled_for_channel("mattermost"));
     }
@@ -11329,6 +11339,7 @@ This is an example JSON object for profile settings."#;
             discord: true,
             mattermost: false,
             matrix: false,
+            wecom_ws: false,
         };
         assert!(cfg.enabled_for_channel("discord"));
     }
@@ -11341,6 +11352,7 @@ This is an example JSON object for profile settings."#;
             discord: false,
             mattermost: false,
             matrix: false,
+            wecom_ws: false,
         };
         assert!(!cfg.enabled_for_channel("discord"));
     }
