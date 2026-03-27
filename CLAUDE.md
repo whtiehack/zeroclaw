@@ -2,6 +2,7 @@
 
 > **Shared instructions live in [`AGENTS.md`](./AGENTS.md).**
 > This file contains only Claude Code-specific directives.
+> Current Branch is `master_wecom`, read [`AGENTS.md`](./AGENTS.md) and [`docs/master_wecom/README.md`](./docs/master_wecom/README.md) before working.
 
 ## Claude Code Settings
 

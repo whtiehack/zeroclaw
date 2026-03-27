@@ -73,7 +73,7 @@ Branch/commit/PR rules:
 - Use conventional commit titles. Prefer small PRs (`size: XS/S/M`).
 - Follow `.github/pull_request_template.md` fully.
 - Never commit secrets, personal data, or real identity information (see `@docs/contributing/pr-discipline.md`).
-- Current Branch is `master_wecom`, read [`docs/master_wecom/README.md`](./docs/master_wecom/README.md) before editing.
+- Current Branch is `master_wecom`, read [`docs/master_wecom/README.md`](./docs/master_wecom/README.md) before working.
 
 ## Anti-Patterns
 
