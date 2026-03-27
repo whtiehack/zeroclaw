@@ -82,6 +82,7 @@
 | [upstream-master-divergence-report-2026-03-17.md](./upstream-master-divergence-report-2026-03-17.md) | 历史分叉分析 |
 | [master-sync-2026-03-20.md](./master-sync-2026-03-20.md) | 同步 master 记录 |
 | [master-sync-2026-03-22.md](./master-sync-2026-03-22.md) | 同步 master 记录 |
+| [master-sync-2026-03-27.md](./master-sync-2026-03-27.md) | 同步 upstream/master 记录，含 merge 冲突处理与后续公共层打断/执行日志回补 |
 | [wecom-ws-cron-delivery-merge-gap-2026-03-23.md](./wecom-ws-cron-delivery-merge-gap-2026-03-23.md) | cron delivery merge gap 记录 |
 | [full-non-cli-excluded-tools-2026-03-23.md](./full-non-cli-excluded-tools-2026-03-23.md) | non_cli_excluded_tools 决策记录 |
 | [agent-upstream-reporting-mistakes-2026-03-19.md](./agent-upstream-reporting-mistakes-2026-03-19.md) | 上游提单失误经验 |
