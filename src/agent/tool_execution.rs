@@ -16,6 +16,8 @@ use crate::util::truncate_with_ellipsis;
 // Items that still live in `loop_` — import via the parent module.
 use super::loop_::{scrub_credentials, ParsedToolCall, ToolLoopCancelled};
 
+const TOOL_SUCCESS_LOG_OUTPUT_MAX_CHARS: usize = 300;
+
 // ── Helpers ──────────────────────────────────────────────────────────────
 
 /// Look up a tool by name in a slice of boxed `dyn Tool` values.
@@ -42,7 +44,14 @@ pub(crate) async fn execute_one_tool(
     observer: &dyn Observer,
     cancellation_token: Option<&CancellationToken>,
 ) -> Result<ToolExecutionOutcome> {
-    let args_summary = truncate_with_ellipsis(&call_arguments.to_string(), 300);
+    let args_json = call_arguments.to_string();
+    tracing::info!(
+        target: "zeroclaw::agent::tool_execution",
+        tool = %call_name,
+        args = %args_json,
+        "tool call started"
+    );
+    let args_summary = truncate_with_ellipsis(&args_json, 300);
     observer.record_event(&ObserverEvent::ToolCallStart {
         tool: call_name.to_string(),
         arguments: Some(args_summary),
@@ -63,6 +72,13 @@ pub(crate) async fn execute_one_tool(
             duration,
             success: false,
         });
+        tracing::info!(
+            target: "zeroclaw::agent::tool_execution",
+            tool = %call_name,
+            duration_ms = duration.as_millis(),
+            output = %reason,
+            "tool call failed"
+        );
         return Ok(ToolExecutionOutcome {
             output: reason.clone(),
             success: false,
@@ -90,6 +106,16 @@ pub(crate) async fn execute_one_tool(
                 success: r.success,
             });
             if r.success {
+                tracing::info!(
+                    target: "zeroclaw::agent::tool_execution",
+                    tool = %call_name,
+                    duration_ms = duration.as_millis(),
+                    output = %truncate_with_ellipsis(
+                        &r.output,
+                        TOOL_SUCCESS_LOG_OUTPUT_MAX_CHARS
+                    ),
+                    "tool call succeeded"
+                );
                 Ok(ToolExecutionOutcome {
                     output: scrub_credentials(&r.output),
                     success: true,
@@ -98,6 +124,13 @@ pub(crate) async fn execute_one_tool(
                 })
             } else {
                 let reason = r.error.unwrap_or(r.output);
+                tracing::info!(
+                    target: "zeroclaw::agent::tool_execution",
+                    tool = %call_name,
+                    duration_ms = duration.as_millis(),
+                    output = %reason,
+                    "tool call failed"
+                );
                 Ok(ToolExecutionOutcome {
                     output: format!("Error: {reason}"),
                     success: false,
@@ -114,6 +147,13 @@ pub(crate) async fn execute_one_tool(
                 success: false,
             });
             let reason = format!("Error executing {call_name}: {e}");
+            tracing::info!(
+                target: "zeroclaw::agent::tool_execution",
+                tool = %call_name,
+                duration_ms = duration.as_millis(),
+                output = %reason,
+                "tool call failed"
+            );
             Ok(ToolExecutionOutcome {
                 output: reason.clone(),
                 success: false,
