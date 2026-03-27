@@ -273,6 +273,10 @@ struct StreamDraftState {
     last_content: String,
     /// Whether any tool/progress activity has been seen in this draft lifecycle.
     has_tool_activity: bool,
+    /// Content delta buffered after tool activity — might be inter-batch narration
+    /// or final answer.  Flushed into `work_log` on next Progress, discarded on
+    /// `finalize_draft` / `clear_draft_state`.
+    pending_content: String,
 }
 
 // ── MediaDecryptor (per-attachment AES key) ──────────────────────────
@@ -667,7 +671,26 @@ impl WeComWsChannel {
         let mut states = self.draft_states.lock();
         let state = states.entry(message_id.to_string()).or_default();
 
-        state.has_tool_activity = true;
+        if !state.has_tool_activity {
+            // First tool activity — seed work_log with any pre-tool narration.
+            if !state.last_content.is_empty() {
+                state.work_log.push_str(&state.last_content);
+                if !state.last_content.ends_with('\n') {
+                    state.work_log.push('\n');
+                }
+            }
+            state.has_tool_activity = true;
+        }
+
+        // Flush pending content — it was inter-batch narration, not final answer.
+        if !state.pending_content.is_empty() {
+            state.work_log.push_str(&state.pending_content);
+            if !state.pending_content.ends_with('\n') {
+                state.work_log.push('\n');
+            }
+            state.pending_content.clear();
+        }
+
         state.work_log.push_str(text);
         Some(render_work_log(&state.work_log))
     }
@@ -683,17 +706,19 @@ impl WeComWsChannel {
             return Some(sanitize_outbound_draft_content(content));
         }
 
-        // Tool activity mode — compute delta and append to work log.
+        // Tool activity mode — compute delta and buffer it.
         let delta = content
             .strip_prefix(&state.last_content)
             .unwrap_or(content);
         state.last_content.clear();
         state.last_content.push_str(content);
         if !delta.is_empty() {
-            state.work_log.push_str(delta);
+            state.pending_content.push_str(delta);
         }
 
-        Some(render_work_log(&state.work_log))
+        // Don't update display — keep showing current work_log.
+        // Pending content will be flushed on next Progress or discarded on finalize.
+        None
     }
 
     async fn fail_pending_responses(&self, reason: &str) {
@@ -3743,32 +3768,72 @@ mod tests {
     }
 
     #[test]
-    fn draft_state_progress_always_visible_in_work_log() {
+    fn draft_state_progress_seeds_pretool_narration() {
         let channel = WeComWsChannel::new(&test_wecom_ws_config(), Path::new("/tmp")).unwrap();
         channel
             .draft_states
             .lock()
-            .insert("stream-1".to_string(), StreamDraftState::default());
+            .insert("s1".to_string(), StreamDraftState::default());
 
-        // Progress always renders and marks tool activity.
-        let progress = channel
-            .note_progress_update("stream-1", "⏳ shell: ls -la\n")
+        // Model speaks before tools — normal streaming.
+        let body = channel
+            .note_content_update("s1", "Let me check\n")
+            .expect("pre-tool content should stream");
+        assert_eq!(body, "Let me check\n");
+
+        // First progress seeds work_log with pre-tool narration.
+        let wl = channel
+            .note_progress_update("s1", "⏳ shell: ls\n")
             .expect("progress should render");
-        assert!(progress.contains("shell: ls -la"));
+        assert!(wl.contains("Let me check"), "pre-tool narration should be seeded");
+        assert!(wl.contains("shell: ls"));
+    }
 
-        // Content after tool activity merges into work log.
-        let merged = channel
-            .note_content_update("stream-1", "Task started.\n")
-            .expect("content should render in work log");
-        assert!(merged.contains("shell: ls -la"));
-        assert!(merged.contains("Task started."));
+    #[test]
+    fn draft_state_content_after_tools_is_pending_not_displayed() {
+        let channel = WeComWsChannel::new(&test_wecom_ws_config(), Path::new("/tmp")).unwrap();
+        channel
+            .draft_states
+            .lock()
+            .insert("s2".to_string(), StreamDraftState::default());
 
-        // More progress keeps appending.
-        let more = channel
-            .note_progress_update("stream-1", "✅ shell done\n")
-            .expect("further progress should render");
-        assert!(more.contains("shell: ls -la"));
-        assert!(more.contains("shell done"));
+        channel.note_progress_update("s2", "⏳ tool\n");
+
+        // Content after tool activity goes to pending — not displayed.
+        assert!(
+            channel.note_content_update("s2", "Final answer").is_none(),
+            "content after tool activity should return None (pending)"
+        );
+
+        // Pending content is stored.
+        let state = channel.draft_states.lock();
+        assert_eq!(state.get("s2").unwrap().pending_content, "Final answer");
+    }
+
+    #[test]
+    fn draft_state_pending_flushed_on_next_progress() {
+        let channel = WeComWsChannel::new(&test_wecom_ws_config(), Path::new("/tmp")).unwrap();
+        channel
+            .draft_states
+            .lock()
+            .insert("s3".to_string(), StreamDraftState::default());
+
+        channel.note_progress_update("s3", "⏳ tool1\n");
+        channel.note_progress_update("s3", "✅ done\n");
+
+        // Simulate inter-batch narration (model says something between tool batches).
+        channel.note_content_update("s3", "Found it");
+
+        // Next progress flushes pending into work_log.
+        let wl = channel
+            .note_progress_update("s3", "⏳ tool2\n")
+            .expect("progress should render");
+        assert!(wl.contains("Found it"), "pending narration should be flushed");
+        assert!(wl.contains("tool2"));
+
+        // Pending is cleared.
+        let state = channel.draft_states.lock();
+        assert!(state.get("s3").unwrap().pending_content.is_empty());
     }
 
     #[test]
@@ -3777,46 +3842,18 @@ mod tests {
         channel
             .draft_states
             .lock()
-            .insert("stream-2".to_string(), StreamDraftState::default());
+            .insert("s4".to_string(), StreamDraftState::default());
 
         // No tool activity — content streams as normal accumulated text.
         let body = channel
-            .note_content_update("stream-2", "Hello world")
+            .note_content_update("s4", "Hello world")
             .expect("content should render normally");
         assert_eq!(body, "Hello world");
 
         let body2 = channel
-            .note_content_update("stream-2", "Hello world, more text")
+            .note_content_update("s4", "Hello world, more text")
             .expect("accumulated content should render");
         assert_eq!(body2, "Hello world, more text");
-    }
-
-    #[test]
-    fn draft_state_narration_then_tool_merges_into_work_log() {
-        let channel = WeComWsChannel::new(&test_wecom_ws_config(), Path::new("/tmp")).unwrap();
-        channel
-            .draft_states
-            .lock()
-            .insert("stream-3".to_string(), StreamDraftState::default());
-
-        // Model speaks first (no tool activity yet) — normal streaming.
-        let body = channel
-            .note_content_update("stream-3", "Let me check...\n")
-            .expect("initial content should render");
-        assert_eq!(body, "Let me check...\n");
-
-        // Tool starts — switches to work log mode.
-        let progress = channel
-            .note_progress_update("stream-3", "⏳ shell: ls\n")
-            .expect("progress should render");
-        assert!(progress.contains("shell: ls"));
-
-        // Further content merges into work log (delta from accumulated text).
-        let merged = channel
-            .note_content_update("stream-3", "Let me check...\nOK done.\n")
-            .expect("content delta should merge into work log");
-        assert!(merged.contains("shell: ls"));
-        assert!(merged.contains("OK done."));
     }
 
     #[test]
@@ -5285,7 +5322,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn update_draft_content_merges_into_work_log_after_tool_activity() {
+    async fn update_draft_content_after_tools_does_not_send_frame() {
         let config = test_wecom_ws_config();
         let channel = WeComWsChannel::new(&config, Path::new("/tmp")).unwrap();
 
@@ -5294,9 +5331,9 @@ mod tests {
         channel
             .req_id_map
             .lock()
-            .insert("stream-wl2".to_string(), "req-wl2".to_string());
+            .insert("stream-pend".to_string(), "req-pend".to_string());
         channel.draft_states.lock().insert(
-            "stream-wl2".to_string(),
+            "stream-pend".to_string(),
             StreamDraftState {
                 has_tool_activity: true,
                 work_log: "⏳ shell: ls\n".to_string(),
@@ -5304,45 +5341,33 @@ mod tests {
             },
         );
 
-        // Content update with tool activity should merge delta into work log.
-        let updater = {
-            let channel = channel.clone();
-            tokio::spawn(async move {
-                channel
-                    .update_draft(
-                        "user--zeroclaw_user",
-                        "stream-wl2",
-                        "Model says hello.\n",
-                    )
-                    .await
-            })
-        };
+        // Content after tool activity should NOT send a frame (goes to pending).
+        channel
+            .update_draft(
+                "user--zeroclaw_user",
+                "stream-pend",
+                "Final answer text",
+            )
+            .await
+            .unwrap();
 
-        let Some(WsOutbound::Frame(frame)) =
-            tokio::time::timeout(Duration::from_millis(250), rx.recv())
-                .await
-                .expect("content with tool activity should send a frame")
-        else {
-            panic!("expected respond_msg frame");
-        };
-        let content = frame
-            .pointer("/body/stream/content")
-            .and_then(Value::as_str)
-            .unwrap_or("");
         assert!(
-            content.contains("shell: ls") && content.contains("Model says hello."),
-            "frame should contain both work log and content delta"
+            tokio::time::timeout(Duration::from_millis(100), rx.recv())
+                .await
+                .is_err(),
+            "content after tool activity should not emit a websocket frame"
         );
 
-        channel
-            .maybe_handle_command_response(&serde_json::json!({
-                "headers": { "req_id": frame_req_id(&frame) },
-                "errcode": 0,
-                "errmsg": "ok"
-            }))
-            .await;
-
-        updater.await.unwrap().unwrap();
+        assert_eq!(
+            channel
+                .draft_states
+                .lock()
+                .get("stream-pend")
+                .unwrap()
+                .pending_content,
+            "Final answer text",
+            "content delta should be buffered in pending_content"
+        );
     }
 
     #[tokio::test]
