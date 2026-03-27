@@ -707,9 +707,7 @@ impl WeComWsChannel {
         }
 
         // Tool activity mode — compute delta and buffer it.
-        let delta = content
-            .strip_prefix(&state.last_content)
-            .unwrap_or(content);
+        let delta = content.strip_prefix(&state.last_content).unwrap_or(content);
         state.last_content.clear();
         state.last_content.push_str(content);
         if !delta.is_empty() {
@@ -3785,7 +3783,10 @@ mod tests {
         let wl = channel
             .note_progress_update("s1", "⏳ shell: ls\n")
             .expect("progress should render");
-        assert!(wl.contains("Let me check"), "pre-tool narration should be seeded");
+        assert!(
+            wl.contains("Let me check"),
+            "pre-tool narration should be seeded"
+        );
         assert!(wl.contains("shell: ls"));
     }
 
@@ -3828,7 +3829,10 @@ mod tests {
         let wl = channel
             .note_progress_update("s3", "⏳ tool2\n")
             .expect("progress should render");
-        assert!(wl.contains("Found it"), "pending narration should be flushed");
+        assert!(
+            wl.contains("Found it"),
+            "pending narration should be flushed"
+        );
         assert!(wl.contains("tool2"));
 
         // Pending is cleared.
@@ -4002,7 +4006,6 @@ mod tests {
             allowed_groups: vec![],
             file_retention_days: 3,
             max_file_size_mb: 20,
-            history_max_turns: 50,
             interrupt_on_new_message: false,
             stream_mode: StreamMode::Partial,
         }
@@ -5221,11 +5224,7 @@ mod tests {
             let channel = channel.clone();
             tokio::spawn(async move {
                 channel
-                    .update_draft_progress(
-                        "user--zeroclaw_user",
-                        "stream-wl",
-                        "⏳ shell: ls -la\n",
-                    )
+                    .update_draft_progress("user--zeroclaw_user", "stream-wl", "⏳ shell: ls -la\n")
                     .await
             })
         };
@@ -5343,11 +5342,7 @@ mod tests {
 
         // Content after tool activity should NOT send a frame (goes to pending).
         channel
-            .update_draft(
-                "user--zeroclaw_user",
-                "stream-pend",
-                "Final answer text",
-            )
+            .update_draft("user--zeroclaw_user", "stream-pend", "Final answer text")
             .await
             .unwrap();
 

@@ -7594,10 +7594,6 @@ fn default_wecom_ws_max_file_size_mb() -> u64 {
     20
 }
 
-fn default_wecom_ws_history_max_turns() -> usize {
-    50
-}
-
 fn default_wecom_ws_stream_mode() -> StreamMode {
     StreamMode::Partial
 }
@@ -7621,9 +7617,6 @@ pub struct WeComWsConfig {
     /// Maximum accepted file size (MiB) for WeCom attachment download attempts.
     #[serde(default = "default_wecom_ws_max_file_size_mb")]
     pub max_file_size_mb: u64,
-    /// Maximum retained turns per WeCom conversation scope.
-    #[serde(default = "default_wecom_ws_history_max_turns")]
-    pub history_max_turns: usize,
     /// When true, a newer WeCom WS message from the same sender in the same conversation
     /// cancels the in-flight request and starts a fresh response with preserved history.
     #[serde(default)]
