@@ -1,6 +1,6 @@
 # `master_wecom` 分支文档
 
-更新时间：`2026-03-26`
+更新时间：`2026-03-27`
 
 ## 分支语境
 
@@ -47,6 +47,12 @@
 - 向上游提 PR / issue 时，不得带入 `wecom_ws` 分支语境，因为上游没有 `wecom_ws`
 - 涉及公共层问题时，用上游已有的 channel（如 `telegram`）举例，日志和路径一律脱敏
 
+### 上游更新分析
+
+- 后续凡是分析上游更新，默认都要覆盖：`trait / 公共接口变动`、`框架层新增能力`、`其它 channel 更新`、`对 wecom_ws 的影响`
+- 上游分析优先按“能力变化”和“对 `wecom_ws` 的实际影响”组织，不只按文件或 commit 标题罗列
+- 如需做同步记录或长期复用，按 [`upstream-review-rules.md`](./upstream-review-rules.md) 的固定结构输出
+
 ### 新功能记录
 
 - 在本分支添加新功能时，须在 `docs/master_wecom/` 下新建独立文档记录
@@ -64,6 +70,7 @@
 |------|------|
 | [branch-features.md](./branch-features.md) | 功能清单（新增功能时先登记，链接到详细文档） |
 | [TEMPLATE-master-sync.md](./TEMPLATE-master-sync.md) | 合并记录模板 |
+| [upstream-review-rules.md](./upstream-review-rules.md) | 上游更新分析规则，固定 trait / 框架 / channel / `wecom_ws` 影响四类关注点 |
 
 ### 历史参考
 
