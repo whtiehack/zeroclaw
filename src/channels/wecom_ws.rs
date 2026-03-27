@@ -39,7 +39,6 @@ const WECOM_STREAM_CONFLICT_MAX_RETRIES: usize = 3;
 const WECOM_STREAM_CONFLICT_RETRY_BASE_MILLIS: u64 = 150;
 const WECOM_EXPIRED_STREAM_REQ_TTL_SECS: u64 = 3600;
 const WECOM_DRAFT_UPDATE_MAX_LINES: usize = 10;
-const WECOM_POSTCLEAR_DRAFT_UPDATE_INTERVAL_MILLIS: u64 = 1200;
 
 const WECOM_MARKDOWN_MAX_BYTES: usize = 20_480;
 const WECOM_MARKDOWN_CHUNK_BYTES: usize = 8_000;
@@ -268,10 +267,12 @@ struct WeComRuntimeConfig {
 
 #[derive(Debug, Default, Clone)]
 struct StreamDraftState {
-    preclear_body: String,
-    preclear_content: String,
-    after_clear: bool,
-    after_clear_last_flush_at: Option<Instant>,
+    /// Rolling work log buffer (tool progress + model narration during tool activity).
+    work_log: String,
+    /// Last accumulated content snapshot from `update_draft` (used to compute delta).
+    last_content: String,
+    /// Whether any tool/progress activity has been seen in this draft lifecycle.
+    has_tool_activity: bool,
 }
 
 // ── MediaDecryptor (per-attachment AES key) ──────────────────────────
@@ -663,70 +664,36 @@ impl WeComWsChannel {
     }
 
     fn note_progress_update(&self, message_id: &str, text: &str) -> Option<String> {
-        self.note_progress_update_at(message_id, text, Instant::now())
-    }
-
-    fn note_progress_update_at(
-        &self,
-        message_id: &str,
-        text: &str,
-        now: Instant,
-    ) -> Option<String> {
         let mut states = self.draft_states.lock();
         let state = states.entry(message_id.to_string()).or_default();
 
-        if text == super::WECOM_WS_DRAFT_CLEAR_SENTINEL {
-            state.preclear_body.clear();
-            state.preclear_content.clear();
-            state.after_clear = true;
-            state.after_clear_last_flush_at = Some(now);
-            return None;
-        }
-
-        if state.after_clear {
-            return None;
-        }
-
-        state.preclear_body.push_str(text);
-        Some(render_wecom_preclear_draft_body(&state.preclear_body))
+        state.has_tool_activity = true;
+        state.work_log.push_str(text);
+        Some(render_work_log(&state.work_log))
     }
 
     fn note_content_update(&self, message_id: &str, content: &str) -> Option<String> {
-        self.note_content_update_at(message_id, content, Instant::now())
-    }
-
-    fn note_content_update_at(
-        &self,
-        message_id: &str,
-        content: &str,
-        now: Instant,
-    ) -> Option<String> {
         let mut states = self.draft_states.lock();
         let state = states.entry(message_id.to_string()).or_default();
 
-        if state.after_clear {
-            let should_flush = state.after_clear_last_flush_at.is_none_or(|last_flush_at| {
-                now.duration_since(last_flush_at)
-                    >= Duration::from_millis(WECOM_POSTCLEAR_DRAFT_UPDATE_INTERVAL_MILLIS)
-            });
-            if !should_flush {
-                return None;
-            }
-
-            state.after_clear_last_flush_at = Some(now);
+        if !state.has_tool_activity {
+            // No tool activity yet — normal streaming reply, show accumulated content.
+            state.last_content.clear();
+            state.last_content.push_str(content);
             return Some(sanitize_outbound_draft_content(content));
         }
 
+        // Tool activity mode — compute delta and append to work log.
         let delta = content
-            .strip_prefix(&state.preclear_content)
+            .strip_prefix(&state.last_content)
             .unwrap_or(content);
-        state.preclear_content.clear();
-        state.preclear_content.push_str(content);
+        state.last_content.clear();
+        state.last_content.push_str(content);
         if !delta.is_empty() {
-            state.preclear_body.push_str(delta);
+            state.work_log.push_str(delta);
         }
 
-        Some(render_wecom_preclear_draft_body(&state.preclear_body))
+        Some(render_work_log(&state.work_log))
     }
 
     async fn fail_pending_responses(&self, reason: &str) {
@@ -3189,7 +3156,7 @@ fn retain_latest_lines(content: &str, max_lines: usize) -> String {
     lines[lines.len() - max_lines..].join("\n")
 }
 
-fn render_wecom_preclear_draft_body(content: &str) -> String {
+fn render_work_log(content: &str) -> String {
     sanitize_outbound_draft_content(&retain_latest_lines(content, WECOM_DRAFT_UPDATE_MAX_LINES))
 }
 
@@ -3776,59 +3743,84 @@ mod tests {
     }
 
     #[test]
-    fn draft_state_merges_progress_and_preclear_content_until_clear() {
+    fn draft_state_progress_always_visible_in_work_log() {
         let channel = WeComWsChannel::new(&test_wecom_ws_config(), Path::new("/tmp")).unwrap();
-        let now = Instant::now();
         channel
             .draft_states
             .lock()
             .insert("stream-1".to_string(), StreamDraftState::default());
 
+        // Progress always renders and marks tool activity.
         let progress = channel
-            .note_progress_update_at("stream-1", "⏳ shell: ls -la\n", now)
+            .note_progress_update("stream-1", "⏳ shell: ls -la\n")
             .expect("progress should render");
         assert!(progress.contains("shell: ls -la"));
 
+        // Content after tool activity merges into work log.
         let merged = channel
-            .note_content_update_at("stream-1", "Task started.\n", now)
-            .expect("pre-clear content should render");
+            .note_content_update("stream-1", "Task started.\n")
+            .expect("content should render in work log");
         assert!(merged.contains("shell: ls -la"));
         assert!(merged.contains("Task started."));
 
-        assert!(
-            channel
-                .note_progress_update_at(
-                    "stream-1",
-                    super::super::WECOM_WS_DRAFT_CLEAR_SENTINEL,
-                    now,
-                )
-                .is_none(),
-            "clear sentinel should reset local draft state without emitting a body"
-        );
-
-        assert!(
-            channel
-                .note_content_update_at(
-                    "stream-1",
-                    "Final answer",
-                    now + Duration::from_millis(200),
-                )
-                .is_none(),
-            "post-clear content should wait for the throttling interval"
-        );
-
-        let final_body = channel
-            .note_content_update_at(
-                "stream-1",
-                "Final answer",
-                now + Duration::from_millis(WECOM_POSTCLEAR_DRAFT_UPDATE_INTERVAL_MILLIS + 1),
-            )
-            .expect("post-clear content should render after the throttling interval");
-        assert_eq!(final_body, "Final answer");
+        // More progress keeps appending.
+        let more = channel
+            .note_progress_update("stream-1", "✅ shell done\n")
+            .expect("further progress should render");
+        assert!(more.contains("shell: ls -la"));
+        assert!(more.contains("shell done"));
     }
 
     #[test]
-    fn draft_state_limits_preclear_body_to_latest_lines() {
+    fn draft_state_content_without_tools_streams_normally() {
+        let channel = WeComWsChannel::new(&test_wecom_ws_config(), Path::new("/tmp")).unwrap();
+        channel
+            .draft_states
+            .lock()
+            .insert("stream-2".to_string(), StreamDraftState::default());
+
+        // No tool activity — content streams as normal accumulated text.
+        let body = channel
+            .note_content_update("stream-2", "Hello world")
+            .expect("content should render normally");
+        assert_eq!(body, "Hello world");
+
+        let body2 = channel
+            .note_content_update("stream-2", "Hello world, more text")
+            .expect("accumulated content should render");
+        assert_eq!(body2, "Hello world, more text");
+    }
+
+    #[test]
+    fn draft_state_narration_then_tool_merges_into_work_log() {
+        let channel = WeComWsChannel::new(&test_wecom_ws_config(), Path::new("/tmp")).unwrap();
+        channel
+            .draft_states
+            .lock()
+            .insert("stream-3".to_string(), StreamDraftState::default());
+
+        // Model speaks first (no tool activity yet) — normal streaming.
+        let body = channel
+            .note_content_update("stream-3", "Let me check...\n")
+            .expect("initial content should render");
+        assert_eq!(body, "Let me check...\n");
+
+        // Tool starts — switches to work log mode.
+        let progress = channel
+            .note_progress_update("stream-3", "⏳ shell: ls\n")
+            .expect("progress should render");
+        assert!(progress.contains("shell: ls"));
+
+        // Further content merges into work log (delta from accumulated text).
+        let merged = channel
+            .note_content_update("stream-3", "Let me check...\nOK done.\n")
+            .expect("content delta should merge into work log");
+        assert!(merged.contains("shell: ls"));
+        assert!(merged.contains("OK done."));
+    }
+
+    #[test]
+    fn draft_state_work_log_limits_to_latest_lines() {
         let channel = WeComWsChannel::new(&test_wecom_ws_config(), Path::new("/tmp")).unwrap();
         channel
             .draft_states
@@ -5172,7 +5164,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn update_draft_progress_clear_sentinel_resets_state_without_frame() {
+    async fn update_draft_progress_continues_after_content() {
         let config = test_wecom_ws_config();
         let channel = WeComWsChannel::new(&config, Path::new("/tmp")).unwrap();
 
@@ -5181,19 +5173,20 @@ mod tests {
         channel
             .req_id_map
             .lock()
-            .insert("stream-clear".to_string(), "req-clear".to_string());
+            .insert("stream-wl".to_string(), "req-wl".to_string());
         channel
             .draft_states
             .lock()
-            .insert("stream-clear".to_string(), StreamDraftState::default());
+            .insert("stream-wl".to_string(), StreamDraftState::default());
 
+        // Send initial progress update.
         let initial_update = {
             let channel = channel.clone();
             tokio::spawn(async move {
                 channel
                     .update_draft_progress(
                         "user--zeroclaw_user",
-                        "stream-clear",
+                        "stream-wl",
                         "⏳ shell: ls -la\n",
                     )
                     .await
@@ -5215,30 +5208,14 @@ mod tests {
             .await;
         initial_update.await.unwrap().unwrap();
 
-        channel
-            .update_draft_progress(
-                "user--zeroclaw_user",
-                "stream-clear",
-                super::super::WECOM_WS_DRAFT_CLEAR_SENTINEL,
-            )
-            .await
-            .unwrap();
-
-        assert!(
-            tokio::time::timeout(Duration::from_millis(100), rx.recv())
-                .await
-                .is_err(),
-            "clear sentinel should not emit an extra websocket frame"
-        );
+        // Verify tool activity flag is set.
         assert!(
             channel
                 .draft_states
                 .lock()
-                .get("stream-clear")
-                .is_some_and(|state| {
-                    state.after_clear && state.after_clear_last_flush_at.is_some()
-                }),
-            "clear sentinel should flip the local draft state into final mode"
+                .get("stream-wl")
+                .is_some_and(|state| state.has_tool_activity),
+            "progress update should mark tool activity"
         );
     }
 
@@ -5308,7 +5285,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn update_draft_throttles_post_clear_content_until_interval() {
+    async fn update_draft_content_merges_into_work_log_after_tool_activity() {
         let config = test_wecom_ws_config();
         let channel = WeComWsChannel::new(&config, Path::new("/tmp")).unwrap();
 
@@ -5317,47 +5294,25 @@ mod tests {
         channel
             .req_id_map
             .lock()
-            .insert("stream-postclear".to_string(), "req-postclear".to_string());
+            .insert("stream-wl2".to_string(), "req-wl2".to_string());
         channel.draft_states.lock().insert(
-            "stream-postclear".to_string(),
+            "stream-wl2".to_string(),
             StreamDraftState {
-                after_clear: true,
-                after_clear_last_flush_at: Some(Instant::now()),
+                has_tool_activity: true,
+                work_log: "⏳ shell: ls\n".to_string(),
                 ..StreamDraftState::default()
             },
         );
 
-        channel
-            .update_draft("user--zeroclaw_user", "stream-postclear", "tiny")
-            .await
-            .unwrap();
-
-        assert!(
-            tokio::time::timeout(Duration::from_millis(100), rx.recv())
-                .await
-                .is_err(),
-            "post-clear content should not emit a websocket frame before the throttling interval"
-        );
-
-        channel
-            .draft_states
-            .lock()
-            .entry("stream-postclear".to_string())
-            .and_modify(|state| {
-                state.after_clear_last_flush_at = Some(
-                    Instant::now()
-                        - Duration::from_millis(WECOM_POSTCLEAR_DRAFT_UPDATE_INTERVAL_MILLIS + 1),
-                );
-            });
-
+        // Content update with tool activity should merge delta into work log.
         let updater = {
             let channel = channel.clone();
             tokio::spawn(async move {
                 channel
                     .update_draft(
                         "user--zeroclaw_user",
-                        "stream-postclear",
-                        "final answer body",
+                        "stream-wl2",
+                        "Model says hello.\n",
                     )
                     .await
             })
@@ -5366,15 +5321,17 @@ mod tests {
         let Some(WsOutbound::Frame(frame)) =
             tokio::time::timeout(Duration::from_millis(250), rx.recv())
                 .await
-                .expect("post-clear content should send a frame after the throttling interval")
+                .expect("content with tool activity should send a frame")
         else {
             panic!("expected respond_msg frame");
         };
-        assert_eq!(
-            frame
-                .pointer("/body/stream/content")
-                .and_then(Value::as_str),
-            Some("final answer body")
+        let content = frame
+            .pointer("/body/stream/content")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        assert!(
+            content.contains("shell: ls") && content.contains("Model says hello."),
+            "frame should contain both work log and content delta"
         );
 
         channel

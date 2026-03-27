@@ -212,7 +212,7 @@ const CHANNEL_MIN_IN_FLIGHT_MESSAGES: usize = 8;
 const CHANNEL_MAX_IN_FLIGHT_MESSAGES: usize = 64;
 const CHANNEL_TYPING_REFRESH_INTERVAL_SECS: u64 = 4;
 const CHANNEL_HEALTH_HEARTBEAT_SECS: u64 = 30;
-const WECOM_WS_DRAFT_CLEAR_SENTINEL: &str = "\u{0}WECOM_WS_DRAFT_CLEAR\u{0}";
+
 const MODEL_CACHE_FILE: &str = "models_cache.json";
 const MODEL_CACHE_PREVIEW_LIMIT: usize = 10;
 const MEMORY_CONTEXT_MAX_ENTRIES: usize = 4;
@@ -2741,15 +2741,6 @@ async fn process_channel_message(
                     match event {
                         DraftEvent::Clear => {
                             accumulated.clear();
-                            if channel.name() == "wecom_ws" {
-                                let _ = channel
-                                    .update_draft_progress(
-                                        &reply_target,
-                                        &draft_id,
-                                        WECOM_WS_DRAFT_CLEAR_SENTINEL,
-                                    )
-                                    .await;
-                            }
                         }
                         DraftEvent::Progress(text) => {
                             if let Err(e) = channel
