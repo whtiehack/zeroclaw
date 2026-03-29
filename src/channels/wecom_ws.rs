@@ -3451,18 +3451,6 @@ async fn cleanup_inbox_files(root: PathBuf, retention: Duration) {
     }
 }
 
-/// Find the largest char boundary <= `max_bytes` in `s`.
-fn floor_char_boundary(s: &str, max_bytes: usize) -> usize {
-    if max_bytes >= s.len() {
-        return s.len();
-    }
-    let mut pos = max_bytes;
-    while pos > 0 && !s.is_char_boundary(pos) {
-        pos -= 1;
-    }
-    pos
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3942,22 +3930,6 @@ mod tests {
         assert_eq!(extract_runtime_routing_command("/new"), None);
         assert_eq!(extract_runtime_routing_command("please /model gpt-5"), None);
         assert_eq!(extract_runtime_routing_command(""), None);
-    }
-
-    #[test]
-    fn floor_char_boundary_handles_multibyte() {
-        let s = "Hello \u{4f60}\u{597d}\u{4e16}\u{754c}";
-        let boundary = floor_char_boundary(s, 8);
-        assert!(s.is_char_boundary(boundary));
-        assert!(boundary <= 8);
-        assert!(boundary == 6 || boundary == 9);
-    }
-
-    #[test]
-    fn floor_char_boundary_full_string() {
-        let s = "Hello";
-        let boundary = floor_char_boundary(s, 100);
-        assert_eq!(boundary, s.len());
     }
 
     #[test]
