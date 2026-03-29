@@ -39,3 +39,4 @@
 | 16 | 工具调用日志增强 | 脱敏参数、执行时长、输出结果（tracing::info） | - |
 | 17 | disable_shell_policy | 跳过 shell 白名单/危险命令/路径黑名单，保留限流 | - |
 | 18 | OpenAI fallback 收紧 | 仅 404 尝试 /responses fallback，传输层错误直接返回 | - |
+| 19 | heartbeat 投递 wecom_ws | validate + auto-detect 支持 wecom_ws 作为 heartbeat target | - |

@@ -766,6 +766,12 @@ fn auto_detect_heartbeat_channel(config: &Config) -> Option<(String, String)> {
         // Mattermost requires explicit target
         return None;
     }
+    if let Some(ww) = &config.channels_config.wecom_ws {
+        let target = ww.allowed_users.first().cloned().unwrap_or_default();
+        if !target.is_empty() {
+            return Some(("wecom_ws".to_string(), target));
+        }
+    }
     None
 }
 
@@ -796,6 +802,13 @@ fn validate_heartbeat_channel_config(config: &Config, channel: &str) -> Result<(
             if config.channels_config.mattermost.is_none() {
                 anyhow::bail!(
                     "heartbeat.target is set to mattermost but channels_config.mattermost is not configured"
+                );
+            }
+        }
+        "wecom_ws" => {
+            if config.channels_config.wecom_ws.is_none() {
+                anyhow::bail!(
+                    "heartbeat.target is set to wecom_ws but channels_config.wecom_ws is not configured"
                 );
             }
         }
@@ -1038,6 +1051,60 @@ mod tests {
         assert_eq!(
             target,
             Some(("telegram".to_string(), "user123".to_string()))
+        );
+    }
+
+    #[test]
+    fn resolve_delivery_accepts_wecom_ws_configuration() {
+        let mut config = Config::default();
+        config.heartbeat.target = Some("wecom_ws".into());
+        config.heartbeat.to = Some("user1".into());
+        config.channels_config.wecom_ws = Some(crate::config::WeComWsConfig {
+            bot_id: "bot-id".into(),
+            secret: "secret".into(),
+            allowed_users: vec!["user1".into()],
+            allowed_groups: vec![],
+            file_retention_days: 7,
+            max_file_size_mb: 20,
+            interrupt_on_new_message: false,
+            stream_mode: crate::config::StreamMode::default(),
+            draft_update_interval_ms: 300,
+        });
+
+        let target = resolve_heartbeat_delivery(&config).unwrap();
+        assert_eq!(target, Some(("wecom_ws".to_string(), "user1".to_string())));
+    }
+
+    #[test]
+    fn resolve_delivery_rejects_unconfigured_wecom_ws() {
+        let mut config = Config::default();
+        config.heartbeat.target = Some("wecom_ws".into());
+        config.heartbeat.to = Some("user1".into());
+        let err = resolve_heartbeat_delivery(&config).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("channels_config.wecom_ws is not configured"));
+    }
+
+    #[test]
+    fn auto_detect_wecom_ws_when_configured() {
+        let mut config = Config::default();
+        config.channels_config.wecom_ws = Some(crate::config::WeComWsConfig {
+            bot_id: "bot-id".into(),
+            secret: "secret".into(),
+            allowed_users: vec!["user1".into()],
+            allowed_groups: vec![],
+            file_retention_days: 7,
+            max_file_size_mb: 20,
+            interrupt_on_new_message: false,
+            stream_mode: crate::config::StreamMode::default(),
+            draft_update_interval_ms: 300,
+        });
+
+        let target = resolve_heartbeat_delivery(&config).unwrap();
+        assert_eq!(
+            target,
+            Some(("wecom_ws".to_string(), "user1".to_string()))
         );
     }
 
