@@ -7624,6 +7624,10 @@ fn default_wecom_ws_stream_mode() -> StreamMode {
     StreamMode::Partial
 }
 
+fn default_wecom_ws_draft_update_interval_ms() -> u64 {
+    300
+}
+
 /// WeCom AI Bot WebSocket configuration.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct WeComWsConfig {
@@ -7650,6 +7654,10 @@ pub struct WeComWsConfig {
     /// Streaming mode for progressive draft delivery over the WeCom long connection.
     #[serde(default = "default_wecom_ws_stream_mode")]
     pub stream_mode: StreamMode,
+    /// Minimum interval (ms) between draft message updates to avoid flooding the WS connection.
+    /// Only effective when `stream_mode` is not `off`.
+    #[serde(default = "default_wecom_ws_draft_update_interval_ms")]
+    pub draft_update_interval_ms: u64,
 }
 
 impl ChannelConfig for WeComWsConfig {

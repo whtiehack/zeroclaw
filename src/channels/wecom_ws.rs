@@ -263,6 +263,7 @@ struct WeComRuntimeConfig {
     file_retention_days: u32,
     max_file_size_bytes: u64,
     stream_mode: StreamMode,
+    draft_update_interval_ms: u64,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -340,6 +341,7 @@ pub struct WeComWsChannel {
     req_id_map: Arc<Mutex<HashMap<String, String>>>, // stream_id → req_id
     expired_stream_req_ids: Arc<Mutex<HashMap<String, Instant>>>,
     draft_states: Arc<Mutex<HashMap<String, StreamDraftState>>>,
+    last_draft_edit: Arc<Mutex<HashMap<String, Instant>>>,
 }
 
 // ── Construction + WS helpers ────────────────────────────────────────
@@ -364,6 +366,7 @@ impl WeComWsChannel {
                 file_retention_days: config.file_retention_days,
                 max_file_size_bytes: config.max_file_size_mb.saturating_mul(1024 * 1024),
                 stream_mode: config.stream_mode,
+                draft_update_interval_ms: config.draft_update_interval_ms,
             },
             client,
             ws_tx: Arc::new(tokio::sync::Mutex::new(None)),
@@ -376,6 +379,7 @@ impl WeComWsChannel {
             req_id_map: Arc::new(Mutex::new(HashMap::new())),
             expired_stream_req_ids: Arc::new(Mutex::new(HashMap::new())),
             draft_states: Arc::new(Mutex::new(HashMap::new())),
+            last_draft_edit: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -668,6 +672,28 @@ impl WeComWsChannel {
 
     fn clear_draft_state(&self, message_id: &str) {
         self.draft_states.lock().remove(message_id);
+        self.last_draft_edit.lock().remove(message_id);
+    }
+
+    /// Returns `true` if the draft update should be skipped due to rate-limiting.
+    fn should_throttle_draft_edit(&self, message_id: &str) -> bool {
+        let interval = self.cfg.draft_update_interval_ms;
+        if interval == 0 {
+            return false;
+        }
+        let edits = self.last_draft_edit.lock();
+        if let Some(last_time) = edits.get(message_id) {
+            let elapsed = u64::try_from(last_time.elapsed().as_millis()).unwrap_or(u64::MAX);
+            elapsed < interval
+        } else {
+            false
+        }
+    }
+
+    fn record_draft_edit(&self, message_id: &str) {
+        self.last_draft_edit
+            .lock()
+            .insert(message_id.to_string(), Instant::now());
     }
 
     fn note_progress_update(&self, message_id: &str, text: &str) -> Option<String> {
@@ -2427,11 +2453,17 @@ impl Channel for WeComWsChannel {
         let Some(draft_content) = self.note_content_update(message_id, content) else {
             return Ok(());
         };
+        if self.should_throttle_draft_edit(message_id) {
+            return Ok(());
+        }
         match self
             .ws_send_respond_msg(&req_id, message_id, &draft_content, false)
             .await
         {
-            Ok(()) => Ok(()),
+            Ok(()) => {
+                self.record_draft_edit(message_id);
+                Ok(())
+            }
             Err(err) if is_wecom_stream_update_expired_error(&err) => {
                 tracing::info!(
                     req_id = %req_id,
@@ -2471,12 +2503,18 @@ impl Channel for WeComWsChannel {
         let Some(draft_content) = self.note_progress_update(message_id, text) else {
             return Ok(());
         };
+        if self.should_throttle_draft_edit(message_id) {
+            return Ok(());
+        }
 
         match self
             .ws_send_respond_msg(&req_id, message_id, &draft_content, false)
             .await
         {
-            Ok(()) => Ok(()),
+            Ok(()) => {
+                self.record_draft_edit(message_id);
+                Ok(())
+            }
             Err(err) if is_wecom_stream_update_expired_error(&err) => {
                 tracing::info!(
                     req_id = %req_id,
@@ -4107,6 +4145,7 @@ mod tests {
             max_file_size_mb: 20,
             interrupt_on_new_message: false,
             stream_mode: StreamMode::Partial,
+            draft_update_interval_ms: 300,
         }
     }
 
