@@ -1,6 +1,6 @@
 # `master_wecom` 功能清单
 
-更新时间：`2026-03-26`
+更新时间：`2026-03-29`
 
 维护规则：
 
@@ -23,6 +23,8 @@
 | 7 | interrupt_on_new_message | 新消息中断旧生成，保留上下文 | - |
 | 8 | 流式过期兜底 | 草稿过期停刷、收口过期退回普通消息 | - |
 | 9 | 心跳 ACK 静默 | 心跳响应不打日志噪音 | - |
+| 10 | 正文流式回复 | 工具执行完后正文也逐步流式推送，基于 content reset 检测 | [详细文档](./stream-final-answer-2026-03-29.md) |
+| 11 | draft 限流 | `draft_update_interval_ms` 控制 WS 帧发送频率，默认 300ms | [详细文档](./stream-final-answer-2026-03-29.md) |
 
 ## 通用层改动
 
@@ -30,13 +32,14 @@
 
 | # | 功能 | 说明 | 文档 |
 |---|------|------|------|
-| 10 | cron 投递 wecom_ws | `delivery.channel = "wecom_ws"` 接入校验和持久化 | [merge gap 记录](./wecom-ws-cron-delivery-merge-gap-2026-03-23.md) |
-| 11 | tool-call 文本 relay | 工具调用前后解释文本实时推送到草稿 | - |
-| 12 | draft sender 显式关闭 | tool loop 结束后 drop(delta_tx) 再 await | - |
-| 13 | non_cli_excluded_tools in full | 非 CLI 通道在 full 模式下仍排除指定工具 | [决策记录](./full-non-cli-excluded-tools-2026-03-23.md) |
-| 14 | native tools 去重 summary | 原生工具调用时跳过重复 tools summary | - |
-| 15 | 时间上下文拆分 | 系统提示只保留日期+时区，渠道消息补精确时间戳 | - |
-| 16 | 工具调用日志增强 | 脱敏参数、执行时长、输出结果（tracing::info） | - |
-| 17 | disable_shell_policy | 跳过 shell 白名单/危险命令/路径黑名单，保留限流 | - |
-| 18 | OpenAI fallback 收紧 | 仅 404 尝试 /responses fallback，传输层错误直接返回 | - |
-| 19 | heartbeat 投递 wecom_ws | validate + auto-detect 支持 wecom_ws 作为 heartbeat target | - |
+| 12 | cron 投递 wecom_ws | `delivery.channel = "wecom_ws"` 接入校验和持久化 | [merge gap 记录](./wecom-ws-cron-delivery-merge-gap-2026-03-23.md) |
+| 13 | tool-call 文本 relay | 工具调用前后解释文本实时推送到草稿 | - |
+| 14 | draft sender 显式关闭 | tool loop 结束后 drop(delta_tx) 再 await | - |
+| 15 | non_cli_excluded_tools in full | 非 CLI 通道在 full 模式下仍排除指定工具 | [决策记录](./full-non-cli-excluded-tools-2026-03-23.md) |
+| 16 | native tools 去重 summary | 原生工具调用时跳过重复 tools summary | - |
+| 17 | 时间上下文拆分 | 系统提示只保留日期+时区，渠道消息补精确时间戳 | - |
+| 18 | 工具调用日志增强 | 脱敏参数、执行时长、输出结果（tracing::info） | - |
+| 19 | disable_shell_policy | 跳过 shell 白名单/危险命令/路径黑名单，保留限流 | - |
+| 20 | OpenAI fallback 收紧 | 仅 404 尝试 /responses fallback，传输层错误直接返回 | - |
+| 21 | heartbeat 投递 wecom_ws | validate + auto-detect 支持 wecom_ws 作为 heartbeat target | - |
+| 22 | draft_update_interval_ms 配置 | `WeComWsConfig` 新增字段，默认 300ms | [详细文档](./stream-final-answer-2026-03-29.md) |
