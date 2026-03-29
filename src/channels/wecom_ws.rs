@@ -277,6 +277,9 @@ struct StreamDraftState {
     /// or final answer.  Flushed into `work_log` on next Progress, discarded on
     /// `finalize_draft` / `clear_draft_state`.
     pending_content: String,
+    /// True once we detect the framework `Clear` → content reset, meaning
+    /// the model has finished tools and is streaming the final answer.
+    in_final_answer: bool,
 }
 
 // ── MediaDecryptor (per-attachment AES key) ──────────────────────────
@@ -682,6 +685,14 @@ impl WeComWsChannel {
             state.has_tool_activity = true;
         }
 
+        // If we were streaming the final answer but got an unexpected progress,
+        // fall back to tool-activity mode — our detection was premature.
+        // work_log was kept intact on purpose; pending_content flush below
+        // will fold any buffered narration back into work_log.
+        if state.in_final_answer {
+            state.in_final_answer = false;
+        }
+
         // Flush pending content — it was inter-batch narration, not final answer.
         if !state.pending_content.is_empty() {
             state.work_log.push_str(&state.pending_content);
@@ -706,7 +717,35 @@ impl WeComWsChannel {
             return Some(sanitize_outbound_draft_content(content));
         }
 
-        // Tool activity mode — compute delta and buffer it.
+        if state.in_final_answer {
+            // Already in final answer phase — stream content directly, no line limit.
+            state.last_content.clear();
+            state.last_content.push_str(content);
+            return Some(sanitize_outbound_draft_content(content));
+        }
+
+        // Tool activity mode — check if the framework reset accumulated content
+        // (DraftEvent::Clear before forwarding).  When that happens the new
+        // content no longer starts with last_content.
+        //
+        // Note: Clear fires both before inter-batch narration and before the
+        // final answer — we cannot distinguish them here.  We tentatively enter
+        // `in_final_answer` and show the content directly.  If a Progress event
+        // arrives afterward the flag is reverted (see `note_progress_update`).
+        // We intentionally keep work_log intact so it can be restored on revert.
+        let is_continuation = state.last_content.is_empty()
+            || content.starts_with(&state.last_content);
+
+        if !is_continuation {
+            // Content was reset → tentatively enter final-answer streaming.
+            // Keep work_log and pending_content intact for potential fallback.
+            state.in_final_answer = true;
+            state.last_content.clear();
+            state.last_content.push_str(content);
+            return Some(sanitize_outbound_draft_content(content));
+        }
+
+        // Inter-batch narration — compute delta and buffer it.
         let delta = content.strip_prefix(&state.last_content).unwrap_or(content);
         state.last_content.clear();
         state.last_content.push_str(content);
@@ -3846,6 +3885,94 @@ mod tests {
             .note_content_update("s4", "Hello world, more text")
             .expect("accumulated content should render");
         assert_eq!(body2, "Hello world, more text");
+    }
+
+    #[test]
+    fn draft_state_final_answer_streams_after_content_reset() {
+        let channel = WeComWsChannel::new(&test_wecom_ws_config(), Path::new("/tmp")).unwrap();
+        channel
+            .draft_states
+            .lock()
+            .insert("fa1".to_string(), StreamDraftState::default());
+
+        // Simulate: pre-tool content → tool activity → inter-batch narration
+        channel.note_content_update("fa1", "Let me check");
+        channel.note_progress_update("fa1", "⏳ tool1\n");
+        channel.note_progress_update("fa1", "✅ done\n");
+        // Inter-batch narration (continuation of accumulated content)
+        channel.note_content_update("fa1", "Let me checkFound it");
+
+        // Now simulate framework Clear → accumulated resets → final answer
+        // The new content does NOT start with last_content ("Let me checkFound it").
+        let body = channel
+            .note_content_update("fa1", "Here is the answer")
+            .expect("final answer should stream");
+        assert_eq!(body, "Here is the answer");
+
+        // Verify state transitioned to final answer.
+        // work_log and pending_content are kept intact for potential fallback.
+        let state = channel.draft_states.lock();
+        let s = state.get("fa1").unwrap();
+        assert!(s.in_final_answer);
+        assert!(
+            !s.work_log.is_empty(),
+            "work_log should be preserved for fallback"
+        );
+    }
+
+    #[test]
+    fn draft_state_final_answer_continues_streaming() {
+        let channel = WeComWsChannel::new(&test_wecom_ws_config(), Path::new("/tmp")).unwrap();
+        channel
+            .draft_states
+            .lock()
+            .insert("fa2".to_string(), StreamDraftState::default());
+
+        channel.note_content_update("fa2", "Thinking...");
+        channel.note_progress_update("fa2", "⏳ tool\n");
+
+        // Trigger final answer detection.
+        channel.note_content_update("fa2", "Answer part 1");
+
+        // Subsequent content in final answer phase streams directly, no line limit.
+        let body = channel
+            .note_content_update("fa2", "Answer part 1\npart 2\npart 3\npart 4\npart 5\npart 6\npart 7\npart 8\npart 9\npart 10\npart 11\npart 12")
+            .expect("final answer should stream without line limit");
+        assert!(body.contains("part 12"), "all lines should be present");
+        assert!(body.contains("part 1"), "first line should be present");
+    }
+
+    #[test]
+    fn draft_state_final_answer_fallback_on_unexpected_progress() {
+        let channel = WeComWsChannel::new(&test_wecom_ws_config(), Path::new("/tmp")).unwrap();
+        channel
+            .draft_states
+            .lock()
+            .insert("fa3".to_string(), StreamDraftState::default());
+
+        channel.note_content_update("fa3", "Pre-tool");
+        channel.note_progress_update("fa3", "⏳ tool1\n");
+
+        // Trigger final answer detection.
+        channel.note_content_update("fa3", "Answer start");
+
+        {
+            let state = channel.draft_states.lock();
+            assert!(state.get("fa3").unwrap().in_final_answer);
+        }
+
+        // Unexpected progress → fall back to tool-activity mode.
+        let wl = channel
+            .note_progress_update("fa3", "⏳ tool2\n")
+            .expect("progress should render");
+        assert!(wl.contains("tool2"));
+        // work_log should still contain previous tool progress (preserved across false positive).
+        assert!(wl.contains("tool1"), "work_log must preserve tool1 after fallback");
+
+        {
+            let state = channel.draft_states.lock();
+            assert!(!state.get("fa3").unwrap().in_final_answer);
+        }
     }
 
     #[test]
