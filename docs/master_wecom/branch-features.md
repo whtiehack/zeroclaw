@@ -1,6 +1,6 @@
 # `master_wecom` 功能清单
 
-更新时间：`2026-03-29`
+更新时间：`2026-03-30`
 
 维护规则：
 
@@ -43,3 +43,4 @@
 | 20 | OpenAI fallback 收紧 | 仅 404 尝试 /responses fallback，传输层错误直接返回 | - |
 | 21 | heartbeat 投递 wecom_ws | validate + auto-detect 支持 wecom_ws 作为 heartbeat target | - |
 | 22 | draft_update_interval_ms 配置 | `WeComWsConfig` 新增字段，默认 300ms | [详细文档](./stream-final-answer-2026-03-29.md) |
+| 23 | stale local image history 自愈 | 历史中的失效本地 `[IMAGE:]` marker 自动剥离，当前坏图失败回滚，避免后续文本继续报错 | [详细文档](./stale-local-image-history-self-heal-2026-03-30.md) |
