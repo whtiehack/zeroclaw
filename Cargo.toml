@@ -290,6 +290,12 @@ ci-all = [
 incremental = true
 opt-level = 1
 
+[profile.test]
+# Keep test binaries unoptimized on this x86_64 macOS branch environment.
+# `opt-level = 1` was enough to trigger linker failures after cache rebuilds,
+# while `opt-level = 0` links reliably and keeps test verification stable.
+opt-level = 0
+
 [profile.release]
 opt-level = "z"      # Optimize for size
 lto = "fat"          # Maximum cross-crate optimization for smaller binaries
