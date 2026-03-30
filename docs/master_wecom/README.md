@@ -1,6 +1,6 @@
 # `master_wecom` 分支文档
 
-更新时间：`2026-03-27`
+更新时间：`2026-03-30`
 
 ## 分支语境
 
@@ -71,6 +71,7 @@
 | [branch-features.md](./branch-features.md) | 功能清单（新增功能时先登记，链接到详细文档） |
 | [TEMPLATE-master-sync.md](./TEMPLATE-master-sync.md) | 合并记录模板 |
 | [upstream-review-rules.md](./upstream-review-rules.md) | 上游更新分析规则，固定 trait / 框架 / channel / `wecom_ws` 影响四类关注点 |
+| [test-link-opt-level-2026-03-30.md](./test-link-opt-level-2026-03-30.md) | macOS x86_64 测试链接排障记录，确认 test profile 固定 `opt-level = 0` |
 
 ### 历史参考
 
