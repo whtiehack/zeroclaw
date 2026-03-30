@@ -1372,11 +1372,131 @@ fn rollback_orphan_user_turn(
     true
 }
 
+fn is_readable_local_image_reference(reference: &str) -> bool {
+    let path = Path::new(reference);
+    path.is_file() && std::fs::File::open(path).is_ok()
+}
+
+fn compose_image_marker_message(text: &str, image_refs: &[String]) -> String {
+    let mut content = String::new();
+    let trimmed = text.trim();
+
+    if !trimmed.is_empty() {
+        content.push_str(trimmed);
+        if !image_refs.is_empty() {
+            content.push_str("\n\n");
+        }
+    }
+
+    for (index, image_ref) in image_refs.iter().enumerate() {
+        if index > 0 {
+            content.push('\n');
+        }
+        content.push_str("[IMAGE:");
+        content.push_str(image_ref);
+        content.push(']');
+    }
+
+    content
+}
+
+fn strip_unreadable_local_image_markers(content: &str) -> Option<(String, usize)> {
+    if !content.contains("[IMAGE:") {
+        return None;
+    }
+
+    let (cleaned_text, refs) = crate::multimodal::parse_image_markers(content);
+    if refs.is_empty() {
+        return None;
+    }
+
+    let mut kept_refs = Vec::with_capacity(refs.len());
+    let mut removed = 0usize;
+    for reference in refs {
+        if reference.starts_with("data:")
+            || reference.starts_with("http://")
+            || reference.starts_with("https://")
+            || is_readable_local_image_reference(&reference)
+        {
+            kept_refs.push(reference);
+        } else {
+            removed += 1;
+        }
+    }
+
+    if removed == 0 {
+        return None;
+    }
+
+    Some((
+        compose_image_marker_message(&cleaned_text, &kept_refs),
+        removed,
+    ))
+}
+
+fn prune_unreadable_local_image_markers_from_history(
+    ctx: &ChannelRuntimeContext,
+    sender_key: &str,
+) -> usize {
+    let mut histories = ctx
+        .conversation_histories
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let Some(turns) = histories.get_mut(sender_key) else {
+        return 0;
+    };
+    if turns.len() <= 1 {
+        return 0;
+    }
+
+    let last_idx = turns.len() - 1;
+    let mut removed = 0usize;
+    let mut changed = false;
+
+    for turn in &mut turns[..last_idx] {
+        if turn.role != "user" {
+            continue;
+        }
+
+        if let Some((cleaned, removed_from_turn)) =
+            strip_unreadable_local_image_markers(&turn.content)
+        {
+            turn.content = cleaned;
+            removed += removed_from_turn;
+            changed = true;
+        }
+    }
+
+    if changed {
+        let current = turns.pop();
+        turns.retain(|turn| !turn.content.trim().is_empty());
+        if let Some(current) = current {
+            turns.push(current);
+        }
+    }
+
+    removed
+}
+
+fn is_missing_local_image_reference_error(error: &anyhow::Error) -> bool {
+    matches!(
+        error.downcast_ref::<crate::multimodal::MultimodalError>(),
+        Some(
+            crate::multimodal::MultimodalError::ImageSourceNotFound { .. }
+                | crate::multimodal::MultimodalError::LocalReadFailed { .. }
+        )
+    )
+}
+
 fn should_rollback_failed_user_turn(error: &anyhow::Error) -> bool {
     if error
         .downcast_ref::<providers::ProviderCapabilityError>()
         .is_some_and(|capability| capability.capability.eq_ignore_ascii_case("vision"))
     {
+        return true;
+    }
+
+    if is_missing_local_image_reference_error(error) {
         return true;
     }
 
@@ -2585,6 +2705,22 @@ async fn process_channel_message(
 
     // Preserve user turn before the LLM call so interrupted requests keep context.
     append_sender_turn(ctx.as_ref(), &history_key, ChatMessage::user(&msg.content));
+
+    // Remove stale local image markers from older cached turns so expired
+    // attachment files do not poison later follow-up requests.
+    let removed_stale_images = if force_fresh_session {
+        0
+    } else {
+        prune_unreadable_local_image_markers_from_history(ctx.as_ref(), &history_key)
+    };
+    if removed_stale_images > 0 {
+        tracing::info!(
+            channel = %msg.channel,
+            sender = %msg.sender,
+            removed_stale_images,
+            "Removed stale local image markers from cached channel history"
+        );
+    }
 
     // Build history from per-sender conversation cache.
     let prior_turns_raw = if force_fresh_session {
@@ -5530,6 +5666,7 @@ mod tests {
     use super::*;
     use crate::memory::{Memory, MemoryCategory, SqliteMemory};
     use crate::observability::NoopObserver;
+    use crate::providers::traits::ProviderCapabilities;
     use crate::providers::{ChatMessage, Provider};
     use crate::tools::{Tool, ToolResult};
     use std::collections::{HashMap, HashSet};
@@ -5682,6 +5819,27 @@ mod tests {
             "telegram_user_msg_201",
             "plain text without tool results"
         ));
+    }
+
+    #[test]
+    fn strip_unreadable_local_image_markers_removes_only_missing_local_refs() {
+        let tmp = TempDir::new().unwrap();
+        let existing = tmp.path().join("present.png");
+        std::fs::write(&existing, b"png").unwrap();
+        let missing = tmp.path().join("missing.png");
+
+        let input = format!(
+            "Describe both\n\n[IMAGE:{}]\n[IMAGE:{}]\n[IMAGE:https://example.com/remote.png]",
+            existing.display(),
+            missing.display()
+        );
+        let (cleaned, removed) = strip_unreadable_local_image_markers(&input)
+            .expect("missing local marker should be pruned");
+
+        assert_eq!(removed, 1);
+        assert!(cleaned.contains(&existing.display().to_string()));
+        assert!(cleaned.contains("https://example.com/remote.png"));
+        assert!(!cleaned.contains(&missing.display().to_string()));
     }
 
     #[test]
@@ -6210,6 +6368,46 @@ mod tests {
         );
         assert_eq!(persisted[0].content, "first");
         assert_eq!(persisted[1].content, "ok");
+    }
+
+    #[derive(Default)]
+    struct VisionCaptureProvider {
+        history_calls: AtomicUsize,
+        captured_messages: Mutex<Vec<ChatMessage>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Provider for VisionCaptureProvider {
+        fn capabilities(&self) -> ProviderCapabilities {
+            ProviderCapabilities {
+                vision: true,
+                ..Default::default()
+            }
+        }
+
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<String> {
+            Ok("ok".to_string())
+        }
+
+        async fn chat_with_history(
+            &self,
+            messages: &[ChatMessage],
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<String> {
+            self.history_calls.fetch_add(1, Ordering::SeqCst);
+            *self
+                .captured_messages
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = messages.to_vec();
+            Ok("ok".to_string())
+        }
     }
 
     struct DummyProvider;
@@ -10629,6 +10827,299 @@ This is an example JSON object for profile settings."#;
         assert!(
             turns.iter().all(|turn| !turn.content.contains("[IMAGE:")),
             "failed vision turn must not persist image marker content"
+        );
+    }
+
+    #[tokio::test]
+    async fn e2e_stale_local_image_history_is_pruned_for_vision_provider() {
+        let workspace = make_workspace();
+        let stale_path = workspace.path().join("expired.png");
+        let stale_path_str = stale_path.display().to_string();
+
+        let channel_impl = Arc::new(RecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+
+        let mut channels_by_name = HashMap::new();
+        channels_by_name.insert(channel.name().to_string(), channel);
+
+        let provider_impl = Arc::new(VisionCaptureProvider::default());
+        let provider: Arc<dyn Provider> = provider_impl.clone();
+
+        let history_key = "test-channel_chat-photo_zeroclaw_user".to_string();
+        let mut histories = HashMap::new();
+        histories.insert(
+            history_key.clone(),
+            vec![
+                ChatMessage::user(format!(
+                    "[IMAGE:{stale_path_str}]\n\nDescribe this screenshot"
+                )),
+                ChatMessage::assistant("It looked like a dashboard"),
+            ],
+        );
+
+        let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            channels_by_name: Arc::new(channels_by_name),
+            provider,
+            default_provider: Arc::new("vision-test".to_string()),
+            memory: Arc::new(NoopMemory),
+            tools_registry: Arc::new(vec![]),
+            observer: Arc::new(NoopObserver),
+            system_prompt: Arc::new("You are a helpful assistant.".to_string()),
+            model: Arc::new("vision-model".to_string()),
+            temperature: 0.0,
+            auto_save_memory: false,
+            max_tool_iterations: 5,
+            min_relevance_score: 0.0,
+            conversation_histories: Arc::new(Mutex::new(histories)),
+            pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
+            provider_cache: Arc::new(Mutex::new(HashMap::new())),
+            route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            api_key: None,
+            api_url: None,
+            reliability: Arc::new(crate::config::ReliabilityConfig::default()),
+            provider_runtime_options: providers::ProviderRuntimeOptions::default(),
+            workspace_dir: Arc::new(workspace.path().to_path_buf()),
+            prompt_config: Arc::new(crate::config::Config::default()),
+            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            interrupt_on_new_message: InterruptOnNewMessageConfig {
+                telegram: false,
+                slack: false,
+                discord: false,
+                mattermost: false,
+                matrix: false,
+                wecom_ws: false,
+            },
+            multimodal: crate::config::MultimodalConfig::default(),
+            media_pipeline: crate::config::MediaPipelineConfig::default(),
+            transcription_config: crate::config::TranscriptionConfig::default(),
+            hooks: None,
+            non_cli_excluded_tools: Arc::new(Vec::new()),
+            autonomy_level: AutonomyLevel::default(),
+            tool_call_dedup_exempt: Arc::new(Vec::new()),
+            model_routes: Arc::new(Vec::new()),
+            query_classification: crate::config::QueryClassificationConfig::default(),
+            ack_reactions: true,
+            show_tool_calls: true,
+            session_store: None,
+            approval_manager: Arc::new(ApprovalManager::for_non_interactive(
+                &crate::config::AutonomyConfig::default(),
+            )),
+            activated_tools: None,
+            cost_tracking: None,
+            pacing: crate::config::PacingConfig::default(),
+            max_tool_result_chars: 0,
+            context_token_budget: 0,
+            debouncer: Arc::new(debounce::MessageDebouncer::new(Duration::ZERO)),
+        });
+
+        process_channel_message(
+            Arc::clone(&runtime_ctx),
+            traits::ChannelMessage {
+                id: "msg-text-1".to_string(),
+                sender: "zeroclaw_user".to_string(),
+                reply_target: "chat-photo".to_string(),
+                content: "What changed after that screenshot?".to_string(),
+                channel: "test-channel".to_string(),
+                timestamp: 1,
+                thread_ts: None,
+                interruption_scope_id: None,
+                attachments: vec![],
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+        let sent = channel_impl.sent_messages.lock().await;
+        assert_eq!(sent.len(), 1, "expected exactly one reply");
+        assert!(
+            sent[0].ends_with(":ok"),
+            "follow-up text should succeed after pruning stale image history, got: {}",
+            sent[0]
+        );
+        drop(sent);
+
+        assert_eq!(
+            provider_impl.history_calls.load(Ordering::SeqCst),
+            1,
+            "vision provider should receive the sanitized follow-up request"
+        );
+        let captured = provider_impl
+            .captured_messages
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        assert!(
+            captured
+                .iter()
+                .all(|msg| !msg.content.contains(&stale_path_str)),
+            "provider request must not contain stale local image paths"
+        );
+
+        let histories = runtime_ctx
+            .conversation_histories
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let turns = histories
+            .get(&history_key)
+            .expect("history should still exist for sender");
+        assert!(
+            turns
+                .iter()
+                .all(|turn| !turn.content.contains(&stale_path_str)),
+            "cached history should self-heal stale image paths"
+        );
+    }
+
+    #[tokio::test]
+    async fn e2e_missing_current_local_image_turn_rolls_back_for_vision_provider() {
+        let workspace = make_workspace();
+        let missing_path = workspace.path().join("missing.png");
+        let missing_path_str = missing_path.display().to_string();
+
+        let channel_impl = Arc::new(RecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+
+        let mut channels_by_name = HashMap::new();
+        channels_by_name.insert(channel.name().to_string(), channel);
+
+        let provider_impl = Arc::new(VisionCaptureProvider::default());
+        let provider: Arc<dyn Provider> = provider_impl.clone();
+
+        let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            channels_by_name: Arc::new(channels_by_name),
+            provider,
+            default_provider: Arc::new("vision-test".to_string()),
+            memory: Arc::new(NoopMemory),
+            tools_registry: Arc::new(vec![]),
+            observer: Arc::new(NoopObserver),
+            system_prompt: Arc::new("You are a helpful assistant.".to_string()),
+            model: Arc::new("vision-model".to_string()),
+            temperature: 0.0,
+            auto_save_memory: false,
+            max_tool_iterations: 5,
+            min_relevance_score: 0.0,
+            conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
+            provider_cache: Arc::new(Mutex::new(HashMap::new())),
+            route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            api_key: None,
+            api_url: None,
+            reliability: Arc::new(crate::config::ReliabilityConfig::default()),
+            provider_runtime_options: providers::ProviderRuntimeOptions::default(),
+            workspace_dir: Arc::new(workspace.path().to_path_buf()),
+            prompt_config: Arc::new(crate::config::Config::default()),
+            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            interrupt_on_new_message: InterruptOnNewMessageConfig {
+                telegram: false,
+                slack: false,
+                discord: false,
+                mattermost: false,
+                matrix: false,
+                wecom_ws: false,
+            },
+            multimodal: crate::config::MultimodalConfig::default(),
+            media_pipeline: crate::config::MediaPipelineConfig::default(),
+            transcription_config: crate::config::TranscriptionConfig::default(),
+            hooks: None,
+            non_cli_excluded_tools: Arc::new(Vec::new()),
+            autonomy_level: AutonomyLevel::default(),
+            tool_call_dedup_exempt: Arc::new(Vec::new()),
+            model_routes: Arc::new(Vec::new()),
+            query_classification: crate::config::QueryClassificationConfig::default(),
+            ack_reactions: true,
+            show_tool_calls: true,
+            session_store: None,
+            approval_manager: Arc::new(ApprovalManager::for_non_interactive(
+                &crate::config::AutonomyConfig::default(),
+            )),
+            activated_tools: None,
+            cost_tracking: None,
+            pacing: crate::config::PacingConfig::default(),
+            max_tool_result_chars: 0,
+            context_token_budget: 0,
+            debouncer: Arc::new(debounce::MessageDebouncer::new(Duration::ZERO)),
+        });
+
+        process_channel_message(
+            Arc::clone(&runtime_ctx),
+            traits::ChannelMessage {
+                id: "msg-bad-image".to_string(),
+                sender: "zeroclaw_user".to_string(),
+                reply_target: "chat-photo".to_string(),
+                content: format!("[IMAGE:{missing_path_str}]\n\nWhat is this?"),
+                channel: "test-channel".to_string(),
+                timestamp: 1,
+                thread_ts: None,
+                interruption_scope_id: None,
+                attachments: vec![],
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+        process_channel_message(
+            Arc::clone(&runtime_ctx),
+            traits::ChannelMessage {
+                id: "msg-text-2".to_string(),
+                sender: "zeroclaw_user".to_string(),
+                reply_target: "chat-photo".to_string(),
+                content: "What is WAL?".to_string(),
+                channel: "test-channel".to_string(),
+                timestamp: 2,
+                thread_ts: None,
+                interruption_scope_id: None,
+                attachments: vec![],
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+        let sent = channel_impl.sent_messages.lock().await;
+        assert_eq!(sent.len(), 2, "expected one error and one successful reply");
+        assert!(
+            sent[0].contains("image source not found or unreadable"),
+            "first reply must mention the missing image path, got: {}",
+            sent[0]
+        );
+        assert!(
+            sent[1].ends_with(":ok"),
+            "second reply should succeed for follow-up text, got: {}",
+            sent[1]
+        );
+        drop(sent);
+
+        assert_eq!(
+            provider_impl.history_calls.load(Ordering::SeqCst),
+            1,
+            "provider should only be called for the successful text follow-up"
+        );
+        let captured = provider_impl
+            .captured_messages
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        assert!(
+            captured
+                .iter()
+                .all(|msg| !msg.content.contains(&missing_path_str)),
+            "rolled-back bad image turn must not reach the provider later"
+        );
+
+        let histories = runtime_ctx
+            .conversation_histories
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let turns = histories
+            .get("test-channel_chat-photo_zeroclaw_user")
+            .expect("history should exist for sender");
+        assert_eq!(turns.len(), 2);
+        assert_eq!(turns[0].role, "user");
+        assert_eq!(turns[0].content, "What is WAL?");
+        assert_eq!(turns[1].role, "assistant");
+        assert_eq!(turns[1].content, "ok");
+        assert!(
+            turns.iter().all(|turn| !turn.content.contains("[IMAGE:")),
+            "failed missing-image turn must not poison later history"
         );
     }
 
