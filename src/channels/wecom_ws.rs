@@ -759,8 +759,8 @@ impl WeComWsChannel {
         // `in_final_answer` and show the content directly.  If a Progress event
         // arrives afterward the flag is reverted (see `note_progress_update`).
         // We intentionally keep work_log intact so it can be restored on revert.
-        let is_continuation = state.last_content.is_empty()
-            || content.starts_with(&state.last_content);
+        let is_continuation =
+            state.last_content.is_empty() || content.starts_with(&state.last_content);
 
         if !is_continuation {
             // Content was reset → tentatively enter final-answer streaming.
@@ -4005,7 +4005,10 @@ mod tests {
             .expect("progress should render");
         assert!(wl.contains("tool2"));
         // work_log should still contain previous tool progress (preserved across false positive).
-        assert!(wl.contains("tool1"), "work_log must preserve tool1 after fallback");
+        assert!(
+            wl.contains("tool1"),
+            "work_log must preserve tool1 after fallback"
+        );
 
         {
             let state = channel.draft_states.lock();
