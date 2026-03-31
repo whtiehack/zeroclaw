@@ -170,15 +170,20 @@ pub async fn prepare_messages_for_provider_with_provider_hint(
                     normalized_refs.push(data_uri);
                 }
                 Err(error) => {
-                    if error
+                    let is_retrieval_failure = error
                         .downcast_ref::<MultimodalError>()
                         .map_or(false, |e| {
-                            matches!(e, MultimodalError::RemoteFetchFailed { .. })
-                        })
-                    {
+                            matches!(
+                                e,
+                                MultimodalError::RemoteFetchFailed { .. }
+                                    | MultimodalError::RemoteFetchDisabled { .. }
+                                    | MultimodalError::ImageSourceNotFound { .. }
+                            )
+                        });
+                    if is_retrieval_failure {
                         tracing::warn!(
                             reference = %reference,
-                            "multimodal: skipping unavailable remote image: {error}"
+                            "multimodal: skipping unavailable image: {error}"
                         );
                     } else {
                         return Err(error);
