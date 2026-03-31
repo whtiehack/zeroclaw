@@ -164,10 +164,27 @@ pub async fn prepare_messages_for_provider_with_provider_hint(
         }
 
         let mut normalized_refs = Vec::with_capacity(refs.len());
-        for reference in refs {
-            let data_uri =
-                normalize_image_reference(&reference, config, max_bytes, provider_hint).await?;
-            normalized_refs.push(data_uri);
+        for reference in &refs {
+            match normalize_image_reference(reference, config, max_bytes, provider_hint).await {
+                Ok(data_uri) => {
+                    normalized_refs.push(data_uri);
+                }
+                Err(error) => {
+                    if error
+                        .downcast_ref::<MultimodalError>()
+                        .map_or(false, |e| {
+                            matches!(e, MultimodalError::RemoteFetchFailed { .. })
+                        })
+                    {
+                        tracing::warn!(
+                            reference = %reference,
+                            "multimodal: skipping unavailable remote image: {error}"
+                        );
+                    } else {
+                        return Err(error);
+                    }
+                }
+            }
         }
 
         let content = compose_multimodal_message(&cleaned_text, &normalized_refs);
