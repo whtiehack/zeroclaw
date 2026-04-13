@@ -6410,3 +6410,47 @@ fn sanitize_channel_response_passes_clean_text() {
 
     assert_eq!(result, clean_text);
 }
+
+// ── Tests for strip_think_tags_inline (streaming draft sanitization) ──
+
+#[test]
+fn strip_think_tags_inline_removes_single_block() {
+    assert_eq!(
+        strip_think_tags_inline("<think>reasoning</think>Hello"),
+        "Hello"
+    );
+}
+
+#[test]
+fn strip_think_tags_inline_removes_multiple_blocks() {
+    assert_eq!(
+        strip_think_tags_inline("<think>a</think>X<think>b</think>Y"),
+        "XY"
+    );
+}
+
+#[test]
+fn strip_think_tags_inline_handles_unclosed_block() {
+    assert_eq!(
+        strip_think_tags_inline("visible<think>hidden tail"),
+        "visible"
+    );
+}
+
+#[test]
+fn strip_think_tags_inline_preserves_text_without_tags() {
+    assert_eq!(strip_think_tags_inline("plain text"), "plain text");
+}
+
+#[test]
+fn strip_think_tags_inline_handles_empty_string() {
+    assert_eq!(strip_think_tags_inline(""), "");
+}
+
+#[test]
+fn strip_think_tags_inline_strips_surrounding_whitespace() {
+    assert_eq!(
+        strip_think_tags_inline("<think>hidden</think>  Answer  "),
+        "Answer"
+    );
+}

@@ -2161,6 +2161,28 @@ fn extract_tool_context_summary(history: &[ChatMessage], start_index: usize) -> 
     format!("[Used tools: {}]", tool_names.join(", "))
 }
 
+/// Strip `<think>...</think>` blocks from streaming draft text so reasoning
+/// tokens are never shown to the user in partial updates.
+fn strip_think_tags_inline(s: &str) -> String {
+    let mut result = String::with_capacity(s.len());
+    let mut rest = s;
+    loop {
+        if let Some(start) = rest.find("<think>") {
+            result.push_str(&rest[..start]);
+            if let Some(end) = rest[start..].find("</think>") {
+                rest = &rest[start + end + "</think>".len()..];
+            } else {
+                // Unclosed tag: drop the tail to avoid leaking partial reasoning.
+                break;
+            }
+        } else {
+            result.push_str(rest);
+            break;
+        }
+    }
+    result.trim().to_string()
+}
+
 fn sanitize_channel_response(response: &str, tools: &[Box<dyn Tool>]) -> String {
     let known_tool_names: HashSet<String> = tools
         .iter()
@@ -2907,8 +2929,9 @@ async fn process_channel_message(
                             accumulated.clear();
                         }
                         DraftEvent::Progress(text) => {
+                            let visible = strip_think_tags_inline(&text);
                             if let Err(e) = channel
-                                .update_draft_progress(&reply_target, &draft_id, &text)
+                                .update_draft_progress(&reply_target, &draft_id, &visible)
                                 .await
                             {
                                 tracing::debug!("Draft progress update failed: {e}");
@@ -2916,8 +2939,9 @@ async fn process_channel_message(
                         }
                         DraftEvent::Content(text) => {
                             accumulated.push_str(&text);
+                            let visible = strip_think_tags_inline(&accumulated);
                             if let Err(e) = channel
-                                .update_draft(&reply_target, &draft_id, &accumulated)
+                                .update_draft(&reply_target, &draft_id, &visible)
                                 .await
                             {
                                 tracing::debug!("Draft update failed: {e}");
