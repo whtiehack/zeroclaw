@@ -806,7 +806,11 @@ fn normalize_cached_channel_turns(turns: Vec<ChatMessage>) -> Vec<ChatMessage> {
 
     for turn in turns {
         match (expecting_user, turn.role.as_str()) {
-            (true, "user") => {
+            // Pass through tool-role messages preserved by
+            // keep_tool_context_turns (#4827).  After a tool result the
+            // next expected message is an assistant response, same as
+            // after a user message.
+            (_, "tool") | (true, "user") => {
                 normalized.push(turn);
                 expecting_user = false;
             }
@@ -1334,6 +1338,90 @@ fn append_sender_turn(ctx: &ChannelRuntimeContext, sender_key: &str, turn: ChatM
     while turns.len() > max_history {
         turns.remove(0);
     }
+}
+
+/// Extract tool-call (assistant with tool_call content) and tool-result
+/// messages from the current turn in the LLM history, excluding the final
+/// assistant text response.  "Current turn" = everything after the last
+/// user-role message.
+fn extract_current_turn_tool_messages(history: &[ChatMessage]) -> Vec<ChatMessage> {
+    // Find the index of the last user message — tool messages for the
+    // current turn come after it.
+    let last_user_idx = history.iter().rposition(|m| m.role == "user").unwrap_or(0);
+
+    let tail = &history[last_user_idx + 1..];
+    if tail.is_empty() {
+        return Vec::new();
+    }
+
+    // Everything except the very last assistant message (which is the
+    // final text response that gets stored separately).
+    let end = if tail.last().is_some_and(|m| m.role == "assistant") {
+        tail.len() - 1
+    } else {
+        tail.len()
+    };
+
+    tail[..end]
+        .iter()
+        .filter(|m| m.role == "assistant" || m.role == "tool")
+        .cloned()
+        .collect()
+}
+
+/// Remove tool-role and intermediate assistant tool-call messages from
+/// conversation turns older than the most recent `keep_turns` user→assistant
+/// exchanges.  This prevents unbounded history growth while preserving
+/// tool context for the N most recent turns.
+fn strip_old_tool_context(ctx: &ChannelRuntimeContext, sender_key: &str, keep_turns: usize) {
+    let mut histories = ctx
+        .conversation_histories
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+
+    let Some(turns) = histories.get_mut(sender_key) else {
+        return;
+    };
+
+    // Walk backwards to find the boundary: count user messages to
+    // identify which turns are "recent" (protected from stripping).
+    let mut user_count = 0;
+    let mut protect_from = turns.len();
+    for (i, turn) in turns.iter().enumerate().rev() {
+        if turn.role == "user" {
+            user_count += 1;
+            if user_count > keep_turns {
+                // Everything before this index is old enough to strip.
+                protect_from = i + 1; // protect from next message onward
+                break;
+            }
+        }
+    }
+
+    // Remove tool and intermediate assistant messages before the boundary.
+    // An "intermediate assistant" is one whose content looks like a tool
+    // call (contains `<tool_call>` or starts with `{\"tool_call`).
+    let mut i = 0;
+    while i < protect_from && i < turns.len() {
+        let dominated = turns[i].role == "tool"
+            || (turns[i].role == "assistant" && is_tool_call_content(&turns[i].content));
+        if dominated {
+            turns.remove(i);
+            // Adjust boundary since we removed an element.
+            protect_from = protect_from.saturating_sub(1);
+        } else {
+            i += 1;
+        }
+    }
+}
+
+/// Heuristic: does this assistant message content represent a tool call
+/// rather than a final text response?
+fn is_tool_call_content(content: &str) -> bool {
+    let trimmed = content.trim();
+    trimmed.contains("<tool_call>")
+        || trimmed.starts_with("{\"tool_call\"")
+        || trimmed.starts_with("{\"name\"")
 }
 
 fn rollback_orphan_user_turn(
@@ -3312,13 +3400,32 @@ async fn process_channel_message(
             // receives tool context through the tool-call/result messages in
             // the conversation history built by `run_tool_call_loop`, so the
             // extra summary prefix is unnecessary.
-            let history_response = delivered_response.clone();
+            // Persist intermediate tool-call/result messages from this turn
+            // so the model retains concrete "I used tools" examples in
+            // context, preventing drift toward tool-less responses (#4827).
+            let keep_tool_turns = ctx.prompt_config.agent.keep_tool_context_turns;
+            if keep_tool_turns > 0 {
+                // Find tool messages for the current turn: everything after
+                // the last user message up to (but not including) the final
+                // assistant response that matches our delivered text.
+                let tool_messages: Vec<ChatMessage> = extract_current_turn_tool_messages(&history);
+                for tool_msg in tool_messages {
+                    append_sender_turn(ctx.as_ref(), &history_key, tool_msg);
+                }
+            }
 
+            let history_response = delivered_response.clone();
             append_sender_turn(
                 ctx.as_ref(),
                 &history_key,
                 ChatMessage::assistant(&history_response),
             );
+
+            // Strip tool-call messages from turns older than
+            // keep_tool_context_turns to prevent unbounded growth.
+            if keep_tool_turns > 0 {
+                strip_old_tool_context(ctx.as_ref(), &history_key, keep_tool_turns);
+            }
 
             // Fire-and-forget LLM-driven memory consolidation.
             if ctx.auto_save_memory && autosave_content_chars >= AUTOSAVE_MIN_MESSAGE_CHARS {

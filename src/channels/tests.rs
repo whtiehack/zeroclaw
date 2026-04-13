@@ -6454,3 +6454,83 @@ fn strip_think_tags_inline_strips_surrounding_whitespace() {
         "Answer"
     );
 }
+
+// ── Tests for #4827: tool context preservation ──────────────
+
+#[test]
+fn extract_current_turn_tool_messages_returns_intermediate_messages() {
+    let history = vec![
+        ChatMessage::system("sys"),
+        ChatMessage::user("older msg"),
+        ChatMessage::assistant("older reply"),
+        ChatMessage::user("block the iPad"),
+        ChatMessage::assistant("{\"tool_call\": \"shell\"}"),
+        ChatMessage::tool("ok"),
+        ChatMessage::assistant("Done, iPad is blocked."),
+    ];
+
+    let tool_msgs = extract_current_turn_tool_messages(&history);
+    assert_eq!(tool_msgs.len(), 2);
+    assert_eq!(tool_msgs[0].role, "assistant");
+    assert!(tool_msgs[0].content.contains("tool_call"));
+    assert_eq!(tool_msgs[1].role, "tool");
+}
+
+#[test]
+fn extract_current_turn_tool_messages_empty_when_no_tools() {
+    let history = vec![
+        ChatMessage::user("hello"),
+        ChatMessage::assistant("Hi there!"),
+    ];
+
+    let tool_msgs = extract_current_turn_tool_messages(&history);
+    assert!(tool_msgs.is_empty());
+}
+
+#[test]
+fn extract_current_turn_tool_messages_multiple_tool_rounds() {
+    let history = vec![
+        ChatMessage::user("do two things"),
+        ChatMessage::assistant("{\"tool_call\": \"read_skill\"}"),
+        ChatMessage::tool("skill content"),
+        ChatMessage::assistant("{\"tool_call\": \"shell\"}"),
+        ChatMessage::tool("shell output"),
+        ChatMessage::assistant("All done."),
+    ];
+
+    let tool_msgs = extract_current_turn_tool_messages(&history);
+    assert_eq!(tool_msgs.len(), 4);
+}
+
+#[test]
+fn is_tool_call_content_detects_tool_calls() {
+    assert!(is_tool_call_content("{\"tool_call\": \"shell\"}"));
+    assert!(is_tool_call_content("<tool_call>shell</tool_call>"));
+    assert!(is_tool_call_content(
+        "{\"name\": \"read_file\", \"args\": {}}"
+    ));
+    assert!(!is_tool_call_content("The iPad has been blocked."));
+    assert!(!is_tool_call_content(""));
+}
+
+#[test]
+fn normalize_cached_channel_turns_passes_through_tool_messages() {
+    let turns = vec![
+        ChatMessage::user("block the iPad"),
+        ChatMessage::assistant("{\"tool_call\": \"shell\"}"),
+        ChatMessage::tool("ok"),
+        ChatMessage::assistant("iPad blocked."),
+        ChatMessage::user("next question"),
+    ];
+
+    let normalized = normalize_cached_channel_turns(turns);
+    // user, assistant(tool_call), tool, assistant(final), user
+    assert_eq!(normalized.len(), 5);
+    assert_eq!(normalized[2].role, "tool");
+}
+
+#[test]
+fn default_keep_tool_context_turns_is_two() {
+    let config = crate::config::schema::AgentConfig::default();
+    assert_eq!(config.keep_tool_context_turns, 2);
+}
