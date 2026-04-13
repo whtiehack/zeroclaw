@@ -44,3 +44,9 @@
 | 21 | heartbeat 投递 wecom_ws | validate + auto-detect 支持 wecom_ws 作为 heartbeat target | - |
 | 22 | draft_update_interval_ms 配置 | `WeComWsConfig` 新增字段，默认 300ms | [详细文档](./stream-final-answer-2026-03-29.md) |
 | 23 | stale local image history 自愈 | 历史中的失效本地 `[IMAGE:]` marker 自动剥离，当前坏图失败回滚，避免后续文本继续报错 | [详细文档](./stale-local-image-history-self-heal-2026-03-30.md) |
+
+## 运维参考
+
+| # | 主题 | 说明 | 文档 |
+|---|------|------|------|
+| 1 | vision_provider 路由与 custom: provider | 主模型不支持视觉时，`custom:` 硬编码 vision=true 导致路由失效，用 `openai` provider 替代的 workaround | [详细文档](./vision-provider-routing-custom-workaround-2026-04-13.md) |
