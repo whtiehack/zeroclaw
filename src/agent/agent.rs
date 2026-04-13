@@ -578,7 +578,24 @@ impl Agent {
         }
 
         if other_messages.len() > max {
-            let drop_count = other_messages.len() - max;
+            let mut drop_count = other_messages.len() - max;
+
+            // Avoid creating orphan ToolResults: if the first message remaining
+            // after the drop is a ToolResults, its paired AssistantToolCalls was
+            // dropped, so the ToolResults must be dropped too. Otherwise the
+            // history would start with a tool_result block whose tool_use_id
+            // has no matching tool_use, causing providers (e.g. Anthropic) to
+            // reject the request with "messages.0.content.0: unexpected
+            // tool_use_id found in tool_result blocks".
+            while drop_count < other_messages.len()
+                && matches!(
+                    &other_messages[drop_count],
+                    ConversationMessage::ToolResults(_)
+                )
+            {
+                drop_count += 1;
+            }
+
             other_messages.drain(0..drop_count);
         }
 
