@@ -2871,6 +2871,12 @@ async fn process_channel_message(
         let last_idx = prior_turns.len() - 1;
         let supports_vision = active_provider.supports_vision();
         for turn in &mut prior_turns[..last_idx] {
+            // Only process user messages — tool/assistant content is JSON
+            // and string-level marker replacement would corrupt the structure,
+            // causing tool_call_id to be lost on deserialization.
+            if turn.role != "user" {
+                continue;
+            }
             if turn.content.contains("[IMAGE:") {
                 let (cleaned, refs) = crate::multimodal::parse_image_markers(&turn.content);
                 if supports_vision {
