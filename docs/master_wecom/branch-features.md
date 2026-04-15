@@ -44,7 +44,7 @@
 | 21 | heartbeat 投递 wecom_ws | validate + auto-detect 支持 wecom_ws 作为 heartbeat target | - |
 | 22 | draft_update_interval_ms 配置 | `WeComWsConfig` 新增字段，默认 300ms | [详细文档](./stream-final-answer-2026-03-29.md) |
 | 23 | stale local image history 自愈 | 历史中的失效本地 `[IMAGE:]` marker 自动剥离，当前坏图失败回滚，避免后续文本继续报错 | [详细文档](./stale-local-image-history-self-heal-2026-03-30.md) |
-| 24 | history image truncation | 历史轮 `[IMAGE:]` 替换为 `[Image from history, truncated: <path>]` 文本占位，仅当前轮发真实图片，节省 token | - |
+| 24 | history image truncation | 历史轮 user 消息 `[IMAGE:]` 替换为文本占位，仅当前轮发真实图片，节省 token。**仅处理 user 角色**，tool/assistant 的 JSON content 不动（避免破坏 tool_call_id） | - |
 | 25 | channel context compression | `prior_turns` token 达 `max_context_tokens` 90% 时，LLM 摘要压缩旧消息，更新内存+磁盘 JSONL，timeout 300s | - |
 
 ## 运维参考
