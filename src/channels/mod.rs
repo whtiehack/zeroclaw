@@ -2989,11 +2989,14 @@ Output concise bullet points. Be thorough but brief.";
             .await
             {
                 Ok(Ok(summary)) => {
-                    let mut new_turns = vec![ChatMessage::assistant(format!(
-                        "[CONTEXT SUMMARY — {} earlier messages compressed]\n\n{}",
-                        to_compress.len(),
-                        summary
-                    ))];
+                    let mut new_turns = vec![
+                        ChatMessage::user("[conversation start]".to_string()),
+                        ChatMessage::assistant(format!(
+                            "[CONTEXT SUMMARY — {} earlier messages compressed]\n\n{}",
+                            to_compress.len(),
+                            summary
+                        )),
+                    ];
                     if let Some(last) = last_user {
                         new_turns.push(last);
                     }
