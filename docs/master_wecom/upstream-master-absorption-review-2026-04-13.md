@@ -59,20 +59,13 @@
 
 | commit | 主题 | 建议 | 说明 |
 | --- | --- | --- | --- |
-| `87698ad1` | `tool_use/tool_result` 按原子组修剪 | 建议吸收 | 是 `35dd0914` / `d72c2128` 的关键配套，能避免工具对话被剪断 |
-| `35dd0914` | 截断 tool result 时保留 JSON 信封 | 建议吸收 | 修复 `tool_call_id` 丢失问题，但最好与 `87698ad1` 成组吸收 |
-| `d72c2128` | `trim_history` 跳过孤立 `tool_result` | 建议吸收 | 防止历史裁剪后残留无主 `tool_result` |
-
-当前本地关注点：
-
-- `src/agent/history_pruner.rs`
-- `src/agent/history.rs`
-- `src/agent/agent.rs`
-- `src/agent/loop_.rs`
+| `87698ad1` | `tool_use/tool_result` 按原子组修剪 | ~~建议吸收~~ **已有** | 本地已包含等价实现（2026-04-15 确认��� |
+| `35dd0914` | 截断 tool result 时保留 JSON ���封 | ~~建议���收~~ **已��** | 本地已有 `truncate_tool_message()`（2026-04-15 确认） |
+| `d72c2128` | `trim_history` 跳过孤立 `tool_result` | ~~建议��收~~ **已有** | 本地 `agent.rs` 已有 orphan ToolResults 保护（2026-04-15 确认） |
 
 结论：
 
-- 这组修复值得吸收。
+- ~~这组修复值得吸收。~~ 2026-04-15 确认本地已全部包含，无需再吸收。
 - 正确顺序不是单独挑一条，而是先 `87698ad1`，再 `35dd0914`，最后 `d72c2128`。
 
 ### `providers`
@@ -224,9 +217,9 @@
 
 1. `30c540bb`
 2. `2f4b32a9`
-3. `87698ad1`
-4. `35dd0914`
-5. `d72c2128`
+3. ~~`87698ad1`~~ （已有）
+4. ~~`35dd0914`~~ （已有）
+5. ~~`d72c2128`~~ （已有）
 6. `c70e86cc`
 
 ### 第二批：拆分后再进
