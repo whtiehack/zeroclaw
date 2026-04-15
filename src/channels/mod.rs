@@ -2862,18 +2862,32 @@ async fn process_channel_message(
         }
     }
 
-    // Strip [IMAGE:] markers from *older* history messages when the active
-    // provider does not support vision. This prevents "history poisoning"
-    // where a previously-sent image marker gets reloaded from the JSONL
-    // session file and permanently breaks the conversation (fixes #3674).
-    // We skip the last turn (the current message) so the vision check can
-    // still reject fresh image sends with a proper error.
-    if !active_provider.supports_vision() && prior_turns.len() > 1 {
+    // Replace [IMAGE:] markers in *older* history messages with a short text
+    // placeholder that preserves the original path. This saves tokens by not
+    // re-encoding old images while keeping context about what was sent.
+    // For non-vision providers the marker is stripped entirely (fixes #3674).
+    // We skip the last turn (the current message) so fresh images are sent.
+    if prior_turns.len() > 1 {
         let last_idx = prior_turns.len() - 1;
+        let supports_vision = active_provider.supports_vision();
         for turn in &mut prior_turns[..last_idx] {
             if turn.content.contains("[IMAGE:") {
-                let (cleaned, _refs) = crate::multimodal::parse_image_markers(&turn.content);
-                turn.content = cleaned;
+                let (cleaned, refs) = crate::multimodal::parse_image_markers(&turn.content);
+                if supports_vision {
+                    // Replace with text placeholder preserving original path
+                    let mut replaced = cleaned;
+                    for r in &refs {
+                        if !replaced.is_empty() {
+                            replaced.push('\n');
+                        }
+                        replaced.push_str(&format!(
+                            "[Image from history, truncated: {}]", r
+                        ));
+                    }
+                    turn.content = replaced;
+                } else {
+                    turn.content = cleaned;
+                }
             }
         }
         // Drop older turns that became empty after marker removal (e.g. image-only messages).
