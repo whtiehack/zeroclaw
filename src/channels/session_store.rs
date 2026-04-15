@@ -99,7 +99,7 @@ impl SessionStore {
         self.rewrite(session_key, &messages)
     }
 
-    fn rewrite(&self, session_key: &str, messages: &[ChatMessage]) -> std::io::Result<()> {
+    pub fn rewrite(&self, session_key: &str, messages: &[ChatMessage]) -> std::io::Result<()> {
         let path = self.session_path(session_key);
         let mut file = std::fs::File::create(&path)?;
         for msg in messages {

@@ -2899,6 +2899,143 @@ async fn process_channel_message(
         }
     }
 
+    // ── Channel-level context compression ─────────────────────────
+    // When estimated tokens reach 90% of budget, compress older turns
+    // into an LLM summary. Keeps the last user message intact so the
+    // current request can proceed normally after compression.
+    if ctx.context_token_budget > 0 && prior_turns.len() > 4 {
+        let estimated =
+            crate::agent::context_compressor::estimate_tokens(&prior_turns);
+        let threshold = ctx.context_token_budget * 9 / 10;
+
+        if estimated >= threshold {
+            tracing::info!(
+                channel = %msg.channel,
+                sender = %msg.sender,
+                estimated,
+                threshold,
+                turns = prior_turns.len(),
+                "Channel context compression triggered"
+            );
+
+            // Notify channel
+            if let Some(channel) = target_channel.as_ref() {
+                let _ = channel
+                    .send(
+                        &SendMessage::new(
+                            "⏳ Context limit approaching, compressing history...",
+                            &msg.reply_target,
+                        )
+                        .in_thread(msg.thread_ts.clone()),
+                    )
+                    .await;
+            }
+
+            // Save the last user message (current turn)
+            let last_user = prior_turns.last().cloned();
+
+            // Build transcript from all turns except the last
+            let to_compress = &prior_turns[..prior_turns.len() - 1];
+            let mut transcript = String::with_capacity(50_000.min(
+                to_compress.iter().map(|t| t.content.len()).sum::<usize>(),
+            ));
+            for turn in to_compress {
+                use std::fmt::Write;
+                let content = if turn.content.len() > 2000 {
+                    format!("{}...[truncated]", &turn.content[..turn.content.floor_char_boundary(2000)])
+                } else {
+                    turn.content.clone()
+                };
+                let _ = writeln!(transcript, "[{}]: {}", turn.role, content);
+            }
+            // Cap transcript to avoid oversized compression prompt
+            if transcript.len() > 50_000 {
+                transcript.truncate(transcript.floor_char_boundary(50_000));
+                transcript.push_str("\n...[transcript truncated]");
+            }
+
+            const COMPRESS_SYSTEM: &str = "\
+You are a conversation compaction engine. Summarize the conversation below into concise context.\n\
+\n\
+PRESERVE exactly:\n\
+- All identifiers (usernames, IDs, file paths, URLs, numbers)\n\
+- Actions taken and their results\n\
+- Key data obtained (prices, values, status, error messages)\n\
+- Decisions made and user preferences expressed\n\
+- Current task status and unresolved items\n\
+\n\
+OMIT:\n\
+- Verbose tool output (keep only key results)\n\
+- Repeated greetings or filler\n\
+- Redundant information already stated\n\
+\n\
+Output concise bullet points. Be thorough but brief.";
+
+            let compress_prompt = format!(
+                "Compress the following {}-message conversation into a concise summary.\n\n{}",
+                to_compress.len(),
+                transcript
+            );
+
+            match tokio::time::timeout(
+                Duration::from_secs(300),
+                active_provider.chat_with_system(
+                    Some(COMPRESS_SYSTEM),
+                    &compress_prompt,
+                    &route.model,
+                    0.1,
+                ),
+            )
+            .await
+            {
+                Ok(Ok(summary)) => {
+                    let mut new_turns = vec![ChatMessage::assistant(format!(
+                        "[CONTEXT SUMMARY — {} earlier messages compressed]\n\n{}",
+                        to_compress.len(),
+                        summary
+                    ))];
+                    if let Some(last) = last_user {
+                        new_turns.push(last);
+                    }
+
+                    // Update in-memory history
+                    {
+                        let mut histories = ctx
+                            .conversation_histories
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner());
+                        if let Some(turns) = histories.get_mut(&history_key) {
+                            *turns = new_turns.clone();
+                        }
+                    }
+
+                    // Update disk session
+                    if let Some(ref store) = ctx.session_store {
+                        if let Err(e) = store.rewrite(&history_key, &new_turns) {
+                            tracing::warn!("Failed to rewrite session after compression: {e}");
+                        }
+                    }
+
+                    let new_estimated =
+                        crate::agent::context_compressor::estimate_tokens(&new_turns);
+                    tracing::info!(
+                        compressed_turns = new_turns.len(),
+                        tokens_before = estimated,
+                        tokens_after = new_estimated,
+                        "Channel context compression complete"
+                    );
+                    prior_turns = new_turns;
+                }
+                Ok(Err(e)) => {
+                    tracing::warn!("Channel context compression LLM call failed: {e}");
+                }
+                Err(_) => {
+                    tracing::warn!("Channel context compression timed out after 300s");
+                }
+            }
+        }
+    }
+
     // Proactively trim conversation history before sending to the provider
     // to prevent context-window-exceeded errors (bug #3460).
     let dropped = proactive_trim_turns(&mut prior_turns, PROACTIVE_CONTEXT_BUDGET_CHARS);
