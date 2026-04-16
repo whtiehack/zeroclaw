@@ -2048,6 +2048,27 @@ async fn consume_provider_streaming_response(
                 // do not affect the agent's tool dispatch loop.
             }
             StreamEvent::TextDelta(chunk) => {
+                // Forward reasoning/thinking to draft stream, but do NOT add
+                // to response_text — reasoning should be visible during
+                // streaming yet stay out of session history and final reply.
+                if let Some(reasoning_text) = chunk.reasoning.as_deref() {
+                    if !reasoning_text.is_empty() && !suppress_forwarding {
+                        if let Some(tx) = delta_sender {
+                            if !outcome.forwarded_live_deltas {
+                                let _ = tx.send(DraftEvent::Clear).await;
+                                outcome.forwarded_live_deltas = true;
+                            }
+                            if tx
+                                .send(DraftEvent::Content(reasoning_text.to_string()))
+                                .await
+                                .is_err()
+                            {
+                                delta_sender = None;
+                            }
+                        }
+                    }
+                }
+
                 if chunk.delta.is_empty() {
                     continue;
                 }
