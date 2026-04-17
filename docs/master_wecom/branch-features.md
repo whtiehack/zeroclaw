@@ -48,6 +48,7 @@
 | 25 | channel context compression | `prior_turns` token 达 `max_context_tokens` 90% 时，LLM 摘要压缩旧消息，更新内存+磁盘 JSONL，timeout 300s | - |
 | 26 | reasoning 流式转发 + 切换清屏 | provider 的 `reasoning_content` 流式推到草稿显示，不进 `response_text`；reasoning → 正文过渡时自动翻转 `forwarded_live_deltas` 触发 Clear，避免 draft 出现"思考+正文"拼接 | - |
 | 27 | memory recall session_id 对齐 | `is_group_chat` 补 `"group--"` 前缀（wecom_ws 群聊），recall session 从 `msg.sender` 改为 `history_key`（与 autosave 一致），删除死路的 sender scope | - |
+| 28 | memory context 放 user + 放行全局条目 | `sqlite.rs` vector_search/recall post-filter 改成 `session_id=? OR session_id IS NULL`，让 memory_store 全局条目进入 channel 自动注入；同时把 `[Memory context]` 从 system prompt 末尾挪到最新 user 消息前缀，避免 memory 变化破坏 system+history 的 prompt cache prefix。持久化历史保持纯净（memory 只在 per-request clone 里） | - |
 
 ## 运维参考
 
