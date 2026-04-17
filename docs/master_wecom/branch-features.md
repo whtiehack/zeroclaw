@@ -50,6 +50,7 @@
 | 27 | memory recall session_id 对齐 | `is_group_chat` 补 `"group--"` 前缀（wecom_ws 群聊），recall session 从 `msg.sender` 改为 `history_key`（与 autosave 一致），删除死路的 sender scope | - |
 | 28 | memory context 放 user + 放行全局条目 | `sqlite.rs` vector_search/recall post-filter 改成 `session_id=? OR session_id IS NULL`，让 memory_store 全局条目进入 channel 自动注入；同时把 `[Memory context]` 从 system prompt 末尾挪到最新 user 消息前缀，避免 memory 变化破坏 system+history 的 prompt cache prefix。持久化历史保持纯净（memory 只在 per-request clone 里） | - |
 | 29 | SSE 流 reasoning/content 分离 | `sse_bytes_to_events` 原先用 `extract_sse_text_delta` 把 `reasoning_content` 回落到 content 字段包装成 `StreamChunk::delta`，导致 `chunk.reasoning` 永远 None，feat 26 的过渡 Clear 永不触发。改为显式分发：content → `delta`，reasoning_content → `reasoning`，与 `parse_sse_line` 对齐。非流式 `effective_content` fallback 不变 | - |
+| 30 | autosave embedding 用 stripped 文本 | `SqliteMemory::store` 对 content 先 strip wecom 前缀 (`[sender_userid=...]` / `[timestamp]` / `[WECOM_QUOTE]`) 再算 embedding，与 channel 层 recall_query 的 strip 对齐。**stored content 保持原文**（LLM 看记忆仍有 sender/time 上下文）。效果：embedding_cache 命中，每轮省一次上游 embedding API；向量不再被 timestamp 噪声污染 | - |
 
 ## 运维参考
 
