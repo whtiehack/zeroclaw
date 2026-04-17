@@ -899,21 +899,6 @@ fn parse_proxy_tool_event(line: &str) -> Option<StreamEvent> {
     None
 }
 
-fn extract_sse_text_delta(choice: &StreamChoice) -> Option<String> {
-    if let Some(content) = &choice.delta.content {
-        if !content.is_empty() {
-            return Some(content.clone());
-        }
-    }
-
-    choice
-        .delta
-        .reasoning_content
-        .as_ref()
-        .filter(|value| !value.is_empty())
-        .cloned()
-}
-
 /// Parse SSE (Server-Sent Events) stream from OpenAI-compatible providers.
 /// Handles the `data: {...}` format and `[DONE]` sentinel.
 ///
@@ -1106,17 +1091,39 @@ fn sse_bytes_to_events(
 
                         let mut should_emit_tool_calls = false;
                         for choice in &chunk.choices {
-                            if let Some(text_delta) = extract_sse_text_delta(choice) {
-                                let mut text_chunk = StreamChunk::delta(text_delta);
-                                if count_tokens {
-                                    text_chunk = text_chunk.with_token_estimate();
+                            // Preserve the content/reasoning distinction — do NOT
+                            // merge reasoning_content into delta. Downstream (agent
+                            // loop + channel draft) relies on `chunk.reasoning`
+                            // vs `chunk.delta` to separate thinking from the
+                            // final answer.
+                            if let Some(content) = choice.delta.content.as_deref() {
+                                if !content.is_empty() {
+                                    let mut text_chunk = StreamChunk::delta(content);
+                                    if count_tokens {
+                                        text_chunk = text_chunk.with_token_estimate();
+                                    }
+                                    if tx
+                                        .send(Ok(StreamEvent::TextDelta(text_chunk)))
+                                        .await
+                                        .is_err()
+                                    {
+                                        return;
+                                    }
                                 }
-                                if tx
-                                    .send(Ok(StreamEvent::TextDelta(text_chunk)))
-                                    .await
-                                    .is_err()
-                                {
-                                    return;
+                            }
+                            if let Some(reasoning) = choice.delta.reasoning_content.as_deref() {
+                                if !reasoning.is_empty() {
+                                    let mut text_chunk = StreamChunk::reasoning(reasoning);
+                                    if count_tokens {
+                                        text_chunk = text_chunk.with_token_estimate();
+                                    }
+                                    if tx
+                                        .send(Ok(StreamEvent::TextDelta(text_chunk)))
+                                        .await
+                                        .is_err()
+                                    {
+                                        return;
+                                    }
                                 }
                             }
 
