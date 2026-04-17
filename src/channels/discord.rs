@@ -1151,10 +1151,18 @@ impl Channel for DiscordChannel {
                         is_group_message && self.is_group_sender_trigger_enabled(author_id);
                     let require_mention =
                         self.mention_only && is_group_message && !allow_sender_without_mention;
-                    let Some(clean_content) =
-                        normalize_incoming_content(content, require_mention, &bot_user_id)
-                    else {
-                        continue;
+                    let has_attachments = d
+                        .get("attachments")
+                        .and_then(|a| a.as_array())
+                        .map_or(false, |a| !a.is_empty());
+                    let clean_content = match normalize_incoming_content(
+                        content,
+                        require_mention,
+                        &bot_user_id,
+                    ) {
+                        Some(c) => c,
+                        None if has_attachments && !require_mention => String::new(),
+                        None => continue,
                     };
 
                     let attachment_text = {
