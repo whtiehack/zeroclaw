@@ -2014,6 +2014,7 @@ async fn consume_provider_streaming_response(
     let mut delta_sender = on_delta;
     let mut suppress_forwarding = false;
     let mut marker_window = String::new();
+    let mut reasoning_streamed = false;
 
     loop {
         let next_chunk = if let Some(token) = cancellation_token {
@@ -2041,6 +2042,7 @@ async fn consume_provider_streaming_response(
                     }
                     outcome.forwarded_live_deltas = false;
                 }
+                reasoning_streamed = false;
             }
             StreamEvent::PreExecutedToolCall { .. } | StreamEvent::PreExecutedToolResult { .. } => {
                 // Pre-executed tool events are for observability only.
@@ -2064,6 +2066,8 @@ async fn consume_provider_streaming_response(
                                 .is_err()
                             {
                                 delta_sender = None;
+                            } else {
+                                reasoning_streamed = true;
                             }
                         }
                     }
@@ -2103,6 +2107,13 @@ async fn consume_provider_streaming_response(
                 if suppress_forwarding {
                     continue;
                 }
+
+                // Reasoning → content transition: force a Clear so the draft
+                // shows only the final answer, not reasoning+answer concatenated.
+                if reasoning_streamed && outcome.forwarded_live_deltas {
+                    outcome.forwarded_live_deltas = false;
+                }
+                reasoning_streamed = false;
 
                 if let Some(tx) = delta_sender {
                     if !outcome.forwarded_live_deltas {
