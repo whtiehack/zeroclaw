@@ -571,9 +571,15 @@ impl Memory for SqliteMemory {
         category: MemoryCategory,
         session_id: Option<&str>,
     ) -> anyhow::Result<()> {
-        // Compute embedding (async, before blocking work)
+        // Strip wecom_ws autosave prefixes (sender_userid/timestamp/quote block)
+        // before embedding — mirrors the strip applied to channel-layer recall
+        // queries so both hash to the same cache key (embedding_cache hit +
+        // consistent vector for the same semantic content).
+        // The stored `content` column is NOT modified — LLM-facing display in
+        // Memory context still shows sender/time prefixes.
+        let text_for_embedding = strip_autosave_prefixes_for_embedding(content);
         let embedding_bytes = self
-            .get_or_compute_embedding(content)
+            .get_or_compute_embedding(text_for_embedding)
             .await?
             .map(|emb| vector::vec_to_bytes(&emb));
 
@@ -1145,6 +1151,46 @@ impl Memory for SqliteMemory {
         })
         .await?
     }
+}
+
+// ── wecom_ws prefix strip (embedding-only) ─────────────────────────────
+//
+// Mirrors `strip_wecom_ws_autosave_prefixes` in `src/channels/mod.rs`.
+// Must stay algorithmically identical so autosave and recall queries
+// produce the same embedding_cache hash for semantically equivalent text.
+
+fn strip_autosave_prefixes_for_embedding(content: &str) -> &str {
+    let mut remaining = content.trim_start();
+
+    if remaining.starts_with("[sender_userid=") {
+        remaining = strip_leading_bracket_line(remaining).unwrap_or(remaining);
+        remaining = remaining.trim_start();
+    }
+
+    if remaining.starts_with('[') && !remaining.starts_with("[WECOM_QUOTE]") {
+        remaining = strip_leading_bracket_line(remaining).unwrap_or(remaining);
+        remaining = remaining.trim_start();
+    }
+
+    if remaining.starts_with("[WECOM_QUOTE]") {
+        remaining = strip_wecom_quote_block(remaining).unwrap_or(remaining);
+        remaining = remaining.trim_start();
+    }
+
+    remaining
+}
+
+fn strip_leading_bracket_line(content: &str) -> Option<&str> {
+    let line_end = content.find('\n').unwrap_or(content.len());
+    let line = &content[..line_end];
+    let end_idx = line.find(']')?;
+    Some(&content[end_idx + 1..])
+}
+
+fn strip_wecom_quote_block(content: &str) -> Option<&str> {
+    let rest = content.strip_prefix("[WECOM_QUOTE]")?;
+    let end_idx = rest.find("[/WECOM_QUOTE]")?;
+    Some(&rest[end_idx + "[/WECOM_QUOTE]".len()..])
 }
 
 #[cfg(test)]
