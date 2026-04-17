@@ -1,6 +1,6 @@
 # `master_wecom` 功能清单
 
-更新时间：`2026-04-17`
+更新时间：`2026-04-17`（2nd）
 
 维护规则：
 
@@ -47,6 +47,7 @@
 | 24 | history image truncation | 历史轮 user 消息 `[IMAGE:]` 替换为文本占位，仅当前轮发真实图片，节省 token。**仅处理 user 角色**，tool/assistant 的 JSON content 不动（避免破坏 tool_call_id） | - |
 | 25 | channel context compression | `prior_turns` token 达 `max_context_tokens` 90% 时，LLM 摘要压缩旧消息，更新内存+磁盘 JSONL，timeout 300s | - |
 | 26 | reasoning 流式转发 + 切换清屏 | provider 的 `reasoning_content` 流式推到草稿显示，不进 `response_text`；reasoning → 正文过渡时自动翻转 `forwarded_live_deltas` 触发 Clear，避免 draft 出现"思考+正文"拼接 | - |
+| 27 | memory recall session_id 对齐 | `is_group_chat` 补 `"group--"` 前缀（wecom_ws 群聊），recall session 从 `msg.sender` 改为 `history_key`（与 autosave 一致），删除死路的 sender scope | - |
 
 ## 运维参考
 
