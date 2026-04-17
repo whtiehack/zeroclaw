@@ -135,12 +135,14 @@ pub async fn prepare_messages_for_provider_with_provider_hint(
     let max_bytes = max_image_size_mb.saturating_mul(1024 * 1024);
 
     let found_images = count_image_markers(messages);
-    if found_images > max_images {
-        return Err(MultimodalError::TooManyImages {
+    let mut to_skip = found_images.saturating_sub(max_images);
+    if to_skip > 0 {
+        tracing::warn!(
+            found = found_images,
             max_images,
-            found: found_images,
-        }
-        .into());
+            dropping = to_skip,
+            "multimodal: too many images, keeping most recent {max_images}"
+        );
     }
 
     if found_images == 0 {
@@ -165,6 +167,14 @@ pub async fn prepare_messages_for_provider_with_provider_hint(
 
         let mut normalized_refs = Vec::with_capacity(refs.len());
         for reference in &refs {
+            if to_skip > 0 {
+                to_skip -= 1;
+                tracing::debug!(
+                    reference = %reference,
+                    "multimodal: dropping older image beyond budget"
+                );
+                continue;
+            }
             match normalize_image_reference(reference, config, max_bytes, provider_hint).await {
                 Ok(data_uri) => {
                     normalized_refs.push(data_uri);
@@ -712,10 +722,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn prepare_messages_rejects_too_many_images() {
-        let messages = vec![ChatMessage::user(
-            "[IMAGE:/tmp/1.png]\n[IMAGE:/tmp/2.png]".to_string(),
-        )];
+    async fn prepare_messages_truncates_excess_images_to_most_recent() {
+        let temp = tempfile::tempdir().unwrap();
+        let png_bytes = [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n'];
+        let older = temp.path().join("older.png");
+        let newer = temp.path().join("newer.png");
+        std::fs::write(&older, png_bytes).unwrap();
+        std::fs::write(&newer, png_bytes).unwrap();
+
+        let messages = vec![ChatMessage::user(format!(
+            "[IMAGE:{}]\n[IMAGE:{}]",
+            older.display(),
+            newer.display()
+        ))];
 
         let config = MultimodalConfig {
             max_images: 1,
@@ -723,13 +742,14 @@ mod tests {
             allow_remote_fetch: false,
         };
 
-        let error = prepare_messages_for_provider(&messages, &config)
+        let prepared = prepare_messages_for_provider(&messages, &config)
             .await
-            .expect_err("should reject image count overflow");
+            .expect("truncation should succeed");
 
-        assert!(error
-            .to_string()
-            .contains("multimodal image limit exceeded"));
+        assert!(prepared.contains_images);
+        let (_, refs) = parse_image_markers(&prepared.messages[0].content);
+        assert_eq!(refs.len(), 1, "only most recent image is kept");
+        assert!(refs[0].starts_with("data:image/png;base64,"));
     }
 
     #[tokio::test]
