@@ -4327,12 +4327,14 @@ async fn process_channel_message_enriches_current_turn_without_persisting_contex
         .unwrap_or_else(|e| e.into_inner());
     assert_eq!(calls.len(), 1);
     assert_eq!(calls[0].len(), 2);
-    // Memory context is injected into the system prompt, not the user message.
+    // Memory context is prepended to the user message (not the system prompt)
+    // to keep the system prefix stable for prompt caching.
     assert_eq!(calls[0][0].0, "system");
-    assert!(calls[0][0].1.contains("[Memory context]"));
-    assert!(calls[0][0].1.contains("Age is 45"));
+    assert!(!calls[0][0].1.contains("[Memory context]"));
     assert_eq!(calls[0][1].0, "user");
-    assert_eq!(calls[0][1].1, "hello");
+    assert!(calls[0][1].1.contains("[Memory context]"));
+    assert!(calls[0][1].1.contains("Age is 45"));
+    assert!(calls[0][1].1.ends_with("hello"));
 
     let histories = runtime_ctx
         .conversation_histories

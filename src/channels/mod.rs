@@ -3095,18 +3095,25 @@ Output concise bullet points. Be thorough but brief.";
         "⏱ Memory recall completed"
     );
 
-    // Use refreshed system prompt for new sessions (master's /new support),
-    // and inject memory into system prompt (not user message) so it
-    // doesn't pollute session history and is re-fetched each turn.
+    // Use refreshed system prompt for new sessions (master's /new support).
+    // Memory context is prepended to the LAST user message (not appended to
+    // system prompt) so the system prefix stays stable across turns and
+    // provider prompt cache can retain the long static prefix + prior history.
+    // The stored conversation history remains clean (memory lives only in the
+    // per-request ChatMessage clones), so it's re-fetched each turn.
     let base_system_prompt = if had_prior_history {
         ctx.system_prompt.as_str().to_string()
     } else {
         refreshed_new_session_system_prompt(ctx.as_ref())
     };
-    let mut system_prompt =
+    let system_prompt =
         build_channel_system_prompt(&base_system_prompt, &msg.channel, &msg.reply_target);
     if !memory_context.is_empty() {
-        let _ = write!(system_prompt, "\n\n{memory_context}");
+        if let Some(last) = prior_turns.last_mut() {
+            if last.role == "user" {
+                last.content = format!("{memory_context}{}", last.content);
+            }
+        }
     }
     let mut history = vec![ChatMessage::system(system_prompt)];
     history.extend(prior_turns);

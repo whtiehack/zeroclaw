@@ -402,7 +402,10 @@ impl SqliteMemory {
             idx += 1;
         }
         if let Some(sid) = session_id {
-            let _ = write!(sql, " AND session_id = ?{idx}");
+            // Match session-scoped entries AND globally-scoped entries (NULL session_id).
+            // Global entries come from memory_store tool (session-agnostic facts) and
+            // should surface in any session's recall.
+            let _ = write!(sql, " AND (session_id = ?{idx} OR session_id IS NULL)");
             param_values.push(Box::new(sid.to_string()));
         }
 
@@ -749,8 +752,12 @@ impl Memory for SqliteMemory {
                             superseded_by: sup,
                         };
                         if let Some(filter_sid) = session_ref {
-                            if entry.session_id.as_deref() != Some(filter_sid) {
-                                continue;
+                            // Accept entries that match the session OR are globally
+                            // scoped (NULL session_id). Drop only entries that belong
+                            // to a different session.
+                            match entry.session_id.as_deref() {
+                                Some(s) if s != filter_sid => continue,
+                                _ => {}
                             }
                         }
                         results.push(entry);
@@ -824,8 +831,10 @@ impl Memory for SqliteMemory {
                     for row in rows {
                         let entry = row?;
                         if let Some(sid) = session_ref {
-                            if entry.session_id.as_deref() != Some(sid) {
-                                continue;
+                            // Accept session match AND global (NULL) entries.
+                            match entry.session_id.as_deref() {
+                                Some(s) if s != sid => continue,
+                                _ => {}
                             }
                         }
                         results.push(entry);
