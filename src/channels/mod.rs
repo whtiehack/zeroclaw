@@ -3058,12 +3058,13 @@ Output concise bullet points. Be thorough but brief.";
         );
     }
 
-    // ── Dual-scope memory recall ──────────────────────────────────
+    // ── Memory recall ──────────────────────────────────────────
     // Always recall before each LLM call (not just first turn).
-    // For group chats: merge sender-scope + group-scope memories.
-    // For DMs: sender-scope only.
-    let is_group_chat =
-        msg.reply_target.contains("@g.us") || msg.reply_target.starts_with("group:");
+    // Recall is scoped to `history_key` — the same session_id the
+    // autosave path writes with, so both DM and group match stored entries.
+    let is_group_chat = msg.reply_target.starts_with("group--")
+        || msg.reply_target.contains("@g.us")
+        || msg.reply_target.starts_with("group:");
 
     // Strip wecom_ws sender/timestamp/quote prefixes from the recall query so
     // bge-m3 sees only the semantic body. This (a) lets `embedding_cache` hit
@@ -3078,41 +3079,21 @@ Output concise bullet points. Be thorough but brief.";
     };
 
     let mem_recall_start = Instant::now();
-    let sender_memory_fut = build_memory_context(
+    let memory_context = build_memory_context(
         ctx.memory.as_ref(),
         recall_query,
         ctx.min_relevance_score,
-        Some(&msg.sender),
-    );
-
-    let (sender_memory, group_memory) = if is_group_chat {
-        let group_memory_fut = build_memory_context(
-            ctx.memory.as_ref(),
-            recall_query,
-            ctx.min_relevance_score,
-            Some(&history_key),
-        );
-        tokio::join!(sender_memory_fut, group_memory_fut)
-    } else {
-        (sender_memory_fut.await, String::new())
-    };
+        Some(&history_key),
+    )
+    .await;
     #[allow(clippy::cast_possible_truncation)]
     let mem_recall_ms = mem_recall_start.elapsed().as_millis() as u64;
     tracing::info!(
         mem_recall_ms,
-        sender_empty = sender_memory.is_empty(),
-        group_empty = group_memory.is_empty(),
+        is_group_chat,
+        empty = memory_context.is_empty(),
         "⏱ Memory recall completed"
     );
-
-    // Merge sender + group memories, avoiding duplicates
-    let memory_context = if group_memory.is_empty() {
-        sender_memory
-    } else if sender_memory.is_empty() {
-        group_memory
-    } else {
-        format!("{sender_memory}\n{group_memory}")
-    };
 
     // Use refreshed system prompt for new sessions (master's /new support),
     // and inject memory into system prompt (not user message) so it
