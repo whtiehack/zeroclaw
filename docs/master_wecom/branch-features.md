@@ -1,6 +1,6 @@
 # `master_wecom` 功能清单
 
-更新时间：`2026-04-15`
+更新时间：`2026-04-17`
 
 维护规则：
 
@@ -46,6 +46,7 @@
 | 23 | stale local image history 自愈 | 历史中的失效本地 `[IMAGE:]` marker 自动剥离，当前坏图失败回滚，避免后续文本继续报错 | [详细文档](./stale-local-image-history-self-heal-2026-03-30.md) |
 | 24 | history image truncation | 历史轮 user 消息 `[IMAGE:]` 替换为文本占位，仅当前轮发真实图片，节省 token。**仅处理 user 角色**，tool/assistant 的 JSON content 不动（避免破坏 tool_call_id） | - |
 | 25 | channel context compression | `prior_turns` token 达 `max_context_tokens` 90% 时，LLM 摘要压缩旧消息，更新内存+磁盘 JSONL，timeout 300s | - |
+| 26 | reasoning 流式转发 + 切换清屏 | provider 的 `reasoning_content` 流式推到草稿显示，不进 `response_text`；reasoning → 正文过渡时自动翻转 `forwarded_live_deltas` 触发 Clear，避免 draft 出现"思考+正文"拼接 | - |
 
 ## 运维参考
 
