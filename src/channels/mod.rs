@@ -3066,17 +3066,20 @@ Output concise bullet points. Be thorough but brief.";
         || msg.reply_target.contains("@g.us")
         || msg.reply_target.starts_with("group:");
 
-    // Strip wecom_ws sender/timestamp/quote prefixes from the recall query so
-    // bge-m3 sees only the semantic body. This (a) lets `embedding_cache` hit
-    // when the same question recurs (timestamp would otherwise make every
-    // query unique), and (b) aligns the query vector with stored entries,
-    // which are LLM-rewritten clean text. `msg.content` itself is untouched —
-    // history, autosave, and prompts still see the full prefixed content.
-    let recall_query: &str = if msg.channel == "wecom_ws" {
-        strip_wecom_ws_autosave_prefixes(&msg.content)
+    // Strip wecom_ws sender/timestamp/quote prefixes + leading/trailing @mentions
+    // from the recall query so bge-m3 sees only the semantic body. Removing the
+    // @bot mention prevents every @-mentioned entry from getting an artificial
+    // common-token boost in cosine similarity. `msg.content` itself is untouched.
+    let wecom_ws_query_owned = if msg.channel == "wecom_ws" {
+        Some(wecom_ws::strip_edge_mentions(
+            strip_wecom_ws_autosave_prefixes(&msg.content),
+        ))
     } else {
-        &msg.content
+        None
     };
+    let recall_query: &str = wecom_ws_query_owned
+        .as_deref()
+        .unwrap_or(msg.content.as_str());
 
     let mem_recall_start = Instant::now();
     let memory_context = build_memory_context(

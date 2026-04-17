@@ -2983,7 +2983,7 @@ fn extract_runtime_routing_command(text: &str) -> Option<String> {
     }
 }
 
-fn strip_edge_mentions(text: &str) -> String {
+pub(crate) fn strip_edge_mentions(text: &str) -> String {
     let s = text.trim();
     if s.is_empty() {
         return String::new();
