@@ -71,7 +71,8 @@
 | [branch-features.md](./branch-features.md) | 功能清单（新增功能时先登记，链接到详细文档） |
 | [TEMPLATE-master-sync.md](./TEMPLATE-master-sync.md) | 合并记录模板 |
 | [upstream-review-rules.md](./upstream-review-rules.md) | 上游更新分析规则，固定 trait / 框架 / channel / `wecom_ws` 影响四类关注点 |
-| [upstream-master-absorption-review-2026-04-13.md](./upstream-master-absorption-review-2026-04-13.md) | 本轮上游修复吸收评审，含共同祖先、忽略回滚区间、推荐 commit、隐藏依赖与 `wecom_ws` 回归清单 |
+| [upstream-master-absorption-review-2026-04-13.md](./upstream-master-absorption-review-2026-04-13.md) | 2026-04-13 吸收评审，已全部落地 |
+| [upstream-master-absorption-review-2026-04-18.md](./upstream-master-absorption-review-2026-04-18.md) | 2026-04-18 吸收评审（4b3046e..HEAD 43 条），6 代码 commit 落地 + 1 lockfile 待 wecom 服务器执行 |
 | [test-link-opt-level-2026-03-30.md](./test-link-opt-level-2026-03-30.md) | macOS x86_64 测试链接排障记录，确认 test profile 固定 `opt-level = 0` |
 
 ### 历史参考
