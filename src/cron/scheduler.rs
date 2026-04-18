@@ -260,36 +260,41 @@ async fn run_agent_job(
     let name = job.name.clone().unwrap_or_else(|| "cron-job".to_string());
     let prompt = job.prompt.clone().unwrap_or_default();
 
-    // Recall relevant memories so cron jobs have context awareness.
-    // Exclude `Conversation` memories to prevent chat context from
-    // leaking into scheduled executions (see #5415).
-    let memory_context = match crate::memory::create_memory(
-        &config.memory,
-        &config.workspace_dir,
-        config.api_key.as_deref(),
-    ) {
-        Ok(mem) => match mem.recall(&prompt, 5, None, None, None).await {
-            Ok(entries) if !entries.is_empty() => {
-                let ctx: String = entries
-                    .iter()
-                    .filter(|e| {
-                        !matches!(
-                            e.category,
-                            crate::memory::traits::MemoryCategory::Conversation
-                        )
-                    })
-                    .map(|e| format!("- {}: {}", e.key, e.content))
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                if ctx.is_empty() {
-                    String::new()
-                } else {
-                    format!("[Memory context]\n{ctx}\n\n")
+    // Recall memory before cron agent jobs only when explicitly enabled
+    // (`[cron] auto_recall_memory = true`). Cron payloads are templated task
+    // instructions, not user queries; default recall tends to inject unrelated
+    // context. Agent can still call `memory_recall` tool when it needs to.
+    let memory_context = if config.cron.auto_recall_memory {
+        match crate::memory::create_memory(
+            &config.memory,
+            &config.workspace_dir,
+            config.api_key.as_deref(),
+        ) {
+            Ok(mem) => match mem.recall(&prompt, 5, None, None, None).await {
+                Ok(entries) if !entries.is_empty() => {
+                    let ctx: String = entries
+                        .iter()
+                        .filter(|e| {
+                            !matches!(
+                                e.category,
+                                crate::memory::traits::MemoryCategory::Conversation
+                            )
+                        })
+                        .map(|e| format!("- {}: {}", e.key, e.content))
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    if ctx.is_empty() {
+                        String::new()
+                    } else {
+                        format!("[Memory context]\n{ctx}\n\n")
+                    }
                 }
-            }
-            _ => String::new(),
-        },
-        Err(_) => String::new(),
+                _ => String::new(),
+            },
+            Err(_) => String::new(),
+        }
+    } else {
+        String::new()
     };
 
     let prefixed_prompt = format!("{memory_context}[cron:{} {name}] {prompt}", job.id);

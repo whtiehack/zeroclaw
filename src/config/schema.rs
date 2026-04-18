@@ -4872,6 +4872,12 @@ pub struct MemoryConfig {
     /// context from bleeding into conversations. Default: 0.4
     #[serde(default = "default_min_relevance_score")]
     pub min_relevance_score: f64,
+    /// Minimum query length (in `chars().count()`, i.e. Unicode scalar values)
+    /// below which channel auto-recall is skipped entirely. Very short queries
+    /// (e.g. "1", "ok") produce low-quality bge-m3 embeddings that score
+    /// spuriously high against short generic memories. Default: 8
+    #[serde(default = "default_min_query_chars")]
+    pub min_query_chars: usize,
     /// Max embedding cache entries before LRU eviction
     #[serde(default = "default_cache_size")]
     pub embedding_cache_size: usize,
@@ -5020,6 +5026,9 @@ fn default_keyword_weight() -> f64 {
 fn default_min_relevance_score() -> f64 {
     0.4
 }
+fn default_min_query_chars() -> usize {
+    8
+}
 fn default_cache_size() -> usize {
     10_000
 }
@@ -5053,6 +5062,7 @@ impl Default for MemoryConfig {
             keyword_weight: default_keyword_weight(),
             search_mode: SearchMode::default(),
             min_relevance_score: default_min_relevance_score(),
+            min_query_chars: default_min_query_chars(),
             embedding_cache_size: default_cache_size(),
             chunk_max_tokens: default_chunk_size(),
             response_cache_enabled: false,
@@ -5811,6 +5821,14 @@ pub struct CronConfig {
     /// Maximum number of historical cron run records to retain. Default: `50`.
     #[serde(default = "default_max_run_history")]
     pub max_run_history: u32,
+    /// Automatically recall memory before running cron agent jobs. Default: `false`.
+    ///
+    /// Cron payloads are typically templated/deterministic task instructions,
+    /// not conversational queries. Auto-recall tends to inject unrelated
+    /// context. When disabled, agent jobs can still call `memory_recall`
+    /// explicitly if they need to look something up.
+    #[serde(default)]
+    pub auto_recall_memory: bool,
     /// Declarative cron job definitions (`[[cron.jobs]]`).
     ///
     /// Jobs declared here are synced into the database at scheduler startup.
@@ -5909,6 +5927,7 @@ impl Default for CronConfig {
             enabled: true,
             catch_up_on_startup: true,
             max_run_history: default_max_run_history(),
+            auto_recall_memory: false,
             jobs: Vec::new(),
         }
     }

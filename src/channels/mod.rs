@@ -453,6 +453,7 @@ struct ChannelRuntimeContext {
     auto_save_memory: bool,
     max_tool_iterations: usize,
     min_relevance_score: f64,
+    min_query_chars: usize,
     conversation_histories: ConversationHistoryMap,
     pending_new_sessions: PendingNewSessionSet,
     provider_cache: ProviderCacheMap,
@@ -3081,19 +3082,28 @@ Output concise bullet points. Be thorough but brief.";
         .as_deref()
         .unwrap_or(msg.content.as_str());
 
+    // Skip auto-recall for very short queries. bge-m3 on inputs like "1" / "ok"
+    // produces low-quality vectors that spuriously match short generic memories.
     let mem_recall_start = Instant::now();
-    let memory_context = build_memory_context(
-        ctx.memory.as_ref(),
-        recall_query,
-        ctx.min_relevance_score,
-        Some(&history_key),
-    )
-    .await;
+    let query_chars = recall_query.chars().count();
+    let memory_context = if query_chars < ctx.min_query_chars {
+        String::new()
+    } else {
+        build_memory_context(
+            ctx.memory.as_ref(),
+            recall_query,
+            ctx.min_relevance_score,
+            Some(&history_key),
+        )
+        .await
+    };
     #[allow(clippy::cast_possible_truncation)]
     let mem_recall_ms = mem_recall_start.elapsed().as_millis() as u64;
     tracing::info!(
         mem_recall_ms,
         is_group_chat,
+        query_chars,
+        skipped_short_query = query_chars < ctx.min_query_chars,
         empty = memory_context.is_empty(),
         "⏱ Memory recall completed"
     );
@@ -5832,6 +5842,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
         auto_save_memory: config.memory.auto_save,
         max_tool_iterations: config.agent.max_tool_iterations,
         min_relevance_score: config.memory.min_relevance_score,
+        min_query_chars: config.memory.min_query_chars,
         conversation_histories: Arc::new(Mutex::new(HashMap::new())),
         pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
         provider_cache: Arc::new(Mutex::new(provider_cache_seed)),
