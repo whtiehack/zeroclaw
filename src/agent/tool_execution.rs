@@ -106,18 +106,23 @@ pub(crate) async fn execute_one_tool(
                 success: r.success,
             });
             if r.success {
+                let normalized_output = if r.output.is_empty() {
+                    "(no output)"
+                } else {
+                    &r.output
+                };
                 tracing::info!(
                     target: "zeroclaw::agent::tool_execution",
                     tool = %call_name,
                     duration_ms = duration.as_millis(),
                     output = %truncate_with_ellipsis(
-                        &r.output,
+                        normalized_output,
                         TOOL_SUCCESS_LOG_OUTPUT_MAX_CHARS
                     ),
                     "tool call succeeded"
                 );
                 Ok(ToolExecutionOutcome {
-                    output: scrub_credentials(&r.output),
+                    output: scrub_credentials(normalized_output),
                     success: true,
                     error_reason: None,
                     duration,
