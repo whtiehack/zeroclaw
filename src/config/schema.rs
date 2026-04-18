@@ -5018,9 +5018,16 @@ pub struct DiscordConfig {
     /// Other messages in the guild are silently ignored.
     #[serde(default)]
     pub mention_only: bool,
+    /// When false, direct messages (DMs) are rejected; guild messages unaffected.
+    #[serde(default = "default_discord_allow_dm")]
+    pub allow_dm: bool,
     /// Group-chat trigger controls.
     #[serde(default)]
     pub group_reply: Option<GroupReplyConfig>,
+}
+
+fn default_discord_allow_dm() -> bool {
+    true
 }
 
 impl ChannelConfig for DiscordConfig {
@@ -11325,6 +11332,7 @@ denied_tools = ["shell"]
             allowed_users: vec![],
             listen_to_bots: false,
             mention_only: false,
+            allow_dm: true,
             group_reply: None,
         };
         let json = serde_json::to_string(&dc).unwrap();
@@ -11341,6 +11349,7 @@ denied_tools = ["shell"]
             allowed_users: vec![],
             listen_to_bots: false,
             mention_only: false,
+            allow_dm: true,
             group_reply: None,
         };
         let json = serde_json::to_string(&dc).unwrap();

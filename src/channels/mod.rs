@@ -5399,6 +5399,7 @@ fn collect_configured_channels(
                     dc.listen_to_bots,
                     dc.effective_group_reply_mode().requires_mention(),
                 )
+                .with_allow_dm(dc.allow_dm)
                 .with_group_reply_allowed_senders(dc.group_reply_allowed_sender_ids())
                 .with_ack_reaction(config.channels_config.ack_reaction.discord.clone())
                 .with_transcription(config.transcription.clone())

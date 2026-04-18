@@ -4812,6 +4812,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     allowed_users,
                     listen_to_bots: false,
                     mention_only: false,
+                    allow_dm: true,
                     group_reply: None,
                 });
             }

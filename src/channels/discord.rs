@@ -24,6 +24,8 @@ pub struct DiscordChannel {
     allowed_users: Vec<String>,
     listen_to_bots: bool,
     mention_only: bool,
+    /// When false, DMs are rejected; guild messages unaffected.
+    allow_dm: bool,
     group_reply_allowed_sender_ids: Vec<String>,
     ack_reaction: Option<AckReactionConfig>,
     transcription: Option<TranscriptionConfig>,
@@ -45,12 +47,19 @@ impl DiscordChannel {
             allowed_users,
             listen_to_bots,
             mention_only,
+            allow_dm: true,
             group_reply_allowed_sender_ids: Vec::new(),
             ack_reaction: None,
             transcription: None,
             workspace_dir: None,
             typing_handles: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Reject DMs when set to false. Guild messages unaffected.
+    pub fn with_allow_dm(mut self, allow_dm: bool) -> Self {
+        self.allow_dm = allow_dm;
+        self
     }
 
     /// Configure sender IDs that bypass mention gating in guild channels.
@@ -1143,6 +1152,11 @@ impl Channel for DiscordChannel {
                                 continue;
                             }
                         }
+                    }
+
+                    if !self.allow_dm && d.get("guild_id").is_none() {
+                        tracing::info!("Discord: ignoring DM (allow_dm = false)");
+                        continue;
                     }
 
                     let content = d.get("content").and_then(|c| c.as_str()).unwrap_or("");

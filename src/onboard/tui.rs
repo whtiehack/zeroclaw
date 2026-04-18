@@ -2295,6 +2295,7 @@ fn apply_channel_overrides(config: &mut Config, plan: &TuiOnboardPlan) {
             allowed_users: parse_csv_list(&plan.discord_allowed_users),
             listen_to_bots: false,
             mention_only: false,
+            allow_dm: true,
             group_reply: None,
         });
     }

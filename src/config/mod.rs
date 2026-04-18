@@ -69,6 +69,7 @@ mod tests {
             allowed_users: vec![],
             listen_to_bots: false,
             mention_only: false,
+            allow_dm: true,
             group_reply: None,
         };
 
