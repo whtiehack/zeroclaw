@@ -2252,6 +2252,9 @@ fn extract_tool_context_summary(history: &[ChatMessage], start_index: usize) -> 
 
 /// Strip `<think>...</think>` blocks from streaming draft text so reasoning
 /// tokens are never shown to the user in partial updates.
+///
+/// Preserves trailing `\n` — Progress events (e.g. `"⏳ tool\n"`) rely on it
+/// as a separator when stacked in draft channels like wecom_ws.
 fn strip_think_tags_inline(s: &str) -> String {
     let mut result = String::with_capacity(s.len());
     let mut rest = s;
@@ -2269,7 +2272,14 @@ fn strip_think_tags_inline(s: &str) -> String {
             break;
         }
     }
-    result.trim().to_string()
+    let trimmed_start = result.trim_start();
+    let had_trailing_newline = trimmed_start.ends_with('\n');
+    let core = trimmed_start.trim_end();
+    if had_trailing_newline {
+        format!("{core}\n")
+    } else {
+        core.to_string()
+    }
 }
 
 fn sanitize_channel_response(response: &str, tools: &[Box<dyn Tool>]) -> String {

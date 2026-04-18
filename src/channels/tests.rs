@@ -6492,6 +6492,16 @@ fn strip_think_tags_inline_strips_surrounding_whitespace() {
     );
 }
 
+#[test]
+fn strip_think_tags_inline_preserves_trailing_newline() {
+    assert_eq!(strip_think_tags_inline("\u{23f3} file_read\n"), "\u{23f3} file_read\n");
+    assert_eq!(
+        strip_think_tags_inline("<think>r</think>\u{2705} shell (2s)\n"),
+        "\u{2705} shell (2s)\n"
+    );
+    assert_eq!(strip_think_tags_inline("tail  \n"), "tail\n");
+}
+
 // ── Tests for #4827: tool context preservation ──────────────
 
 #[test]
