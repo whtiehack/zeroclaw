@@ -827,7 +827,7 @@ fn validate_heartbeat_channel_config(config: &Config, channel: &str) -> Result<(
 fn has_supervised_channels(config: &Config) -> bool {
     config
         .channels_config
-        .channels_except_webhook()
+        .channels()
         .iter()
         .any(|(_, ok)| *ok)
 }
