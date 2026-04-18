@@ -2,10 +2,11 @@ use super::traits::{Observer, ObserverEvent, ObserverMetric};
 use opentelemetry::metrics::{Counter, Gauge, Histogram};
 use opentelemetry::trace::{Span, SpanKind, Status, Tracer};
 use opentelemetry::{global, KeyValue};
-use opentelemetry_otlp::WithExportConfig;
+use opentelemetry_otlp::{WithExportConfig, WithHttpConfig};
 use opentelemetry_sdk::metrics::SdkMeterProvider;
 use opentelemetry_sdk::trace::SdkTracerProvider;
 use std::any::Any;
+use std::collections::HashMap;
 use std::time::SystemTime;
 
 /// OpenTelemetry-backed observer — exports traces and metrics via OTLP.
@@ -37,16 +38,24 @@ impl OtelObserver {
     ///
     /// Uses HTTP/protobuf transport (port 4318 by default).
     /// Falls back to `http://localhost:4318` if no endpoint is provided.
-    pub fn new(endpoint: Option<&str>, service_name: Option<&str>) -> Result<Self, String> {
+    pub fn new(
+        endpoint: Option<&str>,
+        service_name: Option<&str>,
+        headers: Option<HashMap<String, String>>,
+    ) -> Result<Self, String> {
         let base_endpoint = endpoint.unwrap_or("http://localhost:4318");
         let traces_endpoint = format!("{}/v1/traces", base_endpoint.trim_end_matches('/'));
         let metrics_endpoint = format!("{}/v1/metrics", base_endpoint.trim_end_matches('/'));
         let service_name = service_name.unwrap_or("zeroclaw");
 
         // ── Trace exporter ──────────────────────────────────────
-        let span_exporter = opentelemetry_otlp::SpanExporter::builder()
+        let mut span_builder = opentelemetry_otlp::SpanExporter::builder()
             .with_http()
-            .with_endpoint(&traces_endpoint)
+            .with_endpoint(&traces_endpoint);
+        if let Some(ref h) = headers {
+            span_builder = span_builder.with_headers(h.clone());
+        }
+        let span_exporter = span_builder
             .build()
             .map_err(|e| format!("Failed to create OTLP span exporter: {e}"))?;
 
@@ -62,9 +71,13 @@ impl OtelObserver {
         global::set_tracer_provider(tracer_provider.clone());
 
         // ── Metric exporter ─────────────────────────────────────
-        let metric_exporter = opentelemetry_otlp::MetricExporter::builder()
+        let mut metric_builder = opentelemetry_otlp::MetricExporter::builder()
             .with_http()
-            .with_endpoint(&metrics_endpoint)
+            .with_endpoint(&metrics_endpoint);
+        if let Some(ref h) = headers {
+            metric_builder = metric_builder.with_headers(h.clone());
+        }
+        let metric_exporter = metric_builder
             .build()
             .map_err(|e| format!("Failed to create OTLP metric exporter: {e}"))?;
 
