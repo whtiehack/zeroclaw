@@ -270,6 +270,7 @@ async fn cron_config_serde_roundtrip() {
         enabled: false,
         catch_up_on_startup: false,
         max_run_history: 100,
+        auto_recall_memory: false,
         jobs: Vec::new(),
     };
     let json = serde_json::to_string(&c).unwrap();
