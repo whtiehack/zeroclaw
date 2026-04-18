@@ -2067,7 +2067,11 @@ impl Provider for OpenAiCompatibleProvider {
                 ),
                 temperature,
                 reasoning_effort: self.reasoning_effort.clone(),
-                tool_stream: if options.enabled { Some(true) } else { None },
+                tool_stream: if options.enabled {
+                    self.tool_stream_for_tools(true)
+                } else {
+                    None
+                },
                 stream: Some(options.enabled),
                 tools: tools.clone(),
                 tool_choice: tools.as_ref().map(|_| "auto".to_string()),
@@ -2091,7 +2095,11 @@ impl Provider for OpenAiCompatibleProvider {
                 messages,
                 temperature,
                 reasoning_effort: self.reasoning_effort.clone(),
-                tool_stream: if options.enabled { Some(true) } else { None },
+                tool_stream: if options.enabled {
+                    self.tool_stream_for_tools(false)
+                } else {
+                    None
+                },
                 stream: Some(options.enabled),
                 tools: None,
                 tool_choice: None,

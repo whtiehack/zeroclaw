@@ -1040,6 +1040,13 @@ fn z_ai_host_enables_tool_stream_for_custom_profiles() {
 }
 
 #[test]
+fn non_zai_provider_omits_tool_stream_regardless_of_streaming() {
+    let provider = make_provider("custom", "https://proxy.example.com/v1", None);
+    assert_eq!(provider.tool_stream_for_tools(true), None);
+    assert_eq!(provider.tool_stream_for_tools(false), None);
+}
+
+#[test]
 fn response_with_tool_calls_deserializes() {
     let json = r#"{
             "choices": [{
