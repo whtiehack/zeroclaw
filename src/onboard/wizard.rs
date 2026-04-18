@@ -419,6 +419,7 @@ fn memory_config_defaults_for_backend(backend: &str) -> MemoryConfig {
         keyword_weight: 0.3,
         search_mode: crate::config::SearchMode::default(),
         min_relevance_score: 0.4,
+        min_query_chars: 8,
         embedding_cache_size: if profile.uses_sqlite_hygiene {
             10000
         } else {
