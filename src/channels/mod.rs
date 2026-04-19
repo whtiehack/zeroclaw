@@ -503,6 +503,17 @@ fn persisted_channel_user_content(msg: &traits::ChannelMessage, content: &str) -
     content.to_string()
 }
 
+/// Strip the `[Attachments]` block (appended by discord.rs) before long-term
+/// autosave/embedding. Inlined attachment text is often a large file dump that
+/// bloats the embedding call and pollutes brain.db without useful recall value.
+fn strip_attachment_block(content: &str) -> String {
+    if let Some(pos) = content.find("\n\n[Attachments]\n") {
+        content[..pos].to_string()
+    } else {
+        content.to_string()
+    }
+}
+
 /// Strip tool-call XML tags from outgoing messages.
 ///
 /// LLM responses may contain `<function_calls>`, `<function_call>`,
@@ -3973,19 +3984,20 @@ If this input is legitimate, rephrase the request and avoid instruction-override
             return;
         }
     };
-    if runtime_defaults.auto_save_memory
-        && msg.content.chars().count() >= AUTOSAVE_MIN_MESSAGE_CHARS
-    {
-        let autosave_key = conversation_memory_key(&msg);
-        let _ = ctx
-            .memory
-            .store(
-                &autosave_key,
-                &msg.content,
-                crate::memory::MemoryCategory::Conversation,
-                Some(&history_key),
-            )
-            .await;
+    if runtime_defaults.auto_save_memory {
+        let content_for_autosave = strip_attachment_block(&msg.content);
+        if content_for_autosave.chars().count() >= AUTOSAVE_MIN_MESSAGE_CHARS {
+            let autosave_key = conversation_memory_key(&msg);
+            let _ = ctx
+                .memory
+                .store(
+                    &autosave_key,
+                    &content_for_autosave,
+                    crate::memory::MemoryCategory::Conversation,
+                    Some(&history_key),
+                )
+                .await;
+        }
     }
 
     println!("  ⏳ Processing message...");
