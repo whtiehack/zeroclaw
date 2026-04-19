@@ -261,7 +261,7 @@ async fn process_attachments(
                 continue;
             }
             if declared_size > MAX_TEXT_ATTACHMENT_BYTES {
-                if let Some(marker) = store_oversized_textlike(
+                if let Some(marker) = spill_attachment_to_workspace(
                     client, url, name, workspace_dir, message_id, declared_size,
                 )
                 .await
@@ -335,13 +335,22 @@ async fn process_attachments(
                 }
             }
         } else {
-            tracing::debug!(
-                name,
-                content_type = ct,
-                "discord: unsupported attachment type, emitting hint"
-            );
-            let ct_label = if ct.is_empty() { "unknown" } else { ct };
-            parts.push(format!("[File:{name} (type {ct_label}, unsupported)]"));
+            let declared_size = att.get("size").and_then(|v| v.as_u64()).unwrap_or(0);
+            if declared_size > MAX_TEXT_STORE_BYTES {
+                let kb = declared_size / 1024;
+                parts.push(format!("[File:{name} ({kb} KB, too large)]"));
+                continue;
+            }
+            if let Some(marker) = spill_attachment_to_workspace(
+                client, url, name, workspace_dir, message_id, declared_size,
+            )
+            .await
+            {
+                parts.push(marker);
+            } else {
+                let ct_label = if ct.is_empty() { "unknown" } else { ct };
+                parts.push(format!("[File:{name} (type {ct_label}, save failed)]"));
+            }
         }
     }
     parts.join("\n---\n")
@@ -352,7 +361,7 @@ const MAX_TEXT_STORE_BYTES: u64 = 10 * 1024 * 1024;
 const UPLOAD_DIR_NAME: &str = "discord-uploads";
 const UPLOAD_MAX_AGE_SECS: u64 = 24 * 3600;
 
-async fn store_oversized_textlike(
+async fn spill_attachment_to_workspace(
     client: &reqwest::Client,
     url: &str,
     name: &str,
@@ -370,7 +379,7 @@ async fn store_oversized_textlike(
                 write_upload_to_workspace(&bytes, name, workspace_dir, message_id).await
             }
             Err(e) => {
-                tracing::warn!(name, error = %e, "discord: failed reading oversized textlike body");
+                tracing::warn!(name, error = %e, "discord: failed reading attachment body");
                 Some(format!(
                     "[File:{name} ({} KB, fetch failed)]",
                     declared_size / 1024
@@ -378,14 +387,14 @@ async fn store_oversized_textlike(
             }
         },
         Ok(resp) => {
-            tracing::warn!(name, status = %resp.status(), "discord: oversized textlike fetch failed");
+            tracing::warn!(name, status = %resp.status(), "discord: attachment fetch failed");
             Some(format!(
                 "[File:{name} ({} KB, fetch failed)]",
                 declared_size / 1024
             ))
         }
         Err(e) => {
-            tracing::warn!(name, error = %e, "discord: oversized textlike fetch error");
+            tracing::warn!(name, error = %e, "discord: attachment fetch error");
             Some(format!(
                 "[File:{name} ({} KB, fetch failed)]",
                 declared_size / 1024
@@ -419,7 +428,7 @@ async fn write_upload_to_workspace(
     }
     let kb = bytes.len() / 1024;
     Some(format!(
-        "[File:{name} saved to {} ({kb} KB) — use file_read]",
+        "[File:{name} saved to {} ({kb} KB)]",
         saved_path.display()
     ))
 }
@@ -2290,7 +2299,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn process_attachments_emits_hint_for_unsupported_types() {
+    async fn process_attachments_emits_marker_for_unsupported_types() {
+        // Without workspace_dir/message_id, spill falls back to a `[File:...]`
+        // marker (exact wording depends on whether the fake URL fetch succeeds),
+        // but the function never silently drops the attachment.
         let client = reqwest::Client::new();
         let attachments = vec![serde_json::json!({
             "url": "https://cdn.discordapp.com/attachments/123/456/doc.pdf",
@@ -2298,7 +2310,10 @@ mod tests {
             "content_type": "application/pdf"
         })];
         let result = process_attachments(&attachments, &client, None, None, "").await;
-        assert_eq!(result, "[File:doc.pdf (type application/pdf, unsupported)]");
+        assert!(
+            result.starts_with("[File:doc.pdf"),
+            "expected File marker, got: {result}"
+        );
     }
 
     #[tokio::test]
