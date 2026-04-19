@@ -84,6 +84,7 @@ impl DiscordChannel {
 
     /// Configure workspace directory used for validating local attachment paths.
     pub fn with_workspace_dir(mut self, dir: PathBuf) -> Self {
+        cleanup_stale_uploads(&dir.join(UPLOAD_DIR_NAME));
         self.workspace_dir = Some(dir);
         self
     }
@@ -166,16 +167,21 @@ fn normalize_group_reply_allowed_sender_ids(sender_ids: Vec<String>) -> Vec<Stri
 /// Process Discord message attachments and return a string to append to the
 /// agent message context.
 ///
-/// `image/*` attachments are forwarded as `[IMAGE:<url>]` markers. For
-/// `application/octet-stream` or missing MIME types, image-like filename/url
-/// extensions are also treated as images.
-/// `audio/*` attachments are transcribed when `[transcription].enabled = true`.
-/// `text/*` MIME types are fetched and inlined. Other types are skipped.
+/// - `image/*` → `[IMAGE:<url>]` (octet-stream/unknown MIME fall back to extension check)
+/// - `audio/*` → transcribed when `[transcription].enabled = true`
+/// - textlike (text/*, application/{xml,json,yaml,toml,sql,javascript,typescript},
+///   plus common code/config/log extensions when MIME is octet-stream/empty):
+///   ≤256KB inlined as `[name]\n<text>`; 256KB-10MB saved to
+///   `<workspace_dir>/discord-uploads/<message_id>-<safe_name>` and emitted as
+///   `[File:<name> saved to <abs_path> — use file_read]`; >10MB stub-only
+/// - anything else → `[File:<name> (type <ct>, unsupported)]` hint
 /// Fetch errors are logged as warnings.
 async fn process_attachments(
     attachments: &[serde_json::Value],
     client: &reqwest::Client,
     transcription: Option<&TranscriptionConfig>,
+    workspace_dir: Option<&Path>,
+    message_id: &str,
 ) -> String {
     let mut parts: Vec<String> = Vec::new();
     for att in attachments {
@@ -248,26 +254,74 @@ async fn process_attachments(
                 }
             }
         } else if is_textlike_attachment(ct, name, url) {
-            let declared_size = att.get("size").and_then(|v| v.as_u64());
-            if let Some(size) = declared_size {
-                if size > MAX_TEXT_ATTACHMENT_BYTES {
-                    let kb = size / 1024;
-                    parts.push(format!("[File:{name} ({kb} KB, too large to inline)]"));
-                    continue;
+            let declared_size = att.get("size").and_then(|v| v.as_u64()).unwrap_or(0);
+            if declared_size > MAX_TEXT_STORE_BYTES {
+                let kb = declared_size / 1024;
+                parts.push(format!("[File:{name} ({kb} KB, too large)]"));
+                continue;
+            }
+            if declared_size > MAX_TEXT_ATTACHMENT_BYTES {
+                if let Some(marker) = store_oversized_textlike(
+                    client, url, name, workspace_dir, message_id, declared_size,
+                )
+                .await
+                {
+                    parts.push(marker);
+                } else {
+                    let kb = declared_size / 1024;
+                    parts.push(format!("[File:{name} ({kb} KB, save failed)]"));
                 }
+                continue;
             }
             match client.get(url).send().await {
                 Ok(resp) if resp.status().is_success() => {
-                    let len = resp.content_length();
-                    if len.unwrap_or(0) > MAX_TEXT_ATTACHMENT_BYTES {
-                        let kb = len.unwrap_or(0) / 1024;
-                        parts.push(format!("[File:{name} ({kb} KB, too large to inline)]"));
+                    let len = resp.content_length().unwrap_or(0);
+                    if len > MAX_TEXT_STORE_BYTES {
+                        let kb = len / 1024;
+                        parts.push(format!("[File:{name} ({kb} KB, too large)]"));
+                        continue;
+                    }
+                    if len > MAX_TEXT_ATTACHMENT_BYTES {
+                        match resp.bytes().await {
+                            Ok(bytes) => {
+                                if let Some(marker) = write_upload_to_workspace(
+                                    &bytes,
+                                    name,
+                                    workspace_dir,
+                                    message_id,
+                                )
+                                .await
+                                {
+                                    parts.push(marker);
+                                } else {
+                                    let kb = bytes.len() / 1024;
+                                    parts.push(format!("[File:{name} ({kb} KB, save failed)]"));
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!(name, error = %e, "discord: failed reading textlike body");
+                            }
+                        }
                         continue;
                     }
                     if let Ok(text) = resp.text().await {
-                        if text.len() as u64 > MAX_TEXT_ATTACHMENT_BYTES {
+                        if text.len() as u64 > MAX_TEXT_STORE_BYTES {
                             let kb = text.len() / 1024;
-                            parts.push(format!("[File:{name} ({kb} KB, too large to inline)]"));
+                            parts.push(format!("[File:{name} ({kb} KB, too large)]"));
+                        } else if text.len() as u64 > MAX_TEXT_ATTACHMENT_BYTES {
+                            if let Some(marker) = write_upload_to_workspace(
+                                text.as_bytes(),
+                                name,
+                                workspace_dir,
+                                message_id,
+                            )
+                            .await
+                            {
+                                parts.push(marker);
+                            } else {
+                                let kb = text.len() / 1024;
+                                parts.push(format!("[File:{name} ({kb} KB, save failed)]"));
+                            }
                         } else {
                             parts.push(format!("[{name}]\n{text}"));
                         }
@@ -284,14 +338,139 @@ async fn process_attachments(
             tracing::debug!(
                 name,
                 content_type = ct,
-                "discord: skipping unsupported attachment type"
+                "discord: unsupported attachment type, emitting hint"
             );
+            let ct_label = if ct.is_empty() { "unknown" } else { ct };
+            parts.push(format!("[File:{name} (type {ct_label}, unsupported)]"));
         }
     }
     parts.join("\n---\n")
 }
 
 const MAX_TEXT_ATTACHMENT_BYTES: u64 = 256 * 1024;
+const MAX_TEXT_STORE_BYTES: u64 = 10 * 1024 * 1024;
+const UPLOAD_DIR_NAME: &str = "discord-uploads";
+const UPLOAD_MAX_AGE_SECS: u64 = 24 * 3600;
+
+async fn store_oversized_textlike(
+    client: &reqwest::Client,
+    url: &str,
+    name: &str,
+    workspace_dir: Option<&Path>,
+    message_id: &str,
+    declared_size: u64,
+) -> Option<String> {
+    match client.get(url).send().await {
+        Ok(resp) if resp.status().is_success() => match resp.bytes().await {
+            Ok(bytes) => {
+                if bytes.len() as u64 > MAX_TEXT_STORE_BYTES {
+                    let kb = bytes.len() / 1024;
+                    return Some(format!("[File:{name} ({kb} KB, too large)]"));
+                }
+                write_upload_to_workspace(&bytes, name, workspace_dir, message_id).await
+            }
+            Err(e) => {
+                tracing::warn!(name, error = %e, "discord: failed reading oversized textlike body");
+                Some(format!(
+                    "[File:{name} ({} KB, fetch failed)]",
+                    declared_size / 1024
+                ))
+            }
+        },
+        Ok(resp) => {
+            tracing::warn!(name, status = %resp.status(), "discord: oversized textlike fetch failed");
+            Some(format!(
+                "[File:{name} ({} KB, fetch failed)]",
+                declared_size / 1024
+            ))
+        }
+        Err(e) => {
+            tracing::warn!(name, error = %e, "discord: oversized textlike fetch error");
+            Some(format!(
+                "[File:{name} ({} KB, fetch failed)]",
+                declared_size / 1024
+            ))
+        }
+    }
+}
+
+async fn write_upload_to_workspace(
+    bytes: &[u8],
+    name: &str,
+    workspace_dir: Option<&Path>,
+    message_id: &str,
+) -> Option<String> {
+    let ws_dir = workspace_dir?;
+    if message_id.is_empty() {
+        tracing::warn!(name, "discord: cannot save upload without message_id");
+        return None;
+    }
+    let upload_dir = ws_dir.join(UPLOAD_DIR_NAME);
+    if let Err(e) = tokio::fs::create_dir_all(&upload_dir).await {
+        tracing::warn!(name, error = %e, "discord: failed to create upload dir");
+        return None;
+    }
+    let safe_name = sanitize_attachment_filename(name);
+    let final_name = format!("{message_id}-{safe_name}");
+    let saved_path = upload_dir.join(&final_name);
+    if let Err(e) = tokio::fs::write(&saved_path, bytes).await {
+        tracing::warn!(name, error = %e, "discord: failed to write upload");
+        return None;
+    }
+    let kb = bytes.len() / 1024;
+    Some(format!(
+        "[File:{name} saved to {} ({kb} KB) — use file_read]",
+        saved_path.display()
+    ))
+}
+
+fn sanitize_attachment_filename(name: &str) -> String {
+    let cleaned: String = name
+        .chars()
+        .map(|c| match c {
+            '/' | '\\' | '\0' => '_',
+            c if c.is_control() => '_',
+            c => c,
+        })
+        .collect();
+    let trimmed: String = cleaned.chars().take(200).collect();
+    if trimmed.is_empty() {
+        "file".to_string()
+    } else {
+        trimmed
+    }
+}
+
+fn cleanup_stale_uploads(upload_dir: &Path) {
+    use std::time::{Duration, SystemTime};
+    if !upload_dir.exists() {
+        return;
+    }
+    let entries = match std::fs::read_dir(upload_dir) {
+        Ok(e) => e,
+        Err(err) => {
+            tracing::warn!(dir = %upload_dir.display(), error = %err, "discord: failed listing upload dir for cleanup");
+            return;
+        }
+    };
+    let max_age = Duration::from_secs(UPLOAD_MAX_AGE_SECS);
+    let now = SystemTime::now();
+    for entry in entries.flatten() {
+        let Ok(meta) = entry.metadata() else { continue };
+        if !meta.is_file() {
+            continue;
+        }
+        let Ok(mtime) = meta.modified() else { continue };
+        if let Ok(age) = now.duration_since(mtime) {
+            if age > max_age {
+                let path = entry.path();
+                if let Err(err) = std::fs::remove_file(&path) {
+                    tracing::warn!(path = %path.display(), error = %err, "discord: failed removing stale upload");
+                }
+            }
+        }
+    }
+}
 
 fn is_textlike_attachment(content_type: &str, filename: &str, url: &str) -> bool {
     let normalized = normalize_content_type(content_type);
@@ -1281,22 +1460,27 @@ impl Channel for DiscordChannel {
                         None => continue,
                     };
 
+                    let message_id = d.get("id").and_then(|i| i.as_str()).unwrap_or("");
                     let attachment_text = {
                         let atts = d
                             .get("attachments")
                             .and_then(|a| a.as_array())
                             .cloned()
                             .unwrap_or_default();
-                        process_attachments(&atts, &self.http_client(), self.transcription.as_ref())
-                            .await
+                        process_attachments(
+                            &atts,
+                            &self.http_client(),
+                            self.transcription.as_ref(),
+                            self.workspace_dir.as_deref(),
+                            message_id,
+                        )
+                        .await
                     };
                     let final_content = if attachment_text.is_empty() {
                         clean_content
                     } else {
                         format!("{clean_content}\n\n[Attachments]\n{attachment_text}")
                     };
-
-                    let message_id = d.get("id").and_then(|i| i.as_str()).unwrap_or("");
                     let channel_id = d
                         .get("channel_id")
                         .and_then(|c| c.as_str())
@@ -2101,20 +2285,20 @@ mod tests {
     #[tokio::test]
     async fn process_attachments_empty_list_returns_empty() {
         let client = reqwest::Client::new();
-        let result = process_attachments(&[], &client, None).await;
+        let result = process_attachments(&[], &client, None, None, "").await;
         assert!(result.is_empty());
     }
 
     #[tokio::test]
-    async fn process_attachments_skips_unsupported_types() {
+    async fn process_attachments_emits_hint_for_unsupported_types() {
         let client = reqwest::Client::new();
         let attachments = vec![serde_json::json!({
             "url": "https://cdn.discordapp.com/attachments/123/456/doc.pdf",
             "filename": "doc.pdf",
             "content_type": "application/pdf"
         })];
-        let result = process_attachments(&attachments, &client, None).await;
-        assert!(result.is_empty());
+        let result = process_attachments(&attachments, &client, None, None, "").await;
+        assert_eq!(result, "[File:doc.pdf (type application/pdf, unsupported)]");
     }
 
     #[tokio::test]
@@ -2125,7 +2309,7 @@ mod tests {
             "filename": "photo.png",
             "content_type": "image/png"
         })];
-        let result = process_attachments(&attachments, &client, None).await;
+        let result = process_attachments(&attachments, &client, None, None, "").await;
         assert_eq!(
             result,
             "[IMAGE:https://cdn.discordapp.com/attachments/123/456/photo.png]"
@@ -2147,7 +2331,7 @@ mod tests {
                 "content_type": "image/webp"
             }),
         ];
-        let result = process_attachments(&attachments, &client, None).await;
+        let result = process_attachments(&attachments, &client, None, None, "").await;
         assert_eq!(
             result,
             "[IMAGE:https://cdn.discordapp.com/attachments/123/456/one.jpg]\n---\n[IMAGE:https://cdn.discordapp.com/attachments/123/456/two.webp]"
@@ -2161,7 +2345,7 @@ mod tests {
             "url": "https://cdn.discordapp.com/attachments/123/456/photo.jpeg?size=1024",
             "filename": "photo.jpeg"
         })];
-        let result = process_attachments(&attachments, &client, None).await;
+        let result = process_attachments(&attachments, &client, None, None, "").await;
         assert_eq!(
             result,
             "[IMAGE:https://cdn.discordapp.com/attachments/123/456/photo.jpeg?size=1024]"
@@ -2209,7 +2393,7 @@ mod tests {
             "duration_secs": 4
         })];
 
-        let result = process_attachments(&attachments, &client, Some(&transcription)).await;
+        let result = process_attachments(&attachments, &client, Some(&transcription), None, "").await;
         assert_eq!(result, "[Voice:voice.ogg] hello from discord audio");
     }
 
@@ -2228,7 +2412,7 @@ mod tests {
             "duration_secs": 120
         })];
 
-        let result = process_attachments(&attachments, &client, Some(&transcription)).await;
+        let result = process_attachments(&attachments, &client, Some(&transcription), None, "").await;
         assert!(result.is_empty());
     }
 
