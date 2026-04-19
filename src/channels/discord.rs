@@ -247,11 +247,30 @@ async fn process_attachments(
                     tracing::warn!(name, error = %error, "discord: audio transcription failed");
                 }
             }
-        } else if ct.starts_with("text/") {
+        } else if is_textlike_attachment(ct, name, url) {
+            let declared_size = att.get("size").and_then(|v| v.as_u64());
+            if let Some(size) = declared_size {
+                if size > MAX_TEXT_ATTACHMENT_BYTES {
+                    let kb = size / 1024;
+                    parts.push(format!("[File:{name} ({kb} KB, too large to inline)]"));
+                    continue;
+                }
+            }
             match client.get(url).send().await {
                 Ok(resp) if resp.status().is_success() => {
+                    let len = resp.content_length();
+                    if len.unwrap_or(0) > MAX_TEXT_ATTACHMENT_BYTES {
+                        let kb = len.unwrap_or(0) / 1024;
+                        parts.push(format!("[File:{name} ({kb} KB, too large to inline)]"));
+                        continue;
+                    }
                     if let Ok(text) = resp.text().await {
-                        parts.push(format!("[{name}]\n{text}"));
+                        if text.len() as u64 > MAX_TEXT_ATTACHMENT_BYTES {
+                            let kb = text.len() / 1024;
+                            parts.push(format!("[File:{name} ({kb} KB, too large to inline)]"));
+                        } else {
+                            parts.push(format!("[{name}]\n{text}"));
+                        }
                     }
                 }
                 Ok(resp) => {
@@ -270,6 +289,89 @@ async fn process_attachments(
         }
     }
     parts.join("\n---\n")
+}
+
+const MAX_TEXT_ATTACHMENT_BYTES: u64 = 256 * 1024;
+
+fn is_textlike_attachment(content_type: &str, filename: &str, url: &str) -> bool {
+    let normalized = normalize_content_type(content_type);
+    if !normalized.is_empty() {
+        if normalized.starts_with("text/") {
+            return true;
+        }
+        if matches!(
+            normalized.as_str(),
+            "application/xml"
+                | "application/json"
+                | "application/yaml"
+                | "application/x-yaml"
+                | "application/toml"
+                | "application/x-toml"
+                | "application/javascript"
+                | "application/typescript"
+                | "application/sql"
+        ) {
+            return true;
+        }
+        if normalized != "application/octet-stream" {
+            return false;
+        }
+    }
+    has_textlike_extension(filename) || has_textlike_extension(url)
+}
+
+fn has_textlike_extension(value: &str) -> bool {
+    let Some(ext) = extension_from_media_path(value) else {
+        return false;
+    };
+    matches!(
+        ext.as_str(),
+        "txt"
+            | "log"
+            | "md"
+            | "xml"
+            | "json"
+            | "yaml"
+            | "yml"
+            | "toml"
+            | "ini"
+            | "conf"
+            | "cfg"
+            | "csv"
+            | "tsv"
+            | "sh"
+            | "bash"
+            | "zsh"
+            | "sql"
+            | "rs"
+            | "py"
+            | "js"
+            | "ts"
+            | "jsx"
+            | "tsx"
+            | "go"
+            | "java"
+            | "kt"
+            | "c"
+            | "cpp"
+            | "cc"
+            | "cxx"
+            | "h"
+            | "hpp"
+            | "cs"
+            | "swift"
+            | "rb"
+            | "php"
+            | "pl"
+            | "lua"
+            | "html"
+            | "htm"
+            | "css"
+            | "scss"
+            | "less"
+            | "vue"
+            | "svelte"
+    )
 }
 
 fn normalize_content_type(content_type: &str) -> String {
