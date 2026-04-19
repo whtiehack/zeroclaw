@@ -3248,14 +3248,19 @@ async fn build_memory_context(
                 break;
             }
 
-            if should_skip_memory_context_entry(&entry.key, &entry.content) {
+            let stripped_content = strip_attachment_block(&entry.content);
+            if stripped_content.trim().is_empty() {
                 continue;
             }
 
-            let content = if entry.content.chars().count() > MEMORY_CONTEXT_ENTRY_MAX_CHARS {
-                truncate_with_ellipsis(&entry.content, MEMORY_CONTEXT_ENTRY_MAX_CHARS)
+            if should_skip_memory_context_entry(&entry.key, &stripped_content) {
+                continue;
+            }
+
+            let content = if stripped_content.chars().count() > MEMORY_CONTEXT_ENTRY_MAX_CHARS {
+                truncate_with_ellipsis(&stripped_content, MEMORY_CONTEXT_ENTRY_MAX_CHARS)
             } else {
-                entry.content.clone()
+                stripped_content
             };
 
             let line = format!("- {}: {}\n", entry.key, content);
@@ -3274,7 +3279,7 @@ async fn build_memory_context(
         }
 
         if included > 0 {
-            context.push('\n');
+            context.push_str("[/Memory context]\n\n");
         }
     }
 
