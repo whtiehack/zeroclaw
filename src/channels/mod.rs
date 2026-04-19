@@ -4048,15 +4048,18 @@ If this input is legitimate, rephrase the request and avoid instruction-override
             // conversation history. Follow-up turns already include context
             // from previous messages.
             if !had_prior_history {
-                let memory_context = build_memory_context(
-                    ctx.memory.as_ref(),
-                    &msg.content,
-                    runtime_defaults.min_relevance_score,
-                    Some(&history_key),
-                )
-                .await;
-                if !memory_context.is_empty() {
-                    last_turn.content = format!("{memory_context}{}", last_turn.content);
+                let recall_query = strip_attachment_block(&msg.content);
+                if !recall_query.trim().is_empty() {
+                    let memory_context = build_memory_context(
+                        ctx.memory.as_ref(),
+                        &recall_query,
+                        runtime_defaults.min_relevance_score,
+                        Some(&history_key),
+                    )
+                    .await;
+                    if !memory_context.is_empty() {
+                        last_turn.content = format!("{memory_context}{}", last_turn.content);
+                    }
                 }
             }
         }
