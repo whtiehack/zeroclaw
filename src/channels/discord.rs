@@ -10,8 +10,12 @@ use reqwest::multipart::{Form, Part};
 use serde_json::json;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 use tokio_tungstenite::tungstenite::Message;
 use uuid::Uuid;
+
+/// Minimum interval between draft message edits per channel (rate-limit friendly).
+const DRAFT_UPDATE_INTERVAL_MS: u64 = 1000;
 
 /// Discord approval button custom_id prefixes.
 const DISCORD_APPROVAL_APPROVE_PREFIX: &str = "zcapr:yes:";
@@ -26,11 +30,15 @@ pub struct DiscordChannel {
     mention_only: bool,
     /// When false, DMs are rejected; guild messages unaffected.
     allow_dm: bool,
+    /// Optional DM rejection reply. `None` = silently drop.
+    dm_reject_message: Option<String>,
     group_reply_allowed_sender_ids: Vec<String>,
     ack_reaction: Option<AckReactionConfig>,
     transcription: Option<TranscriptionConfig>,
     workspace_dir: Option<PathBuf>,
     typing_handles: Mutex<HashMap<String, tokio::task::JoinHandle<()>>>,
+    /// Per-channel last draft edit timestamp for rate-limit throttling.
+    last_draft_edit: Mutex<HashMap<String, Instant>>,
 }
 
 impl DiscordChannel {
@@ -48,17 +56,25 @@ impl DiscordChannel {
             listen_to_bots,
             mention_only,
             allow_dm: true,
+            dm_reject_message: None,
             group_reply_allowed_sender_ids: Vec::new(),
             ack_reaction: None,
             transcription: None,
             workspace_dir: None,
             typing_handles: Mutex::new(HashMap::new()),
+            last_draft_edit: Mutex::new(HashMap::new()),
         }
     }
 
     /// Reject DMs when set to false. Guild messages unaffected.
     pub fn with_allow_dm(mut self, allow_dm: bool) -> Self {
         self.allow_dm = allow_dm;
+        self
+    }
+
+    /// Set the DM rejection reply (Markdown supported). `None` = silently drop.
+    pub fn with_dm_reject_message(mut self, msg: Option<String>) -> Self {
+        self.dm_reject_message = msg.filter(|s| !s.trim().is_empty());
         self
     }
 
@@ -822,7 +838,7 @@ async fn send_discord_message_json(
     reply_to: Option<&str>,
 ) -> anyhow::Result<()> {
     let url = format!("https://discord.com/api/v10/channels/{recipient}/messages");
-    let mut body = json!({ "content": content });
+    let mut body = json!({ "content": content, "flags": 4 });
     if let Some(ref_id) = reply_to {
         body["message_reference"] = json!({
             "message_id": ref_id,
@@ -850,6 +866,112 @@ async fn send_discord_message_json(
     Ok(())
 }
 
+/// Same as send_discord_message_json but returns the new message id for later edits.
+async fn send_discord_message_json_with_id(
+    client: &reqwest::Client,
+    bot_token: &str,
+    recipient: &str,
+    content: &str,
+    reply_to: Option<&str>,
+) -> anyhow::Result<String> {
+    let url = format!("https://discord.com/api/v10/channels/{recipient}/messages");
+    let mut body = json!({ "content": content, "flags": 4 });
+    if let Some(ref_id) = reply_to {
+        body["message_reference"] = json!({
+            "message_id": ref_id,
+            "fail_if_not_exists": false,
+        });
+    }
+
+    let resp = client
+        .post(&url)
+        .header("Authorization", format!("Bot {bot_token}"))
+        .json(&body)
+        .send()
+        .await?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let err = resp
+            .text()
+            .await
+            .unwrap_or_else(|e| format!("<failed to read response body: {e}>"));
+        let sanitized = crate::providers::sanitize_api_error(&err);
+        anyhow::bail!("Discord send message failed ({status}): {sanitized}");
+    }
+
+    let resp_json: serde_json::Value = resp.json().await?;
+    resp_json
+        .get("id")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .ok_or_else(|| anyhow::anyhow!("Discord send response missing 'id'"))
+}
+
+/// PATCH an existing Discord message content. 429 is treated as harmless skip.
+async fn edit_discord_message(
+    client: &reqwest::Client,
+    bot_token: &str,
+    channel_id: &str,
+    message_id: &str,
+    content: &str,
+) -> anyhow::Result<()> {
+    let url = format!("https://discord.com/api/v10/channels/{channel_id}/messages/{message_id}");
+    let body = json!({ "content": content, "flags": 4 });
+
+    let resp = client
+        .patch(&url)
+        .header("Authorization", format!("Bot {bot_token}"))
+        .json(&body)
+        .send()
+        .await?;
+
+    if resp.status().as_u16() == 429 {
+        tracing::debug!("Discord edit message rate-limited (429), skipping update");
+        return Ok(());
+    }
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let err = resp
+            .text()
+            .await
+            .unwrap_or_else(|e| format!("<failed to read response body: {e}>"));
+        let sanitized = crate::providers::sanitize_api_error(&err);
+        anyhow::bail!("Discord edit message failed ({status}): {sanitized}");
+    }
+    Ok(())
+}
+
+/// DELETE a Discord message. 429 is treated as harmless skip.
+async fn delete_discord_message(
+    client: &reqwest::Client,
+    bot_token: &str,
+    channel_id: &str,
+    message_id: &str,
+) -> anyhow::Result<()> {
+    let url = format!("https://discord.com/api/v10/channels/{channel_id}/messages/{message_id}");
+    let resp = client
+        .delete(&url)
+        .header("Authorization", format!("Bot {bot_token}"))
+        .send()
+        .await?;
+
+    if resp.status().as_u16() == 429 {
+        tracing::debug!("Discord delete message rate-limited (429), skipping");
+        return Ok(());
+    }
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let err = resp
+            .text()
+            .await
+            .unwrap_or_else(|e| format!("<failed to read response body: {e}>"));
+        let sanitized = crate::providers::sanitize_api_error(&err);
+        anyhow::bail!("Discord delete message failed ({status}): {sanitized}");
+    }
+    Ok(())
+}
+
 async fn send_discord_message_with_files(
     client: &reqwest::Client,
     bot_token: &str,
@@ -860,7 +982,7 @@ async fn send_discord_message_with_files(
 ) -> anyhow::Result<()> {
     let url = format!("https://discord.com/api/v10/channels/{recipient}/messages");
 
-    let mut payload = json!({ "content": content });
+    let mut payload = json!({ "content": content, "flags": 4 });
     if let Some(ref_id) = reply_to {
         payload["message_reference"] = json!({
             "message_id": ref_id,
@@ -1472,31 +1594,34 @@ impl Channel for DiscordChannel {
 
                     if !self.allow_dm && d.get("guild_id").is_none() {
                         tracing::info!("Discord: ignoring DM (allow_dm = false)");
-                        let dm_channel_id = d
-                            .get("channel_id")
-                            .and_then(serde_json::Value::as_str)
-                            .unwrap_or("");
-                        let dm_message_id = d
-                            .get("id")
-                            .and_then(serde_json::Value::as_str)
-                            .unwrap_or("");
-                        if !dm_channel_id.is_empty() {
-                            let reject_text = "Direct messages aren't supported yet. Please post in the WRSUB channel if you need help there.";
-                            let reply_to = if dm_message_id.is_empty() {
-                                None
-                            } else {
-                                Some(dm_message_id)
-                            };
-                            if let Err(err) = send_discord_message_json(
-                                &self.http_client(),
-                                &self.bot_token,
-                                dm_channel_id,
-                                reject_text,
-                                reply_to,
-                            )
-                            .await
-                            {
-                                tracing::warn!("Discord: failed to send DM rejection: {err}");
+                        if let Some(reject_text) = self.dm_reject_message.as_deref() {
+                            let dm_channel_id = d
+                                .get("channel_id")
+                                .and_then(serde_json::Value::as_str)
+                                .unwrap_or("");
+                            let dm_message_id = d
+                                .get("id")
+                                .and_then(serde_json::Value::as_str)
+                                .unwrap_or("");
+                            if !dm_channel_id.is_empty() {
+                                let reply_to = if dm_message_id.is_empty() {
+                                    None
+                                } else {
+                                    Some(dm_message_id)
+                                };
+                                if let Err(err) = send_discord_message_json(
+                                    &self.http_client(),
+                                    &self.bot_token,
+                                    dm_channel_id,
+                                    reject_text,
+                                    reply_to,
+                                )
+                                .await
+                                {
+                                    tracing::warn!(
+                                        "Discord: failed to send DM rejection: {err}"
+                                    );
+                                }
                             }
                         }
                         continue;
@@ -1649,6 +1774,7 @@ impl Channel for DiscordChannel {
             "content": format!(
                 "**Approval required** for tool `{tool_name}`.\nRequest ID: `{request_id}`\nArgs: `{args_preview}`"
             ),
+            "flags": 4,
             "components": [{
                 "type": 1,
                 "components": [
@@ -1728,6 +1854,234 @@ impl Channel for DiscordChannel {
         let mut guard = self.typing_handles.lock();
         if let Some(handle) = guard.remove(recipient) {
             handle.abort();
+        }
+        Ok(())
+    }
+
+    fn supports_draft_updates(&self) -> bool {
+        true
+    }
+
+    async fn send_draft(&self, message: &SendMessage) -> anyhow::Result<Option<String>> {
+        let initial_text = if message.content.is_empty() {
+            "...".to_string()
+        } else {
+            message.content.clone()
+        };
+        let reply_to = message.thread_ts.as_deref();
+
+        let msg_id = send_discord_message_json_with_id(
+            &self.http_client(),
+            &self.bot_token,
+            &message.recipient,
+            &initial_text,
+            reply_to,
+        )
+        .await?;
+
+        self.last_draft_edit
+            .lock()
+            .insert(message.recipient.clone(), Instant::now());
+
+        Ok(Some(msg_id))
+    }
+
+    async fn update_draft(
+        &self,
+        recipient: &str,
+        message_id: &str,
+        text: &str,
+    ) -> anyhow::Result<Option<String>> {
+        // Rate-limit: skip edits that arrive inside the per-channel throttle window.
+        {
+            let last_edits = self.last_draft_edit.lock();
+            if let Some(last_time) = last_edits.get(recipient) {
+                let elapsed_ms =
+                    u64::try_from(last_time.elapsed().as_millis()).unwrap_or(u64::MAX);
+                if elapsed_ms < DRAFT_UPDATE_INTERVAL_MS {
+                    return Ok(None);
+                }
+            }
+        }
+
+        // Skip PATCH when display text is empty: Discord rejects empty `content`.
+        let trimmed = text.trim();
+        if trimmed.is_empty() {
+            return Ok(None);
+        }
+
+        // UTF-8 safe truncation to Discord's 2000-char limit.
+        let display_text = if text.chars().count() > DISCORD_MAX_MESSAGE_LENGTH {
+            let end_byte = text
+                .char_indices()
+                .nth(DISCORD_MAX_MESSAGE_LENGTH)
+                .map_or(text.len(), |(idx, _)| idx);
+            &text[..end_byte]
+        } else {
+            text
+        };
+
+        match edit_discord_message(
+            &self.http_client(),
+            &self.bot_token,
+            recipient,
+            message_id,
+            display_text,
+        )
+        .await
+        {
+            Ok(()) => {
+                self.last_draft_edit
+                    .lock()
+                    .insert(recipient.to_string(), Instant::now());
+            }
+            Err(e) => {
+                tracing::debug!("Discord draft update failed: {e}");
+            }
+        }
+
+        Ok(None)
+    }
+
+    async fn finalize_draft(
+        &self,
+        recipient: &str,
+        message_id: &str,
+        text: &str,
+    ) -> anyhow::Result<()> {
+        let _ = self.stop_typing(recipient).await;
+        self.last_draft_edit.lock().remove(recipient);
+
+        let text = super::strip_tool_call_tags(text);
+        let (cleaned_content, parsed_attachments) = parse_attachment_markers(&text);
+        let (local_attachment_targets, remote_urls, mut unresolved_markers) =
+            classify_outgoing_attachments(&parsed_attachments);
+
+        let mut local_files = Vec::new();
+        for attachment in &local_attachment_targets {
+            let target = attachment.target.trim();
+            match self.resolve_local_attachment_path(target) {
+                Ok(path) => local_files.push(path),
+                Err(error) => {
+                    tracing::warn!(
+                        target,
+                        error = %error,
+                        "discord: local attachment rejected by workspace policy (finalize)"
+                    );
+                    unresolved_markers.push(format!(
+                        "[{}:{}]",
+                        attachment.kind.marker_name(),
+                        target
+                    ));
+                }
+            }
+        }
+        if local_files.len() > 10 {
+            local_files.truncate(10);
+        }
+
+        let content =
+            with_inline_attachment_urls(&cleaned_content, &remote_urls, &unresolved_markers);
+        let client = self.http_client();
+
+        // Path 1: attachments — delete draft and POST fresh message(s) with files.
+        if !local_files.is_empty() {
+            let _ =
+                delete_discord_message(&client, &self.bot_token, recipient, message_id).await;
+            let chunks = split_message_for_discord(&content);
+            for (i, chunk) in chunks.iter().enumerate() {
+                if i == 0 {
+                    send_discord_message_with_files(
+                        &client,
+                        &self.bot_token,
+                        recipient,
+                        chunk,
+                        &local_files,
+                        None,
+                    )
+                    .await?;
+                } else {
+                    send_discord_message_json(
+                        &client,
+                        &self.bot_token,
+                        recipient,
+                        chunk,
+                        None,
+                    )
+                    .await?;
+                }
+                if i < chunks.len() - 1 {
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                }
+            }
+            return Ok(());
+        }
+
+        // Path 2: text exceeds limit — delete draft and POST as chunked messages.
+        if content.chars().count() > DISCORD_MAX_MESSAGE_LENGTH {
+            let _ =
+                delete_discord_message(&client, &self.bot_token, recipient, message_id).await;
+            let chunks = split_message_for_discord(&content);
+            for (i, chunk) in chunks.iter().enumerate() {
+                send_discord_message_json(
+                    &client,
+                    &self.bot_token,
+                    recipient,
+                    chunk,
+                    None,
+                )
+                .await?;
+                if i < chunks.len() - 1 {
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                }
+            }
+            return Ok(());
+        }
+
+        // Path 3: simple edit-in-place; fall back to delete + POST on failure.
+        let final_text = if content.trim().is_empty() {
+            "(empty)".to_string()
+        } else {
+            content
+        };
+        if let Err(e) = edit_discord_message(
+            &client,
+            &self.bot_token,
+            recipient,
+            message_id,
+            &final_text,
+        )
+        .await
+        {
+            tracing::warn!(
+                "Discord finalize_draft edit failed: {e}; falling back to delete+send"
+            );
+            let _ =
+                delete_discord_message(&client, &self.bot_token, recipient, message_id).await;
+            send_discord_message_json(
+                &client,
+                &self.bot_token,
+                recipient,
+                &final_text,
+                None,
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
+    async fn cancel_draft(&self, recipient: &str, message_id: &str) -> anyhow::Result<()> {
+        let _ = self.stop_typing(recipient).await;
+        self.last_draft_edit.lock().remove(recipient);
+        if let Err(e) = delete_discord_message(
+            &self.http_client(),
+            &self.bot_token,
+            recipient,
+            message_id,
+        )
+        .await
+        {
+            tracing::debug!("Discord cancel_draft delete failed: {e}");
         }
         Ok(())
     }

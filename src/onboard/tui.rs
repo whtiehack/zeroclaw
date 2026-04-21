@@ -2296,6 +2296,7 @@ fn apply_channel_overrides(config: &mut Config, plan: &TuiOnboardPlan) {
             listen_to_bots: false,
             mention_only: false,
             allow_dm: true,
+            dm_reject_message: None,
             group_reply: None,
         });
     }

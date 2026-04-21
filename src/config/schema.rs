@@ -5021,6 +5021,10 @@ pub struct DiscordConfig {
     /// When false, direct messages (DMs) are rejected; guild messages unaffected.
     #[serde(default = "default_discord_allow_dm")]
     pub allow_dm: bool,
+    /// Reply sent when a DM is rejected. Kept out of source so forks don't leak
+    /// guild/channel URLs. `None` = silently drop (no user-visible reply).
+    #[serde(default)]
+    pub dm_reject_message: Option<String>,
     /// Group-chat trigger controls.
     #[serde(default)]
     pub group_reply: Option<GroupReplyConfig>,
@@ -11333,6 +11337,7 @@ denied_tools = ["shell"]
             listen_to_bots: false,
             mention_only: false,
             allow_dm: true,
+            dm_reject_message: None,
             group_reply: None,
         };
         let json = serde_json::to_string(&dc).unwrap();
@@ -11350,6 +11355,7 @@ denied_tools = ["shell"]
             listen_to_bots: false,
             mention_only: false,
             allow_dm: true,
+            dm_reject_message: None,
             group_reply: None,
         };
         let json = serde_json::to_string(&dc).unwrap();

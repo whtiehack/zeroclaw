@@ -2338,7 +2338,12 @@ pub async fn run_tool_call_loop(
             );
 
             let progress_idx = if should_emit_tool_progress(progress_mode) {
-                let hint = truncate_tool_args_for_progress(&tool_name, &tool_args, 60);
+                // Discord shows tool names only (no arg hints) per WRSUB policy.
+                let hint = if channel_name.eq_ignore_ascii_case("discord") {
+                    String::new()
+                } else {
+                    truncate_tool_args_for_progress(&tool_name, &tool_args, 60)
+                };
                 let idx = progress_tracker.add(&tool_name, &hint);
                 if let Some(ref tx) = on_delta {
                     tracing::debug!(tool = %tool_name, "Sending progress start to draft");

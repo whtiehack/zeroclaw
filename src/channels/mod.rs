@@ -862,6 +862,8 @@ fn effective_progress_mode_for_message(
         runtime_telegram_progress_mode()
     } else if channel_name.eq_ignore_ascii_case("wecom") {
         runtime_wecom_progress_mode()
+    } else if channel_name.eq_ignore_ascii_case("discord") {
+        ProgressMode::Verbose
     } else {
         ProgressMode::Off
     }
@@ -4016,6 +4018,19 @@ If this input is legitimate, rephrase the request and avoid instruction-override
         .get(&history_key)
         .is_some_and(|turns| !turns.is_empty());
 
+    // Discord: mark a fresh session (no prior history after seed/evict) with
+    // a 🆕 reaction on the user's message. Non-history, non-memory side-effect.
+    if !had_prior_history && msg.channel == "discord" {
+        if let Some(channel) = target_channel.as_ref() {
+            if let Err(err) = channel
+                .add_reaction(&msg.reply_target, &msg.id, "\u{1F195}")
+                .await
+            {
+                tracing::debug!("Discord: failed to add 🆕 reaction: {err}");
+            }
+        }
+    }
+
     // Inject per-message timestamp so the LLM always knows the current time,
     // even in multi-turn conversations where the system prompt may be stale.
     let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S %Z");
@@ -5455,6 +5470,7 @@ fn collect_configured_channels(
                     dc.effective_group_reply_mode().requires_mention(),
                 )
                 .with_allow_dm(dc.allow_dm)
+                .with_dm_reject_message(dc.dm_reject_message.clone())
                 .with_group_reply_allowed_senders(dc.group_reply_allowed_sender_ids())
                 .with_ack_reaction(config.channels_config.ack_reaction.discord.clone())
                 .with_transcription(config.transcription.clone())
