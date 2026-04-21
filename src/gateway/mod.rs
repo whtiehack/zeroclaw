@@ -114,7 +114,9 @@ fn qq_memory_key(msg: &crate::channels::traits::ChannelMessage) -> String {
 }
 
 fn gateway_message_session_id(msg: &crate::channels::traits::ChannelMessage) -> String {
-    if msg.channel == "qq" || msg.channel == "napcat" {
+    // discord reuses thread_ts as a reply-target message id (see
+    // channels/discord.rs listen), so exclude it from session id like qq/napcat.
+    if msg.channel == "qq" || msg.channel == "napcat" || msg.channel == "discord" {
         return format!("{}_{}", msg.channel, msg.sender);
     }
 

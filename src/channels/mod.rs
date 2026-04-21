@@ -427,9 +427,10 @@ fn assistant_memory_key(msg: &traits::ChannelMessage) -> String {
 }
 
 fn conversation_history_key(msg: &traits::ChannelMessage) -> String {
-    // QQ uses thread_ts as a passive-reply message id, not a thread identifier.
-    // Using it in history keys would reset context on every incoming message.
-    if msg.channel == "qq" || msg.channel == "napcat" {
+    // QQ/napcat/discord use thread_ts as a passive-reply message id, not a
+    // thread identifier. Using it in history keys would reset context on
+    // every incoming message.
+    if msg.channel == "qq" || msg.channel == "napcat" || msg.channel == "discord" {
         return format!("{}_{}", msg.channel, msg.sender);
     }
 

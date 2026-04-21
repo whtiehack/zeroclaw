@@ -819,9 +819,16 @@ async fn send_discord_message_json(
     bot_token: &str,
     recipient: &str,
     content: &str,
+    reply_to: Option<&str>,
 ) -> anyhow::Result<()> {
     let url = format!("https://discord.com/api/v10/channels/{recipient}/messages");
-    let body = json!({ "content": content });
+    let mut body = json!({ "content": content });
+    if let Some(ref_id) = reply_to {
+        body["message_reference"] = json!({
+            "message_id": ref_id,
+            "fail_if_not_exists": false,
+        });
+    }
 
     let resp = client
         .post(&url)
@@ -849,10 +856,18 @@ async fn send_discord_message_with_files(
     recipient: &str,
     content: &str,
     files: &[PathBuf],
+    reply_to: Option<&str>,
 ) -> anyhow::Result<()> {
     let url = format!("https://discord.com/api/v10/channels/{recipient}/messages");
 
-    let mut form = Form::new().text("payload_json", json!({ "content": content }).to_string());
+    let mut payload = json!({ "content": content });
+    if let Some(ref_id) = reply_to {
+        payload["message_reference"] = json!({
+            "message_id": ref_id,
+            "fail_if_not_exists": false,
+        });
+    }
+    let mut form = Form::new().text("payload_json", payload.to_string());
 
     for (idx, path) in files.iter().enumerate() {
         let bytes = tokio::fs::read(path).await.map_err(|error| {
@@ -1221,8 +1236,12 @@ impl Channel for DiscordChannel {
             with_inline_attachment_urls(&cleaned_content, &remote_urls, &unresolved_markers);
         let chunks = split_message_for_discord(&content);
         let client = self.http_client();
+        let reply_to_full = message.thread_ts.as_deref();
 
         for (i, chunk) in chunks.iter().enumerate() {
+            // Only the first chunk carries the reply reference; continuation
+            // chunks post plain so Discord UI doesn't stack quote boxes.
+            let chunk_reply_to = if i == 0 { reply_to_full } else { None };
             if i == 0 && !local_files.is_empty() {
                 send_discord_message_with_files(
                     &client,
@@ -1230,11 +1249,18 @@ impl Channel for DiscordChannel {
                     &message.recipient,
                     chunk,
                     &local_files,
+                    chunk_reply_to,
                 )
                 .await?;
             } else {
-                send_discord_message_json(&client, &self.bot_token, &message.recipient, chunk)
-                    .await?;
+                send_discord_message_json(
+                    &client,
+                    &self.bot_token,
+                    &message.recipient,
+                    chunk,
+                    chunk_reply_to,
+                )
+                .await?;
             }
 
             if i < chunks.len() - 1 {
@@ -1446,6 +1472,33 @@ impl Channel for DiscordChannel {
 
                     if !self.allow_dm && d.get("guild_id").is_none() {
                         tracing::info!("Discord: ignoring DM (allow_dm = false)");
+                        let dm_channel_id = d
+                            .get("channel_id")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or("");
+                        let dm_message_id = d
+                            .get("id")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or("");
+                        if !dm_channel_id.is_empty() {
+                            let reject_text = "Direct messages aren't supported yet. Please post in the WRSUB channel if you need help there.";
+                            let reply_to = if dm_message_id.is_empty() {
+                                None
+                            } else {
+                                Some(dm_message_id)
+                            };
+                            if let Err(err) = send_discord_message_json(
+                                &self.http_client(),
+                                &self.bot_token,
+                                dm_channel_id,
+                                reject_text,
+                                reply_to,
+                            )
+                            .await
+                            {
+                                tracing::warn!("Discord: failed to send DM rejection: {err}");
+                            }
+                        }
                         continue;
                     }
 
@@ -1557,7 +1610,13 @@ impl Channel for DiscordChannel {
                             .duration_since(std::time::UNIX_EPOCH)
                             .unwrap_or_default()
                             .as_secs(),
-                        thread_ts: None,
+                        // Reused as reply-target msg id (like qq/napcat); history/session
+                        // key functions exclude discord so this won't fragment context.
+                        thread_ts: if message_id.is_empty() {
+                            None
+                        } else {
+                            Some(message_id.to_string())
+                        },
                     };
 
                     if tx.send(channel_msg).await.is_err() {
