@@ -239,6 +239,7 @@ enum ChannelRuntimeCommand {
     ShowModel,
     SetModel(String),
     NewSession,
+    StopInFlight,
     RequestAllToolsOnce,
     RequestToolApproval(String),
     ConfirmToolApproval(String),
@@ -1065,6 +1066,7 @@ fn parse_runtime_command(channel_name: &str, content: &str) -> Option<ChannelRun
     match base_command.as_str() {
         // History reset commands are safe for all channels.
         "/new" | "/clear" => Some(ChannelRuntimeCommand::NewSession),
+        "/stop" => Some(ChannelRuntimeCommand::StopInFlight),
         "/approve-all-once" => Some(ChannelRuntimeCommand::RequestAllToolsOnce),
         "/approve-request" => Some(ChannelRuntimeCommand::RequestToolApproval(tail)),
         "/approve-confirm" => Some(ChannelRuntimeCommand::ConfirmToolApproval(tail)),
@@ -1268,7 +1270,12 @@ fn runtime_defaults_from_config(config: &Config) -> ChannelRuntimeDefaults {
         .channels_config
         .telegram
         .as_ref()
-        .is_some_and(|tg| tg.interrupt_on_new_message);
+        .is_some_and(|tg| tg.interrupt_on_new_message)
+        || config
+            .channels_config
+            .discord
+            .as_ref()
+            .is_some_and(|dc| dc.interrupt_on_new_message);
 
     ChannelRuntimeDefaults {
         default_provider: resolved_default_provider(config),
@@ -2725,6 +2732,12 @@ async fn handle_runtime_command_if_needed(
             clear_sender_history(ctx, &sender_key);
             "Conversation history cleared. Starting fresh.".to_string()
         }
+        ChannelRuntimeCommand::StopInFlight => {
+            // Non-Discord channels fall through here with a plain text
+            // acknowledgement. Discord is intercepted earlier in the dispatch
+            // loop and replies with reactions instead.
+            "No active request to stop.".to_string()
+        }
         ChannelRuntimeCommand::RequestAllToolsOnce => {
             let req = ctx.approval_manager.create_non_cli_pending_request(
                 APPROVAL_ALL_TOOLS_ONCE_TOKEN,
@@ -3707,6 +3720,7 @@ async fn process_channel_message(
     ctx: Arc<ChannelRuntimeContext>,
     msg: traits::ChannelMessage,
     cancellation_token: CancellationToken,
+    received_at: std::time::Instant,
 ) {
     let sender_id = msg.sender.as_str();
     let channel_name = msg.channel.as_str();
@@ -4130,9 +4144,11 @@ If this input is legitimate, rephrase the request and avoid instruction-override
 
     let draft_message_id = if use_streaming {
         if let Some(channel) = target_channel.as_ref() {
+            let placeholder = channel.draft_placeholder();
             match channel
                 .send_draft(
-                    &SendMessage::new("...", &msg.reply_target).in_thread(msg.thread_ts.clone()),
+                    &SendMessage::new(placeholder, &msg.reply_target)
+                        .in_thread(msg.thread_ts.clone()),
                 )
                 .await
             {
@@ -4489,22 +4505,24 @@ If this input is legitimate, rephrase the request and avoid instruction-override
                 truncate_with_ellipsis(&delivered_response, 80)
             );
             if let Some(channel) = target_channel.as_ref() {
+                let display_text =
+                    channel.format_final_display(&delivered_response, received_at.elapsed());
                 if let Some(ref draft_id) = draft_message_id {
                     if let Err(e) = channel
-                        .finalize_draft(&msg.reply_target, draft_id, &delivered_response)
+                        .finalize_draft(&msg.reply_target, draft_id, &display_text)
                         .await
                     {
                         tracing::warn!("Failed to finalize draft: {e}; sending as new message");
                         let _ = channel
                             .send(
-                                &SendMessage::new(&delivered_response, &msg.reply_target)
+                                &SendMessage::new(&display_text, &msg.reply_target)
                                     .in_thread(msg.thread_ts.clone()),
                             )
                             .await;
                     }
                 } else if let Err(e) = channel
                     .send(
-                        &SendMessage::new(delivered_response, &msg.reply_target)
+                        &SendMessage::new(display_text, &msg.reply_target)
                             .in_thread(msg.thread_ts.clone()),
                     )
                     .await
@@ -4751,6 +4769,70 @@ async fn run_message_dispatch_loop(
     let task_sequence = Arc::new(AtomicU64::new(1));
 
     while let Some(msg) = rx.recv().await {
+        let received_at = std::time::Instant::now();
+        // Discord-only inline command intercept: /clear, /new, /stop reply with
+        // reactions instead of text and never hit the agent loop.
+        if msg.channel == "discord" {
+            if let Some(cmd) = parse_runtime_command(&msg.channel, &msg.content) {
+                if matches!(
+                    cmd,
+                    ChannelRuntimeCommand::NewSession | ChannelRuntimeCommand::StopInFlight
+                ) {
+                    let scope_key = interruption_scope_key(&msg);
+                    let previous = {
+                        let mut active = in_flight_by_sender.lock().await;
+                        active.remove(&scope_key)
+                    };
+                    let had_prev = previous.is_some();
+                    if let Some(previous) = previous {
+                        tracing::info!(
+                            channel = %msg.channel,
+                            sender = %msg.sender,
+                            cmd = ?cmd,
+                            "Interrupted in-flight request via slash command"
+                        );
+                        previous.cancellation.cancel();
+                        previous.completion.wait().await;
+                    }
+                    let channel_ref = ctx.channels_by_name.get(&msg.channel).cloned();
+                    match cmd {
+                        ChannelRuntimeCommand::NewSession => {
+                            let sender_key = conversation_history_key(&msg);
+                            clear_sender_history(ctx.as_ref(), &sender_key);
+                            if let Some(ch) = channel_ref.as_ref() {
+                                if let Err(err) = ch
+                                    .add_reaction(&msg.reply_target, &msg.id, "\u{1F9F9}")
+                                    .await
+                                {
+                                    tracing::debug!(
+                                        "Failed to add /clear reaction on discord: {err}"
+                                    );
+                                }
+                            }
+                        }
+                        ChannelRuntimeCommand::StopInFlight => {
+                            if let Some(ch) = channel_ref.as_ref() {
+                                let emoji = if had_prev {
+                                    "\u{23F9}\u{FE0F}"
+                                } else {
+                                    "\u{1F4A4}"
+                                };
+                                if let Err(err) =
+                                    ch.add_reaction(&msg.reply_target, &msg.id, emoji).await
+                                {
+                                    tracing::debug!(
+                                        "Failed to add /stop reaction on discord: {err}"
+                                    );
+                                }
+                            }
+                        }
+                        _ => unreachable!(),
+                    }
+                    continue;
+                }
+            }
+        }
+
         let permit = match Arc::clone(&semaphore).acquire_owned().await {
             Ok(permit) => permit,
             Err(_) => break,
@@ -4763,7 +4845,9 @@ async fn run_message_dispatch_loop(
             let _permit = permit;
             let runtime_defaults = runtime_defaults_snapshot(worker_ctx.as_ref());
             let interrupt_enabled = runtime_defaults.interrupt_on_new_message
-                && (msg.channel == "telegram" || msg.channel == "wecom");
+                && (msg.channel == "telegram"
+                    || msg.channel == "wecom"
+                    || msg.channel == "discord");
             let sender_scope_key = interruption_scope_key(&msg);
             let cancellation_token = CancellationToken::new();
             let completion = Arc::new(InFlightTaskCompletion::new());
@@ -4793,7 +4877,13 @@ async fn run_message_dispatch_loop(
                 }
             }
 
-            Box::pin(process_channel_message(worker_ctx, msg, cancellation_token)).await;
+            Box::pin(process_channel_message(
+                worker_ctx,
+                msg,
+                cancellation_token,
+                received_at,
+            ))
+            .await;
 
             if interrupt_enabled {
                 let mut active = in_flight.lock().await;
@@ -6262,7 +6352,12 @@ pub async fn start_channels(config: Config) -> Result<()> {
         .channels_config
         .telegram
         .as_ref()
-        .is_some_and(|tg| tg.interrupt_on_new_message);
+        .is_some_and(|tg| tg.interrupt_on_new_message)
+        || config
+            .channels_config
+            .discord
+            .as_ref()
+            .is_some_and(|dc| dc.interrupt_on_new_message);
     let telegram_progress_mode = config
         .channels_config
         .telegram
@@ -7534,6 +7629,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 thread_ts: None,
             },
             CancellationToken::new(),
+            std::time::Instant::now(),
         )
         .await;
 
@@ -7622,6 +7718,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 thread_ts: None,
             },
             CancellationToken::new(),
+            std::time::Instant::now(),
         )
         .await;
 
@@ -7697,6 +7794,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 thread_ts: None,
             },
             CancellationToken::new(),
+            std::time::Instant::now(),
         )
         .await;
 
@@ -7786,6 +7884,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 thread_ts: None,
             },
             CancellationToken::new(),
+            std::time::Instant::now(),
         )
         .await;
 
@@ -7874,6 +7973,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 thread_ts: None,
             },
             CancellationToken::new(),
+            std::time::Instant::now(),
         )
         .await;
 
@@ -7947,6 +8047,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 thread_ts: None,
             },
             CancellationToken::new(),
+            std::time::Instant::now(),
         )
         .await;
 
@@ -8022,6 +8123,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 thread_ts: None,
             },
             CancellationToken::new(),
+            std::time::Instant::now(),
         )
         .await;
 
@@ -8099,6 +8201,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 thread_ts: None,
             },
             CancellationToken::new(),
+            std::time::Instant::now(),
         )
         .await;
 
@@ -8219,6 +8322,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 thread_ts: None,
             },
             CancellationToken::new(),
+            std::time::Instant::now(),
         )
         .await;
 
@@ -8346,6 +8450,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 thread_ts: None,
             },
             CancellationToken::new(),
+            std::time::Instant::now(),
         )
         .await;
 
@@ -8436,6 +8541,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 thread_ts: None,
             },
             CancellationToken::new(),
+            std::time::Instant::now(),
         )
         .await;
 
@@ -8517,6 +8623,7 @@ BTC is currently around $65,000 based on latest tool output."#
                     thread_ts: None,
                 },
                 CancellationToken::new(),
+                std::time::Instant::now(),
             )
             .await;
         });
@@ -8549,6 +8656,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 thread_ts: None,
             },
             CancellationToken::new(),
+            std::time::Instant::now(),
         )
         .await;
 
@@ -8686,6 +8794,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 thread_ts: None,
             },
             CancellationToken::new(),
+            std::time::Instant::now(),
         )
         .await;
 
@@ -8796,6 +8905,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 thread_ts: None,
             },
             CancellationToken::new(),
+            std::time::Instant::now(),
         )
         .await;
 
@@ -8907,6 +9017,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 thread_ts: None,
             },
             CancellationToken::new(),
+            std::time::Instant::now(),
         )
         .await;
 
@@ -9000,6 +9111,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 thread_ts: None,
             },
             CancellationToken::new(),
+            std::time::Instant::now(),
         )
         .await;
 
@@ -9103,6 +9215,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 thread_ts: None,
             },
             CancellationToken::new(),
+            std::time::Instant::now(),
         )
         .await;
 
@@ -9207,6 +9320,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 thread_ts: None,
             },
             CancellationToken::new(),
+            std::time::Instant::now(),
         )
         .await;
 
@@ -9241,6 +9355,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 thread_ts: None,
             },
             CancellationToken::new(),
+            std::time::Instant::now(),
         )
         .await;
 
@@ -9364,6 +9479,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 thread_ts: None,
             },
             CancellationToken::new(),
+            std::time::Instant::now(),
         )
         .await;
 
@@ -9457,6 +9573,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 thread_ts: None,
             },
             CancellationToken::new(),
+            std::time::Instant::now(),
         )
         .await;
 
@@ -9491,6 +9608,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 thread_ts: None,
             },
             CancellationToken::new(),
+            std::time::Instant::now(),
         )
         .await;
 
@@ -9608,6 +9726,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 thread_ts: None,
             },
             CancellationToken::new(),
+            std::time::Instant::now(),
         )
         .await;
 
@@ -9729,6 +9848,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 thread_ts: None,
             },
             CancellationToken::new(),
+            std::time::Instant::now(),
         )
         .await;
 
@@ -9830,6 +9950,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 thread_ts: None,
             },
             CancellationToken::new(),
+            std::time::Instant::now(),
         )
         .await;
 
@@ -9859,6 +9980,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 thread_ts: None,
             },
             CancellationToken::new(),
+            std::time::Instant::now(),
         )
         .await;
 
@@ -9950,6 +10072,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 thread_ts: None,
             },
             CancellationToken::new(),
+            std::time::Instant::now(),
         )
         .await;
 
@@ -9978,6 +10101,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 thread_ts: None,
             },
             CancellationToken::new(),
+            std::time::Instant::now(),
         )
         .await;
 
@@ -10071,6 +10195,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 thread_ts: None,
             },
             CancellationToken::new(),
+            std::time::Instant::now(),
         )
         .await;
 
@@ -10151,6 +10276,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 thread_ts: None,
             },
             CancellationToken::new(),
+            std::time::Instant::now(),
         )
         .await;
 
@@ -10262,6 +10388,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 thread_ts: None,
             },
             CancellationToken::new(),
+            std::time::Instant::now(),
         )
         .await;
 
@@ -10667,6 +10794,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 thread_ts: None,
             },
             CancellationToken::new(),
+            std::time::Instant::now(),
         )
         .await;
 
@@ -10736,6 +10864,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 thread_ts: None,
             },
             CancellationToken::new(),
+            std::time::Instant::now(),
         )
         .await;
 
@@ -11198,6 +11327,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 thread_ts: None,
             },
             CancellationToken::new(),
+            std::time::Instant::now(),
         )
         .await;
 
@@ -11268,6 +11398,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 thread_ts: None,
             },
             CancellationToken::new(),
+            std::time::Instant::now(),
         )
         .await;
 
@@ -11964,6 +12095,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 thread_ts: None,
             },
             CancellationToken::new(),
+            std::time::Instant::now(),
         )
         .await;
 
@@ -11979,6 +12111,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 thread_ts: None,
             },
             CancellationToken::new(),
+            std::time::Instant::now(),
         )
         .await;
 
@@ -12061,6 +12194,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 thread_ts: Some("req-1".to_string()),
             },
             CancellationToken::new(),
+            std::time::Instant::now(),
         )
         .await;
 
@@ -12076,6 +12210,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 thread_ts: Some("req-2".to_string()),
             },
             CancellationToken::new(),
+            std::time::Instant::now(),
         )
         .await;
 
@@ -12154,6 +12289,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 thread_ts: Some("msg-1".to_string()),
             },
             CancellationToken::new(),
+            std::time::Instant::now(),
         )
         .await;
 
@@ -12169,6 +12305,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 thread_ts: Some("msg-2".to_string()),
             },
             CancellationToken::new(),
+            std::time::Instant::now(),
         )
         .await;
 
@@ -12250,6 +12387,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 thread_ts: None,
             },
             CancellationToken::new(),
+            std::time::Instant::now(),
         )
         .await;
 
@@ -12350,6 +12488,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 thread_ts: None,
             },
             CancellationToken::new(),
+            std::time::Instant::now(),
         )
         .await;
 
@@ -13232,6 +13371,7 @@ BTC is currently around $65,000 based on latest tool output."#;
                 thread_ts: None,
             },
             CancellationToken::new(),
+            std::time::Instant::now(),
         )
         .await;
 
@@ -13308,6 +13448,7 @@ BTC is currently around $65,000 based on latest tool output."#;
                 thread_ts: None,
             },
             CancellationToken::new(),
+            std::time::Instant::now(),
         )
         .await;
 
@@ -13323,6 +13464,7 @@ BTC is currently around $65,000 based on latest tool output."#;
                 thread_ts: None,
             },
             CancellationToken::new(),
+            std::time::Instant::now(),
         )
         .await;
 

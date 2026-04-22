@@ -1862,6 +1862,27 @@ impl Channel for DiscordChannel {
         true
     }
 
+    fn draft_placeholder(&self) -> String {
+        "\u{23F3} Processing\u{2026}\n-# `/clear` \u{00B7} `/new` \u{00B7} `/stop`".to_string()
+    }
+
+    fn format_final_display(&self, content: &str, elapsed: std::time::Duration) -> String {
+        let secs = elapsed.as_secs_f64();
+        let footer = if secs < 60.0 {
+            format!("-# \u{23F1} {secs:.1}s")
+        } else {
+            let mins = (secs / 60.0) as u64;
+            let rem = (secs as u64) % 60;
+            format!("-# \u{23F1} {mins}m {rem}s")
+        };
+        let trimmed = content.trim_end();
+        if trimmed.is_empty() {
+            footer
+        } else {
+            format!("{trimmed}\n\n{footer}")
+        }
+    }
+
     async fn send_draft(&self, message: &SendMessage) -> anyhow::Result<Option<String>> {
         let initial_text = if message.content.is_empty() {
             "...".to_string()

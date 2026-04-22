@@ -4814,6 +4814,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     mention_only: false,
                     allow_dm: true,
                     dm_reject_message: None,
+                    interrupt_on_new_message: false,
                     group_reply: None,
                 });
             }

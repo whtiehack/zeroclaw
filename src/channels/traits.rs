@@ -89,6 +89,19 @@ pub trait Channel: Send + Sync {
         false
     }
 
+    /// Initial placeholder text to show while a draft message is being streamed.
+    /// Channels may override to surface command hints or richer waiting indicators.
+    fn draft_placeholder(&self) -> String {
+        "...".to_string()
+    }
+
+    /// Decorate the final response before it is shipped via finalize_draft or send.
+    /// Default returns the content unchanged. Channels may append timing/metadata
+    /// that must not enter conversation history (history callers use the raw text).
+    fn format_final_display(&self, content: &str, _elapsed: std::time::Duration) -> String {
+        content.to_string()
+    }
+
     /// Send an initial draft message. Returns a platform-specific message ID for later edits.
     async fn send_draft(&self, _message: &SendMessage) -> anyhow::Result<Option<String>> {
         Ok(None)

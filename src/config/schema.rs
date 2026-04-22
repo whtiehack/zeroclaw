@@ -5025,6 +5025,10 @@ pub struct DiscordConfig {
     /// guild/channel URLs. `None` = silently drop (no user-visible reply).
     #[serde(default)]
     pub dm_reject_message: Option<String>,
+    /// When true, a newer Discord message from the same sender in the same channel
+    /// cancels the in-flight agent run before starting the new one.
+    #[serde(default)]
+    pub interrupt_on_new_message: bool,
     /// Group-chat trigger controls.
     #[serde(default)]
     pub group_reply: Option<GroupReplyConfig>,
@@ -11338,6 +11342,7 @@ denied_tools = ["shell"]
             mention_only: false,
             allow_dm: true,
             dm_reject_message: None,
+            interrupt_on_new_message: false,
             group_reply: None,
         };
         let json = serde_json::to_string(&dc).unwrap();
@@ -11356,6 +11361,7 @@ denied_tools = ["shell"]
             mention_only: false,
             allow_dm: true,
             dm_reject_message: None,
+            interrupt_on_new_message: false,
             group_reply: None,
         };
         let json = serde_json::to_string(&dc).unwrap();
