@@ -1268,6 +1268,160 @@ fn acknowledge_interaction_nonblocking(
     });
 }
 
+/// Prefix used for ChannelMessage ids synthesised from Discord slash commands.
+/// The dispatch loop checks this to skip reaction-style feedback (the user has
+/// already received an ephemeral response from the interaction callback).
+pub(crate) const DISCORD_SLASH_COMMAND_MSG_ID_PREFIX: &str = "discord_slash_";
+
+/// Parse a Discord `INTERACTION_CREATE` application-command (type=2) event into
+/// a synthetic text-command ChannelMessage the dispatch loop can reuse.
+fn try_parse_slash_command_interaction(
+    d: &serde_json::Value,
+) -> Option<(ChannelMessage, String, String, &'static str)> {
+    let interaction_type = d.get("type").and_then(serde_json::Value::as_u64)?;
+    if interaction_type != 2 {
+        return None;
+    }
+
+    let interaction_id = d.get("id").and_then(serde_json::Value::as_str)?.to_string();
+    let interaction_token = d
+        .get("token")
+        .and_then(serde_json::Value::as_str)?
+        .to_string();
+
+    let command_name = d
+        .get("data")
+        .and_then(|data| data.get("name"))
+        .and_then(serde_json::Value::as_str)?;
+
+    let (synthetic_content, command_ident) = match command_name {
+        "clear" => ("/clear", "clear"),
+        "new" => ("/new", "new"),
+        "stop" => ("/stop", "stop"),
+        _ => return None,
+    };
+
+    let user = d
+        .get("member")
+        .and_then(|member| member.get("user"))
+        .or_else(|| d.get("user"))?;
+    let user_id = user
+        .get("id")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("unknown");
+
+    let channel_id = d
+        .get("channel_id")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+
+    let message = ChannelMessage {
+        id: format!("{DISCORD_SLASH_COMMAND_MSG_ID_PREFIX}{interaction_id}"),
+        sender: user_id.to_string(),
+        reply_target: if channel_id.is_empty() {
+            user_id.to_string()
+        } else {
+            channel_id.to_string()
+        },
+        content: synthetic_content.to_string(),
+        channel: "discord".to_string(),
+        timestamp: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs(),
+        thread_ts: None,
+    };
+
+    Some((message, interaction_id, interaction_token, command_ident))
+}
+
+/// Respond to a slash command with an immediate ephemeral message
+/// (CHANNEL_MESSAGE_WITH_SOURCE, flags=64). Must be called within 3 seconds of
+/// receiving the interaction.
+fn ack_slash_command_ephemeral_nonblocking(
+    client: reqwest::Client,
+    interaction_id: String,
+    interaction_token: String,
+    content: String,
+) {
+    tokio::spawn(async move {
+        let url = format!(
+            "https://discord.com/api/v10/interactions/{interaction_id}/{interaction_token}/callback"
+        );
+        let body = json!({
+            "type": 4,
+            "data": {
+                "content": content,
+                "flags": 64_u32,
+            }
+        });
+        if let Err(err) = client.post(&url).json(&body).send().await {
+            tracing::debug!("Discord: failed to ack slash command: {err}");
+        }
+    });
+}
+
+/// Bulk-register the WRSUB slash commands for a guild. Uses PUT semantics so
+/// the registration is idempotent and reflects exactly the commands defined
+/// here (stale registrations are removed on startup).
+async fn register_wrsub_slash_commands(
+    client: &reqwest::Client,
+    bot_token: &str,
+    app_id: &str,
+    guild_id: Option<&str>,
+) {
+    let commands = json!([
+        {
+            "name": "clear",
+            "description": "Clear this conversation's history and start fresh.",
+            "type": 1,
+        },
+        {
+            "name": "new",
+            "description": "Start a new conversation (same as /clear).",
+            "type": 1,
+        },
+        {
+            "name": "stop",
+            "description": "Interrupt the bot's current response, if any.",
+            "type": 1,
+        },
+    ]);
+
+    let url = if let Some(gid) = guild_id {
+        format!("https://discord.com/api/v10/applications/{app_id}/guilds/{gid}/commands")
+    } else {
+        format!("https://discord.com/api/v10/applications/{app_id}/commands")
+    };
+
+    match client
+        .put(&url)
+        .header("Authorization", format!("Bot {bot_token}"))
+        .json(&commands)
+        .send()
+        .await
+    {
+        Ok(resp) => {
+            let status = resp.status();
+            if status.is_success() {
+                tracing::info!(
+                    "Discord: registered slash commands (/clear, /new, /stop) on {}",
+                    guild_id.map_or("global", |_| "guild")
+                );
+            } else {
+                let body = resp.text().await.unwrap_or_default();
+                tracing::warn!(
+                    "Discord: slash command registration failed ({status}): {}",
+                    body.chars().take(300).collect::<String>()
+                );
+            }
+        }
+        Err(err) => {
+            tracing::warn!("Discord: slash command registration request failed: {err}");
+        }
+    }
+}
+
 /// Minimal base64 decode (no extra dep) — only needs to decode the user ID portion
 #[allow(clippy::cast_possible_truncation)]
 fn base64_decode(input: &str) -> Option<String> {
@@ -1446,6 +1600,22 @@ impl Channel for DiscordChannel {
 
         tracing::info!("Discord: connected and identified");
 
+        // Register WRSUB slash commands once per connection. Idempotent (PUT
+        // semantics). Non-fatal on failure.
+        if !bot_user_id.is_empty() {
+            register_wrsub_slash_commands(
+                &self.http_client(),
+                &self.bot_token,
+                &bot_user_id,
+                self.guild_id.as_deref(),
+            )
+            .await;
+        } else {
+            tracing::warn!(
+                "Discord: bot_user_id empty; skipping slash command registration"
+            );
+        }
+
         // Track the last sequence number for heartbeats and resume.
         // Only accessed in the select! loop below, so a plain i64 suffices.
         let mut sequence: i64 = -1;
@@ -1519,9 +1689,54 @@ impl Channel for DiscordChannel {
 
                     let event_type = event.get("t").and_then(|t| t.as_str()).unwrap_or("");
 
-                    // Handle button interaction callbacks for tool approvals.
+                    // Handle slash command and button interaction callbacks.
                     if event_type == "INTERACTION_CREATE" {
                         if let Some(d) = event.get("d") {
+                            // Slash commands (application command, type=2)
+                            if let Some((
+                                channel_msg,
+                                interaction_id,
+                                interaction_token,
+                                command_ident,
+                            )) = try_parse_slash_command_interaction(d)
+                            {
+                                if !self.is_user_allowed(&channel_msg.sender) {
+                                    tracing::warn!(
+                                        "Discord: ignoring slash command from unauthorized user: {}",
+                                        channel_msg.sender
+                                    );
+                                    ack_slash_command_ephemeral_nonblocking(
+                                        self.http_client(),
+                                        interaction_id,
+                                        interaction_token,
+                                        "You are not authorized to use this command."
+                                            .to_string(),
+                                    );
+                                    continue;
+                                }
+
+                                let ack_content = match command_ident {
+                                    "clear" | "new" => {
+                                        "\u{1F9F9} Conversation history cleared.".to_string()
+                                    }
+                                    "stop" => {
+                                        "\u{23F9}\u{FE0F} Stop signal sent.".to_string()
+                                    }
+                                    _ => "Command received.".to_string(),
+                                };
+                                ack_slash_command_ephemeral_nonblocking(
+                                    self.http_client(),
+                                    interaction_id,
+                                    interaction_token,
+                                    ack_content,
+                                );
+
+                                if tx.send(channel_msg).await.is_err() {
+                                    break;
+                                }
+                                continue;
+                            }
+
                             if let Some((channel_msg, interaction_id, interaction_token)) =
                                 try_parse_approval_interaction(d)
                             {

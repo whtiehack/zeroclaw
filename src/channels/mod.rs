@@ -4795,34 +4795,43 @@ async fn run_message_dispatch_loop(
                         previous.completion.wait().await;
                     }
                     let channel_ref = ctx.channels_by_name.get(&msg.channel).cloned();
+                    // Slash-command-sourced messages already received an
+                    // ephemeral callback reply from discord.rs, and there is
+                    // no real text message to react to.
+                    let is_slash_invocation =
+                        msg.id.starts_with(discord::DISCORD_SLASH_COMMAND_MSG_ID_PREFIX);
                     match cmd {
                         ChannelRuntimeCommand::NewSession => {
                             let sender_key = conversation_history_key(&msg);
                             clear_sender_history(ctx.as_ref(), &sender_key);
-                            if let Some(ch) = channel_ref.as_ref() {
-                                if let Err(err) = ch
-                                    .add_reaction(&msg.reply_target, &msg.id, "\u{1F9F9}")
-                                    .await
-                                {
-                                    tracing::debug!(
-                                        "Failed to add /clear reaction on discord: {err}"
-                                    );
+                            if !is_slash_invocation {
+                                if let Some(ch) = channel_ref.as_ref() {
+                                    if let Err(err) = ch
+                                        .add_reaction(&msg.reply_target, &msg.id, "\u{1F9F9}")
+                                        .await
+                                    {
+                                        tracing::debug!(
+                                            "Failed to add /clear reaction on discord: {err}"
+                                        );
+                                    }
                                 }
                             }
                         }
                         ChannelRuntimeCommand::StopInFlight => {
-                            if let Some(ch) = channel_ref.as_ref() {
-                                let emoji = if had_prev {
-                                    "\u{23F9}\u{FE0F}"
-                                } else {
-                                    "\u{1F4A4}"
-                                };
-                                if let Err(err) =
-                                    ch.add_reaction(&msg.reply_target, &msg.id, emoji).await
-                                {
-                                    tracing::debug!(
-                                        "Failed to add /stop reaction on discord: {err}"
-                                    );
+                            if !is_slash_invocation {
+                                if let Some(ch) = channel_ref.as_ref() {
+                                    let emoji = if had_prev {
+                                        "\u{23F9}\u{FE0F}"
+                                    } else {
+                                        "\u{1F4A4}"
+                                    };
+                                    if let Err(err) =
+                                        ch.add_reaction(&msg.reply_target, &msg.id, emoji).await
+                                    {
+                                        tracing::debug!(
+                                            "Failed to add /stop reaction on discord: {err}"
+                                        );
+                                    }
                                 }
                             }
                         }
