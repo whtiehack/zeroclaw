@@ -1441,6 +1441,27 @@ fn parse_native_response_none_reasoning_content_for_normal_model() {
 }
 
 #[test]
+fn stream_delta_accepts_reasoning_alias() {
+    // OpenRouter streams thinking in `reasoning`; Moonshot native uses
+    // `reasoning_content`. Both must deserialize into reasoning_content.
+    let or_chunk = r#"{"content":"","reasoning":"I need to check"}"#;
+    let moonshot_chunk = r#"{"content":"","reasoning_content":"Let me think"}"#;
+
+    let or_delta: StreamDelta = serde_json::from_str(or_chunk).unwrap();
+    assert_eq!(or_delta.reasoning_content.as_deref(), Some("I need to check"));
+
+    let m_delta: StreamDelta = serde_json::from_str(moonshot_chunk).unwrap();
+    assert_eq!(m_delta.reasoning_content.as_deref(), Some("Let me think"));
+}
+
+#[test]
+fn response_message_accepts_reasoning_alias() {
+    let or_json = r#"{"content":"","reasoning":"thoughts here"}"#;
+    let msg: ResponseMessage = serde_json::from_str(or_json).unwrap();
+    assert_eq!(msg.reasoning_content.as_deref(), Some("thoughts here"));
+}
+
+#[test]
 fn convert_messages_for_native_round_trips_reasoning_content() {
     // Simulate stored assistant history JSON that includes reasoning_content
     let history_json = serde_json::json!({

@@ -507,9 +507,10 @@ fn strip_think_tags(s: &str) -> String {
 struct ResponseMessage {
     #[serde(default)]
     content: Option<String>,
-    /// Reasoning/thinking models (e.g. Qwen3, GLM-4) may return their output
-    /// in `reasoning_content` instead of `content`. Used as automatic fallback.
-    #[serde(default)]
+    /// Reasoning/thinking models (e.g. Qwen3, GLM-4, Kimi K2.x) may return
+    /// their output in `reasoning_content` (Moonshot native) or `reasoning`
+    /// (OpenRouter). Used as automatic fallback.
+    #[serde(default, alias = "reasoning")]
     reasoning_content: Option<String>,
     #[serde(default)]
     tool_calls: Option<Vec<ToolCall>>,
@@ -748,8 +749,9 @@ struct StreamChoice {
 struct StreamDelta {
     #[serde(default)]
     content: Option<String>,
-    /// Reasoning/thinking models may stream output via `reasoning_content`.
-    #[serde(default)]
+    /// Reasoning/thinking models may stream output via `reasoning_content`
+    /// (Moonshot native) or `reasoning` (OpenRouter / Kimi via OR).
+    #[serde(default, alias = "reasoning")]
     reasoning_content: Option<String>,
     /// Native tool-calling deltas in OpenAI chat-completions streaming format.
     #[serde(default)]
