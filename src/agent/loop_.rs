@@ -1990,6 +1990,7 @@ struct StreamedChatOutcome {
     response_text: String,
     tool_calls: Vec<ToolCall>,
     forwarded_live_deltas: bool,
+    reasoning_content: String,
 }
 
 async fn consume_provider_streaming_response(
@@ -2054,20 +2055,25 @@ async fn consume_provider_streaming_response(
                 // to response_text — reasoning should be visible during
                 // streaming yet stay out of session history and final reply.
                 if let Some(reasoning_text) = chunk.reasoning.as_deref() {
-                    if !reasoning_text.is_empty() && !suppress_forwarding {
-                        if let Some(tx) = delta_sender {
-                            if !outcome.forwarded_live_deltas {
-                                let _ = tx.send(DraftEvent::Clear).await;
-                                outcome.forwarded_live_deltas = true;
-                            }
-                            if tx
-                                .send(DraftEvent::Content(reasoning_text.to_string()))
-                                .await
-                                .is_err()
-                            {
-                                delta_sender = None;
-                            } else {
-                                reasoning_streamed = true;
+                    if !reasoning_text.is_empty() {
+                        // Accumulate for history round-trip: Kimi/GLM require
+                        // reasoning_content on assistant(tool_calls) replay.
+                        outcome.reasoning_content.push_str(reasoning_text);
+                        if !suppress_forwarding {
+                            if let Some(tx) = delta_sender {
+                                if !outcome.forwarded_live_deltas {
+                                    let _ = tx.send(DraftEvent::Clear).await;
+                                    outcome.forwarded_live_deltas = true;
+                                }
+                                if tx
+                                    .send(DraftEvent::Content(reasoning_text.to_string()))
+                                    .await
+                                    .is_err()
+                                {
+                                    delta_sender = None;
+                                } else {
+                                    reasoning_streamed = true;
+                                }
                             }
                         }
                     }
@@ -2570,11 +2576,16 @@ pub(crate) async fn run_tool_call_loop(
             {
                 Ok(streamed) => {
                     streamed_live_deltas = streamed.forwarded_live_deltas;
+                    let reasoning_content = if streamed.reasoning_content.is_empty() {
+                        None
+                    } else {
+                        Some(streamed.reasoning_content)
+                    };
                     Ok(crate::providers::ChatResponse {
                         text: Some(streamed.response_text),
                         tool_calls: streamed.tool_calls,
                         usage: None,
-                        reasoning_content: None,
+                        reasoning_content,
                     })
                 }
                 Err(stream_err) => {

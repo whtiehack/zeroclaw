@@ -1387,10 +1387,22 @@ impl OpenAiCompatibleProvider {
         MessageContent::Parts(parts)
     }
 
+    /// Models that mandate a non-empty `reasoning_content` on every
+    /// assistant message carrying `tool_calls` (currently Kimi K2.x and
+    /// GLM-4.x families). When replaying history produced by a different
+    /// model (or by a past turn before reasoning was captured), we must
+    /// inject a placeholder or upstream returns 400.
+    fn model_requires_reasoning_replay(model: &str) -> bool {
+        let m = model.to_ascii_lowercase();
+        m.starts_with("kimi") || m.starts_with("glm")
+    }
+
     fn convert_messages_for_native(
         messages: &[ChatMessage],
         allow_user_image_parts: bool,
+        model: &str,
     ) -> Vec<NativeMessage> {
+        let inject_reasoning_placeholder = Self::model_requires_reasoning_replay(model);
         messages
             .iter()
             .map(|message| {
@@ -1423,10 +1435,21 @@ impl OpenAiCompatibleProvider {
                                     .and_then(serde_json::Value::as_str)
                                     .map(|value| MessageContent::Text(value.to_string()));
 
-                                let reasoning_content = value
+                                let mut reasoning_content = value
                                     .get("reasoning_content")
                                     .and_then(serde_json::Value::as_str)
                                     .map(ToString::to_string);
+
+                                if inject_reasoning_placeholder
+                                    && !tool_calls.is_empty()
+                                    && reasoning_content
+                                        .as_deref()
+                                        .map(str::is_empty)
+                                        .unwrap_or(true)
+                                {
+                                    reasoning_content =
+                                        Some("(prior reasoning not preserved)".to_string());
+                                }
 
                                 return NativeMessage {
                                     role: "assistant".to_string(),
@@ -1931,6 +1954,7 @@ impl Provider for OpenAiCompatibleProvider {
             messages: Self::convert_messages_for_native(
                 &effective_messages,
                 !self.merge_system_into_user,
+                model,
             ),
             temperature,
             stream: Some(false),
@@ -2064,6 +2088,7 @@ impl Provider for OpenAiCompatibleProvider {
                 messages: Self::convert_messages_for_native(
                     &effective_messages,
                     !self.merge_system_into_user,
+                    model,
                 ),
                 temperature,
                 reasoning_effort: self.reasoning_effort.clone(),

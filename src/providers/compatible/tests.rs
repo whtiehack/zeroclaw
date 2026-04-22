@@ -648,7 +648,8 @@ fn convert_messages_for_native_maps_tool_result_payload() {
         r#"{"tool_call_id":"call_abc","content":"done"}"#,
     )];
 
-    let converted = OpenAiCompatibleProvider::convert_messages_for_native(&input, true);
+    let converted =
+        OpenAiCompatibleProvider::convert_messages_for_native(&input, true, "gpt-5.4");
     assert_eq!(converted.len(), 1);
     assert_eq!(converted[0].role, "tool");
     assert_eq!(converted[0].tool_call_id.as_deref(), Some("call_abc"));
@@ -664,7 +665,8 @@ fn convert_messages_for_native_keeps_user_image_markers_as_text_when_disabled() 
         "System primer [IMAGE:data:image/png;base64,abcd] user turn",
     )];
 
-    let converted = OpenAiCompatibleProvider::convert_messages_for_native(&input, false);
+    let converted =
+        OpenAiCompatibleProvider::convert_messages_for_native(&input, false, "gpt-5.4");
     assert_eq!(converted.len(), 1);
     assert_eq!(converted[0].role, "user");
     assert!(matches!(
@@ -1452,7 +1454,8 @@ fn convert_messages_for_native_round_trips_reasoning_content() {
     });
 
     let messages = vec![ChatMessage::assistant(history_json.to_string())];
-    let native = OpenAiCompatibleProvider::convert_messages_for_native(&messages, true);
+    let native =
+        OpenAiCompatibleProvider::convert_messages_for_native(&messages, true, "gpt-5.4");
     assert_eq!(native.len(), 1);
     assert_eq!(native[0].role, "assistant");
     assert_eq!(
@@ -1475,9 +1478,50 @@ fn convert_messages_for_native_no_reasoning_content_when_absent() {
     });
 
     let messages = vec![ChatMessage::assistant(history_json.to_string())];
-    let native = OpenAiCompatibleProvider::convert_messages_for_native(&messages, true);
+    let native =
+        OpenAiCompatibleProvider::convert_messages_for_native(&messages, true, "gpt-5.4");
     assert_eq!(native.len(), 1);
     assert!(native[0].reasoning_content.is_none());
+}
+
+#[test]
+fn convert_messages_for_native_injects_placeholder_for_kimi_when_absent() {
+    let history_json = serde_json::json!({
+        "content": "",
+        "tool_calls": [{"id": "tc_1", "name": "shell", "arguments": "{}"}]
+    });
+    let messages = vec![ChatMessage::assistant(history_json.to_string())];
+
+    let kimi =
+        OpenAiCompatibleProvider::convert_messages_for_native(&messages, true, "kimi-k2.6");
+    assert_eq!(
+        kimi[0].reasoning_content.as_deref(),
+        Some("(prior reasoning not preserved)")
+    );
+
+    let glm = OpenAiCompatibleProvider::convert_messages_for_native(&messages, true, "glm-5.1");
+    assert_eq!(
+        glm[0].reasoning_content.as_deref(),
+        Some("(prior reasoning not preserved)")
+    );
+
+    let gpt =
+        OpenAiCompatibleProvider::convert_messages_for_native(&messages, true, "gpt-5.4");
+    assert!(gpt[0].reasoning_content.is_none());
+}
+
+#[test]
+fn convert_messages_for_native_keeps_existing_reasoning_for_kimi() {
+    let history_json = serde_json::json!({
+        "content": "",
+        "tool_calls": [{"id": "tc_1", "name": "shell", "arguments": "{}"}],
+        "reasoning_content": "genuine thoughts"
+    });
+    let messages = vec![ChatMessage::assistant(history_json.to_string())];
+
+    let kimi =
+        OpenAiCompatibleProvider::convert_messages_for_native(&messages, true, "kimi-k2.6");
+    assert_eq!(kimi[0].reasoning_content.as_deref(), Some("genuine thoughts"));
 }
 
 #[test]
