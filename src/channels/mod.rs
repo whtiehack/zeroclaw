@@ -4559,6 +4559,21 @@ If this input is legitimate, rephrase the request and avoid instruction-override
                         tracing::debug!("Failed to cancel draft on {}: {err}", channel.name());
                     }
                 }
+                // Discord: mark the interrupted user message with ⏹️ so it's
+                // visually obvious which turn was cancelled (covers both /stop
+                // and new-message-arrives-and-interrupts paths).
+                if msg.channel == "discord" {
+                    if let Some(channel) = target_channel.as_ref() {
+                        if let Err(err) = channel
+                            .add_reaction(&msg.reply_target, &msg.id, "\u{23F9}\u{FE0F}")
+                            .await
+                        {
+                            tracing::debug!(
+                                "Failed to add cancellation reaction on discord: {err}"
+                            );
+                        }
+                    }
+                }
             } else if is_context_window_overflow_error(&e) {
                 let compacted = compact_sender_history(ctx.as_ref(), &history_key);
                 let error_text = if compacted {
