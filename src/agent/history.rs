@@ -145,8 +145,15 @@ pub(crate) fn estimate_history_tokens(history: &[ChatMessage]) -> usize {
 
 /// Trim conversation history to prevent unbounded growth.
 /// Preserves the system prompt (first message if role=system) and the most recent messages.
+///
+/// Orphan protection: if the drain boundary would leave a leading `tool`
+/// message whose paired `assistant(tool_calls)` was dropped, extend the
+/// drain past the orphan(s). Strict upstream validators (Moonshot Kimi,
+/// OpenAI Codex Responses) reject such orphans with "tool_call_id not
+/// found" / "no function_call found for call_id". GLM and some others
+/// tolerate it. See also agent.rs::trim_history (CLI path) and
+/// history_pruner.rs::prune_history for equivalent atomic drop logic.
 pub(crate) fn trim_history(history: &mut Vec<ChatMessage>, max_history: usize) {
-    // Nothing to trim if within limit
     let has_system = history.first().map_or(false, |m| m.role == "system");
     let non_system_count = if has_system {
         history.len() - 1
@@ -159,7 +166,14 @@ pub(crate) fn trim_history(history: &mut Vec<ChatMessage>, max_history: usize) {
     }
 
     let start = if has_system { 1 } else { 0 };
-    let to_remove = non_system_count - max_history;
+    let mut to_remove = non_system_count - max_history;
+
+    while start + to_remove < history.len()
+        && history[start + to_remove].role == "tool"
+    {
+        to_remove += 1;
+    }
+
     history.drain(start..start + to_remove);
 }
 

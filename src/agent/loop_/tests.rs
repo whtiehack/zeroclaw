@@ -3960,6 +3960,66 @@ fn trim_history_removes_oldest_non_system() {
     assert_eq!(history[1].content, "new msg");
 }
 
+#[test]
+fn trim_history_avoids_orphan_tool_messages() {
+    // Scenario: drain boundary would land between assistant(tool_calls) and
+    // its paired tool result. Without protection, the tool becomes an orphan
+    // and Moonshot Kimi / OpenAI Codex reject with "tool_call_id not found".
+    let mut history = vec![
+        crate::providers::ChatMessage::system("system"),
+        crate::providers::ChatMessage::user("u1"),
+        crate::providers::ChatMessage::assistant("a1"),
+        crate::providers::ChatMessage::assistant(
+            r#"{"content":null,"tool_calls":[{"id":"call_aaa","name":"shell","arguments":"{}"}]}"#,
+        ),
+        crate::providers::ChatMessage::tool(r#"{"tool_call_id":"call_aaa","content":"ok"}"#),
+        crate::providers::ChatMessage::user("u2"),
+        crate::providers::ChatMessage::assistant("a2"),
+    ];
+    // max=3 naively drains 3 messages (u1, a1, assistant-with-tc), leaving
+    // tool as orphan at index 1. Protection should also drop the tool.
+    trim_history(&mut history, 3);
+    assert_eq!(
+        history[0].role, "system",
+        "system prompt must be preserved"
+    );
+    assert!(
+        history.iter().skip(1).next().map(|m| m.role.as_str()) != Some("tool"),
+        "no leading orphan tool after trim"
+    );
+    // Remaining: system + [u2, a2]; original assistant(tool_calls)+tool pair
+    // is fully dropped together.
+    assert_eq!(history.len(), 3);
+    assert_eq!(history[1].content, "u2");
+}
+
+#[test]
+fn trim_history_drops_consecutive_orphan_tools() {
+    // Parallel tool calls: one assistant message with multiple tool results
+    // following. Drain boundary in the middle must skip all consecutive tools.
+    let mut history = vec![
+        crate::providers::ChatMessage::system("system"),
+        crate::providers::ChatMessage::assistant(
+            r#"{"content":null,"tool_calls":[{"id":"call_a","name":"t","arguments":"{}"},{"id":"call_b","name":"t","arguments":"{}"}]}"#,
+        ),
+        crate::providers::ChatMessage::tool(r#"{"tool_call_id":"call_a","content":"x"}"#),
+        crate::providers::ChatMessage::tool(r#"{"tool_call_id":"call_b","content":"y"}"#),
+        crate::providers::ChatMessage::user("u"),
+        crate::providers::ChatMessage::assistant("a"),
+    ];
+    // max=2 naively drains 3 (assistant+tc, tool_a, tool_b... wait count):
+    // non_system=5, to_remove=3 → drain [1..4] = assistant, tool, tool.
+    // That leaves [system, user, assistant]. Actually that's clean already.
+    // Tweak: max=3 → to_remove=2 → drain [1..3] = assistant, tool (orphans
+    // the second tool at index 3). Protection must extend to drop both tools.
+    trim_history(&mut history, 3);
+    assert_eq!(history[0].role, "system");
+    assert!(
+        history.iter().skip(1).all(|m| m.role != "tool"),
+        "no orphan tools remaining"
+    );
+}
+
 /// When `build_system_prompt_with_mode` is called with `native_tools = true`,
 /// the output must contain ZERO XML protocol artifacts. In the native path
 /// `build_tool_instructions` is never called, so the system prompt alone
