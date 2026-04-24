@@ -106,20 +106,32 @@ pub fn prune_history(messages: &mut Vec<ChatMessage>, config: &HistoryPrunerConf
     // forms an atomic group (tool_use + tool_result pairing). Collapsing only
     // part of the group would orphan tool_use blocks, causing API 400 errors
     // from providers that enforce pairing (e.g., Anthropic). See #4810.
+    //
+    // The group is collapsed only when *every* tool in it is unprotected —
+    // the same all-or-nothing rule Phase 2 uses. If `keep_recent` protects
+    // any tool in the group we skip the whole group. Partial collapse would
+    // leave a protected tool behind whose parent assistant has been
+    // rewritten to a summary with no "tool_calls" marker, which Phase 3's
+    // orphan sweep then evicts — silently violating `keep_recent`. See
+    // #5823.
     if config.collapse_tool_results {
         let mut i = 0;
         while i < messages.len() {
             let protected = protected_indices(messages, config.keep_recent);
             if messages[i].role == "assistant" && !protected[i] {
                 // Count consecutive tool messages following this assistant
+                // and remember whether any of them is protected.
                 let mut tool_count = 0;
+                let mut any_tool_protected = false;
                 while i + 1 + tool_count < messages.len()
                     && messages[i + 1 + tool_count].role == "tool"
-                    && !protected[i + 1 + tool_count]
                 {
+                    if protected[i + 1 + tool_count] {
+                        any_tool_protected = true;
+                    }
                     tool_count += 1;
                 }
-                if tool_count > 0 {
+                if tool_count > 0 && !any_tool_protected {
                     let summary =
                         format!("[Tool exchange: {tool_count} tool call(s) — results collapsed]");
                     messages[i] = ChatMessage {
@@ -130,6 +142,13 @@ pub fn prune_history(messages: &mut Vec<ChatMessage>, config: &HistoryPrunerConf
                         messages.remove(i + 1);
                     }
                     collapsed_pairs += tool_count;
+                    continue;
+                }
+                if tool_count > 0 {
+                    // Protected tool inside the group → skip the whole
+                    // group intact so Phase 3's orphan sweep has no
+                    // pretext to remove those tools.
+                    i += 1 + tool_count;
                     continue;
                 }
             }

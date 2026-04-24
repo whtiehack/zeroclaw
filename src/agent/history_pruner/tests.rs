@@ -285,3 +285,58 @@ fn prune_under_realistic_token_pressure_preserves_tool_pairing() {
         }
     }
 }
+
+/// Regression for #5823:
+///
+/// When `keep_recent` protects the *tail* of a multi-tool group but not
+/// the preceding assistant, Phase 1 used to collapse the unprotected
+/// tools and rewrite the assistant to a summary that no longer contained
+/// `"tool_calls"`. Phase 3's orphan sweep then classified the still-live
+/// protected tool as an orphan (because the new summary does not contain
+/// `"tool_calls"`) and removed it — silently violating `keep_recent`.
+///
+/// After the fix Phase 1 treats the group as atomic: if any tool in it
+/// is protected, the entire group is left intact.
+#[test]
+fn prune_does_not_evict_protected_tool_when_group_straddles_keep_recent() {
+    let mut messages = vec![
+        msg("system", "sys"),
+        msg("user", "query"),
+        msg(
+            "assistant",
+            r#"{"content":null,"tool_calls":[
+                {"id":"t1","name":"shell","arguments":"{}"},
+                {"id":"t2","name":"web","arguments":"{}"}
+            ]}"#,
+        ),
+        msg("tool", r#"{"tool_call_id":"t1","content":"first"}"#),
+        msg(
+            "tool",
+            r#"{"tool_call_id":"t2","content":"PROTECTED second"}"#,
+        ),
+        msg("user", "follow up"),
+        msg("assistant", "final"),
+    ];
+
+    let config = HistoryPrunerConfig {
+        enabled: true,
+        // Budget is well above the estimated token cost so Phase 2 does
+        // not drop anything; this test isolates the Phase 1 / Phase 3
+        // interaction.
+        max_tokens: 100_000,
+        keep_recent: 3,
+        collapse_tool_results: true,
+    };
+
+    let stats = prune_history(&mut messages, &config);
+
+    assert_eq!(stats.messages_before, 7);
+    assert!(
+        messages
+            .iter()
+            .any(|m| m.content.contains("PROTECTED second")),
+        "a tool message protected by keep_recent must survive; \
+         got roles {:?}",
+        messages.iter().map(|m| m.role.as_str()).collect::<Vec<_>>()
+    );
+}
