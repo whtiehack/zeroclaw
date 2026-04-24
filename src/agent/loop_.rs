@@ -3500,6 +3500,7 @@ pub async fn run(
     interactive: bool,
     session_state_file: Option<PathBuf>,
     allowed_tools: Option<Vec<String>>,
+    suppress_memory_recall: bool,
 ) -> Result<String> {
     // ── Wire up agnostic subsystems ──────────────────────────────
     let base_observer = observability::create_observer(&config.observability);
@@ -3940,14 +3941,20 @@ pub async fn run(
                 .await;
         }
 
-        // Inject memory + hardware RAG context into user message
-        let mem_context = build_context(
-            mem.as_ref(),
-            &effective_msg,
-            config.memory.min_relevance_score,
-            memory_session_id.as_deref(),
-        )
-        .await;
+        // Inject memory + hardware RAG context into user message.
+        // Skipped for scheduled tasks (cron / heartbeat) to prevent
+        // unrelated memory context from bleeding into templated prompts.
+        let mem_context = if suppress_memory_recall {
+            String::new()
+        } else {
+            build_context(
+                mem.as_ref(),
+                &effective_msg,
+                config.memory.min_relevance_score,
+                memory_session_id.as_deref(),
+            )
+            .await
+        };
         let rag_limit = if config.agent.compact_context { 2 } else { 5 };
         let hw_context = hardware_rag
             .as_ref()
@@ -4216,14 +4223,19 @@ pub async fn run(
                     .await;
             }
 
-            // Inject memory + hardware RAG context into user message
-            let mem_context = build_context(
-                mem.as_ref(),
-                &effective_input,
-                config.memory.min_relevance_score,
-                memory_session_id.as_deref(),
-            )
-            .await;
+            // Inject memory + hardware RAG context into user message.
+            // Skipped for scheduled tasks (cron / heartbeat).
+            let mem_context = if suppress_memory_recall {
+                String::new()
+            } else {
+                build_context(
+                    mem.as_ref(),
+                    &effective_input,
+                    config.memory.min_relevance_score,
+                    memory_session_id.as_deref(),
+                )
+                .await
+            };
             let rag_limit = if config.agent.compact_context { 2 } else { 5 };
             let hw_context = hardware_rag
                 .as_ref()

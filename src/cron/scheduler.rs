@@ -300,10 +300,16 @@ async fn run_agent_job(
     let prefixed_prompt = format!("{memory_context}[cron:{} {name}] {prompt}", job.id);
     let model_override = job.model.clone();
 
+    // Cron prompts are templated task instructions, not user intent — disable
+    // auto_save so they don't pollute the memories table (aligns with upstream
+    // #5817 "prevent cron memory snowball").
+    let mut cron_config = config.clone();
+    cron_config.memory.auto_save = false;
+
     let run_result = match job.session_target {
         SessionTarget::Main | SessionTarget::Isolated => {
             Box::pin(crate::agent::run(
-                config.clone(),
+                cron_config,
                 Some(prefixed_prompt),
                 None,
                 model_override,
@@ -312,6 +318,7 @@ async fn run_agent_job(
                 false,
                 None,
                 job.allowed_tools.clone(),
+                true,
             ))
             .await
         }
