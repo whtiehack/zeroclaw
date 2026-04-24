@@ -85,6 +85,127 @@ fn protected_indices(messages: &[ChatMessage], keep_recent: usize) -> Vec<bool> 
 }
 
 // ---------------------------------------------------------------------------
+// Orphan tool self-heal
+// ---------------------------------------------------------------------------
+
+/// Remove `tool`-role messages whose `tool_call_id` has no matching
+/// `tool_use` / `tool_calls` entry in a preceding assistant message.
+///
+/// After any history truncation (drain, remove, prune) the first surviving
+/// message(s) may be `tool` results whose assistant request was trimmed away.
+/// The Anthropic API (and others) reject these with a 400 error.
+///
+/// Returns the number of messages removed.
+pub fn remove_orphaned_tool_messages(messages: &mut Vec<ChatMessage>) -> usize {
+    // Pass 1: Remove assistant(tool_calls) + their tool_results when the
+    // assistant is preceded by another assistant. Normalization would merge
+    // them, destroying structured tool_use blocks and orphaning the results.
+    let mut removed = 0usize;
+    let mut i = 0;
+    while i < messages.len() {
+        if messages[i].role == "assistant"
+            && extract_assistant_tool_call_ids(&messages[i].content).is_some()
+            && i > 0
+            && messages[i - 1].role == "assistant"
+        {
+            let doomed_ids =
+                extract_assistant_tool_call_ids(&messages[i].content).unwrap_or_default();
+            messages.remove(i);
+            removed += 1;
+            while i < messages.len() && messages[i].role == "tool" {
+                let dominated = match extract_tool_call_id(&messages[i].content) {
+                    Some(id) => doomed_ids.iter().any(|d| d == &id),
+                    None => true,
+                };
+                if dominated {
+                    messages.remove(i);
+                    removed += 1;
+                } else {
+                    break;
+                }
+            }
+        } else {
+            i += 1;
+        }
+    }
+
+    // Pass 2: Remove remaining orphan tool messages whose tool_call_id
+    // is not in the preceding assistant's structured tool_calls array.
+    // A substring match on the assistant's *text* is NOT sufficient —
+    // compaction summaries are instructed to preserve identifiers, so an
+    // id can appear in prose without an actual tool_use block backing it
+    // (see #5813).
+    i = 0;
+    while i < messages.len() {
+        if messages[i].role != "tool" {
+            i += 1;
+            continue;
+        }
+
+        let assistant_idx = (0..i)
+            .rev()
+            .take_while(|&j| messages[j].role == "assistant" || messages[j].role == "tool")
+            .find(|&j| messages[j].role == "assistant");
+
+        let is_orphan = match assistant_idx {
+            None => true,
+            Some(idx) => match extract_assistant_tool_call_ids(&messages[idx].content) {
+                None => true,
+                Some(ids) => match extract_tool_call_id(&messages[i].content) {
+                    Some(tool_call_id) => !ids.iter().any(|id| id == &tool_call_id),
+                    None => false,
+                },
+            },
+        };
+
+        if is_orphan {
+            messages.remove(i);
+            removed += 1;
+        } else {
+            i += 1;
+        }
+    }
+    if removed > 0 {
+        tracing::warn!(
+            count = removed,
+            "Removed {removed} orphaned tool message(s) from history — this indicates a prior \
+             tool_use/tool_result pairing inconsistency that was auto-healed"
+        );
+    }
+    removed
+}
+
+/// Try to extract a `tool_call_id` from a tool-role message's JSON content.
+///
+/// Tool messages are stored as JSON like:
+/// `{"content": "...", "tool_call_id": "toolu_01Abc..."}`
+fn extract_tool_call_id(content: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(content).ok()?;
+    value
+        .get("tool_call_id")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+}
+
+/// Extract the list of structured tool-call IDs an assistant message
+/// is claiming to have invoked, if any. Returns `None` when the content
+/// does not parse as a JSON object with a `tool_calls` array — meaning the
+/// assistant has no native tool_use blocks backing any tool_results.
+fn extract_assistant_tool_call_ids(content: &str) -> Option<Vec<String>> {
+    let value: serde_json::Value = serde_json::from_str(content).ok()?;
+    let arr = value.get("tool_calls")?.as_array()?;
+    let ids: Vec<String> = arr
+        .iter()
+        .filter_map(|call| call.get("id").and_then(|v| v.as_str()).map(str::to_owned))
+        .collect();
+    if ids.is_empty() {
+        None
+    } else {
+        Some(ids)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Public entry point
 // ---------------------------------------------------------------------------
 

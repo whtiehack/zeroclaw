@@ -486,15 +486,42 @@ fn align_boundary_forward(messages: &[ChatMessage], idx: usize) -> usize {
     i
 }
 
-/// Move boundary backward past any tool_call-bearing assistant messages at the end
-/// so their results stay in the protected tail.
+/// Move the tail boundary backward past any orphan-creating split.
+///
+/// First step past any leading `tool` messages — their owning assistant
+/// is earlier and must travel with them into the protected tail.
+///
+/// Second, if we land on an assistant that owns `tool_calls`, back up
+/// past it as well. Otherwise that assistant gets summarized while its
+/// already-protected `tool_result` blocks remain in the tail, creating
+/// the 400 "unexpected tool_use_id in tool_result blocks" failure mode
+/// at the root of #5813.
 fn align_boundary_backward(messages: &[ChatMessage], idx: usize) -> usize {
     let mut i = idx;
-    // If the message just before the boundary is an assistant message that likely
-    // contains tool calls (heuristic: followed by a tool result), pull the boundary back.
-    while i > 0 && i < messages.len() && messages[i].role == "tool" {
-        // The tool result at `i` belongs to a tool_call before it — move boundary past it
-        i -= 1;
+    loop {
+        while i > 0 && i < messages.len() && messages[i].role == "tool" {
+            i -= 1;
+        }
+        if i >= messages.len() {
+            break;
+        }
+        let is_tool_call_assistant = messages[i].role == "assistant"
+            && serde_json::from_str::<serde_json::Value>(&messages[i].content)
+                .ok()
+                .and_then(|v| {
+                    v.get("tool_calls")
+                        .and_then(|a| a.as_array())
+                        .map(|a| !a.is_empty())
+                })
+                .unwrap_or(false);
+        if is_tool_call_assistant {
+            if i == 0 {
+                break;
+            }
+            i -= 1;
+            continue;
+        }
+        break;
     }
     i
 }

@@ -208,6 +208,14 @@ pub(crate) fn load_interactive_session_history(
         state.history.insert(0, ChatMessage::system(system_prompt));
     }
 
+    // Self-heal persisted sessions that were written with orphaned
+    // tool_result messages (e.g. a crash mid-compaction, or a trim that
+    // dropped the assistant tool_use block but left its tool_result).
+    // Without this the next API call fails with 400 "unexpected tool_use_id
+    // found in tool_result blocks" and the session stays bricked until the
+    // file is deleted. See #5813.
+    crate::agent::history_pruner::remove_orphaned_tool_messages(&mut state.history);
+
     Ok(state.history)
 }
 

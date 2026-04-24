@@ -276,3 +276,45 @@ fn test_fast_trim_disabled_when_zero() {
     let saved = compressor.fast_trim_tool_results(&mut history);
     assert_eq!(saved, 0);
 }
+
+/// Regression test for the root-cause #5813 fix: when the tail
+/// boundary lands on an assistant with `tool_calls`, the function
+/// must back up past it so the assistant travels with its
+/// `tool_result` blocks into the protected tail. Otherwise the
+/// assistant gets summarized while its results survive, creating an
+/// orphan and producing the 400 "unexpected tool_use_id" failure.
+#[test]
+fn test_align_boundary_backward_backs_up_past_tool_call_assistant() {
+    let messages = vec![
+        msg("system", "sys"),
+        msg("user", "q1"),
+        msg("assistant", "old reply 1"),
+        msg("user", "q2"),
+        msg(
+            "assistant",
+            r#"{"content":null,"tool_calls":[{"id":"toolu_X","name":"shell","arguments":"{}"}]}"#,
+        ),
+        msg("tool", r#"{"tool_call_id":"toolu_X","content":"result"}"#),
+        msg("user", "follow-up"),
+    ];
+    // Initial boundary lands on the assistant(tool_calls) at index 4.
+    // The function must back up past it so the pair stays in the tail.
+    let aligned = align_boundary_backward(&messages, 4);
+    assert!(
+        aligned < 4,
+        "boundary should retreat past assistant(tool_calls) at idx 4, got {aligned}"
+    );
+}
+
+#[test]
+fn test_align_boundary_backward_noop_on_plain_assistant() {
+    let messages = vec![
+        msg("system", "sys"),
+        msg("user", "q"),
+        msg("assistant", "plain text reply"),
+        msg("user", "next"),
+    ];
+    // No tool_calls on the assistant — boundary should not retreat.
+    let aligned = align_boundary_backward(&messages, 2);
+    assert_eq!(aligned, 2);
+}

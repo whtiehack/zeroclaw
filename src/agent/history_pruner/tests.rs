@@ -286,6 +286,34 @@ fn prune_under_realistic_token_pressure_preserves_tool_pairing() {
     }
 }
 
+/// Regression test for issue #5813: a compaction summary preserves
+/// identifiers by design (UUIDs, tokens, tool_call_ids). That means the
+/// summary text may contain the tool_call_id of a tool_result whose
+/// tool_use was dropped. The orphan detector must not be fooled by a
+/// substring match on the summary — it must confirm the id appears in
+/// a structured tool_calls array.
+#[test]
+fn orphan_tool_not_fooled_by_id_in_summary_text() {
+    let summary = "[CONTEXT SUMMARY \u{2014} 4 messages compressed]\n\
+         Earlier turns invoked shell with tool_calls id toolu_01Orphan \
+         and returned ok.";
+    let mut messages = vec![
+        msg("system", "sys"),
+        msg("assistant", summary),
+        msg(
+            "tool",
+            r#"{"tool_call_id":"toolu_01Orphan","content":"stale"}"#,
+        ),
+        msg("user", "new question"),
+    ];
+    let removed = remove_orphaned_tool_messages(&mut messages);
+    assert_eq!(
+        removed, 1,
+        "orphan must be removed even if its id is mentioned in summary text"
+    );
+    assert!(!messages.iter().any(|m| m.role == "tool"));
+}
+
 /// Regression for #5823:
 ///
 /// When `keep_recent` protects the *tail* of a multi-tool group but not
