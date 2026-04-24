@@ -149,6 +149,22 @@ fn memory_context_skip_rules_exclude_history_blobs() {
         "telegram_user_msg_201",
         "plain text without tool results"
     ));
+
+    // Per-turn user auto-save keys must be skipped to prevent exponential
+    // context bloat from re-injected conversation history.
+    assert!(should_skip_memory_context_entry(
+        "user_msg",
+        "original user message text"
+    ));
+    assert!(should_skip_memory_context_entry(
+        "user_msg_a1b2c3d4e5f6",
+        "follow-up message embedding prior context"
+    ));
+    // Channel-scoped keys (e.g. telegram_*) must NOT be affected.
+    assert!(!should_skip_memory_context_entry(
+        "telegram_user_msg_101",
+        "Please describe the image"
+    ));
 }
 
 #[test]

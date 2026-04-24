@@ -3265,7 +3265,7 @@ async fn build_context_ignores_legacy_assistant_autosave_entries() {
     .await
     .unwrap();
     mem.store(
-        "user_msg_real",
+        "user_preference",
         "User asked for concise status updates",
         MemoryCategory::Conversation,
         None,
@@ -3274,7 +3274,7 @@ async fn build_context_ignores_legacy_assistant_autosave_entries() {
     .unwrap();
 
     let context = build_context(&mem, "status updates", 0.0, None).await;
-    assert!(context.contains("user_msg_real"));
+    assert!(context.contains("user_preference"));
     assert!(!context.contains("assistant_resp_poisoned"));
     assert!(!context.contains("fabricated event"));
 }

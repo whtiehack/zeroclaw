@@ -58,6 +58,12 @@ impl MemoryLoader for DefaultMemoryLoader {
             if memory::is_assistant_autosave_key(&entry.key) {
                 continue;
             }
+            // Skip raw per-turn user messages: re-injecting them causes each
+            // recalled entry to embed all prior generations, growing exponentially.
+            // Consolidated knowledge is already promoted to Core/Daily entries.
+            if memory::is_user_autosave_key(&entry.key) {
+                continue;
+            }
             if memory::should_skip_autosave_content(&entry.content) {
                 continue;
             }

@@ -1597,6 +1597,13 @@ fn should_skip_memory_context_entry(key: &str, content: &str) -> bool {
         return true;
     }
 
+    // Skip raw per-turn user messages: re-injecting them causes each
+    // recalled entry to embed all prior generations, growing exponentially.
+    // Consolidated knowledge is already promoted to Core/Daily entries.
+    if memory::is_user_autosave_key(key) {
+        return true;
+    }
+
     if memory::should_skip_autosave_content(content) {
         return true;
     }
