@@ -1604,6 +1604,15 @@ fn should_skip_memory_context_entry(key: &str, content: &str) -> bool {
         return true;
     }
 
+    // Skip channel-level per-turn autosave entries (wecom_ws, slack,
+    // telegram, ...). These exist only to rehydrate session history after
+    // restarts; recalling them leaks the current turn's message back into
+    // its own [Memory context] because the autosave is written just before
+    // recall runs.
+    if memory::is_channel_turn_autosave_key(key) {
+        return true;
+    }
+
     if memory::should_skip_autosave_content(content) {
         return true;
     }

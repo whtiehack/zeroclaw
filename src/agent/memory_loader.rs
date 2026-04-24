@@ -64,6 +64,11 @@ impl MemoryLoader for DefaultMemoryLoader {
             if memory::is_user_autosave_key(&entry.key) {
                 continue;
             }
+            // Skip channel-level per-turn autosave entries — they serve
+            // session rehydration only and alias the current turn's text.
+            if memory::is_channel_turn_autosave_key(&entry.key) {
+                continue;
+            }
             if memory::should_skip_autosave_content(&entry.content) {
                 continue;
             }

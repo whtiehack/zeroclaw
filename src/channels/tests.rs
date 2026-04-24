@@ -133,9 +133,11 @@ fn memory_context_skip_rules_exclude_history_blobs() {
         "telegram_user_msg_100",
         "[IMAGE:/tmp/workspace/photo_1_2.jpg]\n\nCheck this screenshot"
     ));
-    // Plain text without image markers should not be skipped.
+    // Plain text without image markers should not be skipped (use a
+    // non-channel-scoped key so the channel-turn autosave filter below
+    // does not shadow this case).
     assert!(!should_skip_memory_context_entry(
-        "telegram_user_msg_101",
+        "user_preference_vision",
         "Please describe the image"
     ));
 
@@ -146,7 +148,7 @@ fn memory_context_skip_rules_exclude_history_blobs() {
 <tool_result name="shell">Mon Feb 20</tool_result>"#
     ));
     assert!(!should_skip_memory_context_entry(
-        "telegram_user_msg_201",
+        "user_preference_plain",
         "plain text without tool results"
     ));
 
@@ -160,10 +162,16 @@ fn memory_context_skip_rules_exclude_history_blobs() {
         "user_msg_a1b2c3d4e5f6",
         "follow-up message embedding prior context"
     ));
-    // Channel-scoped keys (e.g. telegram_*) must NOT be affected.
-    assert!(!should_skip_memory_context_entry(
+    // Channel-level per-turn autosave keys are now filtered so that
+    // the message just written by `conversation_memory_key` cannot loop
+    // back into its own `[Memory context]` during recall.
+    assert!(should_skip_memory_context_entry(
         "telegram_user_msg_101",
         "Please describe the image"
+    ));
+    assert!(should_skip_memory_context_entry(
+        "wecom_ws_reqid_group-xyz_msg_abcdef",
+        "[sender_userid=hanxiao] [2026-04-24 19:12:57 +08:00] @owl hi"
     ));
 }
 

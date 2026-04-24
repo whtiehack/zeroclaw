@@ -12,9 +12,12 @@
 //! |---|---|---|
 //! | `assistant_resp` / `assistant_resp_*` | Model-authored assistant summaries (untrusted context) | [`is_assistant_autosave_key`] |
 //! | `user_msg` / `user_msg_*` | Raw per-turn user messages (consolidation queue) | [`is_user_autosave_key`] |
+//! | `<channel>_..._<msg_id>` | Channel-level per-turn autosave for session recovery (wecom_ws, telegram, discord, slack, …) | [`is_channel_turn_autosave_key`] |
 //!
-//! Channel-scoped variants (e.g. `telegram_user_msg_*`, `discord_*`) are
-//! **not** filtered — they use different prefixes and are handled separately.
+//! Channel-level turn autosaves exist only to rehydrate session history
+//! after restarts; semantic recall is served by consolidation's Daily/Core
+//! entries, so re-injecting them would leak the current turn back into its
+//! own `[Memory context]`.
 
 pub mod audit;
 pub mod backend;
@@ -124,6 +127,63 @@ pub fn is_assistant_autosave_key(key: &str) -> bool {
 pub fn is_user_autosave_key(key: &str) -> bool {
     let normalized = key.trim().to_ascii_lowercase();
     normalized == "user_msg" || normalized.starts_with("user_msg_")
+}
+
+/// Channel-level per-turn autosave keys produced by `conversation_memory_key`
+/// in `channels/mod.rs`. These keys exist to rehydrate session history after
+/// restarts (via `recall_by_session_id` / SQL lookups), not for semantic
+/// recall: every inbound channel message immediately writes one such entry
+/// whose embedding is near-identical to the message being asked about, so
+/// re-injecting them loops the current turn back into its own `[Memory
+/// context]`.
+///
+/// Format: `<channel>_<thread_ts?>_<sender>_<msg_id>` — prefix is the
+/// `ChannelMessage.channel` string. Matching uses an explicit channel
+/// whitelist so unrelated keys (e.g. `daily_<date>_<uuid>` or
+/// `core_<uuid>`) are left untouched.
+pub fn is_channel_turn_autosave_key(key: &str) -> bool {
+    const CHANNEL_PREFIXES: &[&str] = &[
+        "acp_server_",
+        "bluesky_",
+        "clawdtalk_",
+        "cli_",
+        "dingtalk_",
+        "discord_",
+        "email_",
+        "gmail_",
+        "imessage_",
+        "irc_",
+        "lark_",
+        "matrix_",
+        "mattermost_",
+        "mochat_",
+        "mqtt_",
+        "nextcloud_talk_",
+        "nostr_",
+        "notion_",
+        "qq_",
+        "reddit_",
+        "signal_",
+        "slack_",
+        "telegram_",
+        "twitter_",
+        "voice_call_",
+        "voice_wake_",
+        "wati_",
+        "wecom_ws_",
+    ];
+
+    let lower = key.trim().to_ascii_lowercase();
+    let Some(remainder) = CHANNEL_PREFIXES
+        .iter()
+        .find_map(|prefix| lower.strip_prefix(prefix))
+    else {
+        return false;
+    };
+    // Real turn autosave keys have at least `<sender>_<msg_id>` after the
+    // channel prefix (DM path) — reject short legitimate keys like
+    // `discord_settings` that accidentally share a channel prefix.
+    remainder.contains('_') && remainder.len() >= 8
 }
 
 /// Filter known synthetic autosave noise patterns that should not be
@@ -465,6 +525,48 @@ mod tests {
         assert!(is_user_autosave_key("USER_MSG_abcd"));
         assert!(!is_user_autosave_key("user_message"));
         assert!(!is_user_autosave_key("assistant_resp_1234"));
+    }
+
+    #[test]
+    fn channel_turn_autosave_key_detection_matches_known_channels() {
+        // wecom_ws: {channel}_{req_id}_{reply_target}_{msg_id}
+        assert!(is_channel_turn_autosave_key(
+            "wecom_ws_KtY3WRfTTla4IIn8255mbgAA_group--wrVwGaYwAAQgogw-XGwuEY5fXxK6hFog_246af64e0e749f4a2dd2c7865ff28d26"
+        ));
+        // slack DM: {channel}_{sender}_{id}
+        assert!(is_channel_turn_autosave_key("slack_U123_msg_abc123"));
+        // telegram thread: {channel}_{thread}_{sender}_{id}
+        assert!(is_channel_turn_autosave_key(
+            "telegram_t42_user9999_msg_55"
+        ));
+        // discord
+        assert!(is_channel_turn_autosave_key(
+            "discord_123456789_987654321_msg_abcdef"
+        ));
+        // multi-word channel prefixes (acp_server, voice_call, nextcloud_talk, …)
+        assert!(is_channel_turn_autosave_key(
+            "nextcloud_talk_room1_user2_msg_77"
+        ));
+
+        // user_msg_* / assistant_resp_* are handled by their own detectors
+        assert!(!is_channel_turn_autosave_key("user_msg_1234"));
+        assert!(!is_channel_turn_autosave_key("assistant_resp_abcd"));
+        // channel prefix but too short to be a turn autosave key
+        assert!(!is_channel_turn_autosave_key("slack_config"));
+        assert!(!is_channel_turn_autosave_key("discord_settings"));
+        assert!(!is_channel_turn_autosave_key("wecom_ws_status"));
+        // unrelated keys
+        assert!(!is_channel_turn_autosave_key(
+            "daily_2026-04-24_abc-def"
+        ));
+        assert!(!is_channel_turn_autosave_key("core_abc-def"));
+        // case-insensitive matching
+        assert!(is_channel_turn_autosave_key(
+            "SLACK_U123_MSG_abc123"
+        ));
+        // empty / whitespace
+        assert!(!is_channel_turn_autosave_key(""));
+        assert!(!is_channel_turn_autosave_key("   "));
     }
 
     #[test]
