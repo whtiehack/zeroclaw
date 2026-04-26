@@ -11788,6 +11788,9 @@ BTC is currently around $65,000 based on latest tool output."#
             channel: "test-channel".to_string(),
             timestamp: 2,
             thread_ts: None,
+            addressed_to_bot: false,
+            mentions_others_only: false,
+            has_attachments: false,
         })
         .await
         .unwrap();
@@ -11885,6 +11888,9 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "telegram".to_string(),
                 timestamp: 2,
                 thread_ts: None,
+                addressed_to_bot: false,
+                mentions_others_only: false,
+                has_attachments: false,
             })
             .await
             .unwrap();
@@ -11992,6 +11998,9 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "telegram".to_string(),
                 timestamp: 2,
                 thread_ts: None,
+                addressed_to_bot: false,
+                mentions_others_only: false,
+                has_attachments: false,
             })
             .await
             .unwrap();

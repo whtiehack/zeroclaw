@@ -225,6 +225,9 @@ mod tests {
                 channel: "dummy".into(),
                 timestamp: 123,
                 thread_ts: None,
+                addressed_to_bot: false,
+                mentions_others_only: false,
+                has_attachments: false,
             })
             .await
             .map_err(|e| anyhow::anyhow!(e.to_string()))
@@ -241,6 +244,9 @@ mod tests {
             channel: "dummy".into(),
             timestamp: 999,
             thread_ts: None,
+            addressed_to_bot: false,
+            mentions_others_only: false,
+            has_attachments: false,
         };
 
         let cloned = message.clone();
