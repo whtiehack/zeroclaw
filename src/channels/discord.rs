@@ -2049,6 +2049,33 @@ impl Channel for DiscordChannel {
                             .unwrap_or(false);
                     let addressed_to_bot = mention_addressed || replies_to_bot;
                     let mentions_others_only = mention_others && !addressed_to_bot;
+                    let author_username = d
+                        .get("author")
+                        .and_then(|a| a.get("username"))
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("?");
+                    let reply_label = d
+                        .get("referenced_message")
+                        .and_then(|r| r.get("author"))
+                        .map(|a| {
+                            let ref_id = a
+                                .get("id")
+                                .and_then(serde_json::Value::as_str)
+                                .unwrap_or("");
+                            let ref_name = a
+                                .get("username")
+                                .and_then(serde_json::Value::as_str)
+                                .unwrap_or("?");
+                            if !bot_user_id.is_empty() && ref_id == bot_user_id {
+                                " (reply to assistant)".to_string()
+                            } else {
+                                format!(" (reply to @{ref_name})")
+                            }
+                        })
+                        .unwrap_or_default();
+                    println!(
+                        "  📨 [discord] @{author_username} ({author_id}){reply_label}",
+                    );
                     let channel_msg = ChannelMessage {
                         id: if message_id.is_empty() {
                             Uuid::new_v4().to_string()
