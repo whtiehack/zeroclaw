@@ -528,6 +528,9 @@ impl WeComChannel {
                     channel: "wecom".to_string(),
                     timestamp: bytes_timestamp_now(),
                     thread_ts: None,
+                    addressed_to_bot: false,
+                    mentions_others_only: false,
+                    has_attachments: false,
                 })
                 .await;
             return;
@@ -550,6 +553,9 @@ impl WeComChannel {
                     channel: "wecom".to_string(),
                     timestamp: bytes_timestamp_now(),
                     thread_ts: None,
+                    addressed_to_bot: false,
+                    mentions_others_only: false,
+                    has_attachments: false,
                 })
                 .await;
             return;
@@ -630,6 +636,9 @@ impl WeComChannel {
                     channel: "wecom".to_string(),
                     timestamp: bytes_timestamp_now(),
                     thread_ts: Some(req_id),
+                    addressed_to_bot: false,
+                    mentions_others_only: false,
+                    has_attachments: false,
                 })
                 .await;
         });

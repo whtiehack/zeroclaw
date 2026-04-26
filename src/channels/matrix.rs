@@ -872,6 +872,9 @@ impl Channel for MatrixChannel {
                         .unwrap_or_default()
                         .as_secs(),
                     thread_ts: None,
+                    addressed_to_bot: false,
+                    mentions_others_only: false,
+                    has_attachments: false,
                 };
 
                 let _ = tx.send(msg).await;

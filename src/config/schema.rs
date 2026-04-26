@@ -1106,6 +1106,83 @@ pub struct AgentConfig {
     /// set to `0` for explicit disable.
     #[serde(default = "default_safety_heartbeat_turn_interval")]
     pub safety_heartbeat_turn_interval: usize,
+    /// Optional reply-intent precheck.
+    /// When enabled, runs a lightweight LLM classification on each inbound
+    /// channel message before launching the main agent loop, and skips work
+    /// when the message clearly does not require an assistant reply.
+    /// Disabled by default; existing deployments are unaffected.
+    #[serde(default)]
+    pub reply_intent_precheck: ReplyIntentPrecheckConfig,
+}
+
+/// Reply-intent precheck configuration (`[agent.reply_intent_precheck]`).
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct ReplyIntentPrecheckConfig {
+    /// Enable the precheck. Default: `false`.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Model name used for precheck classification. Empty string falls back
+    /// to the route's main model.
+    #[serde(default)]
+    pub model: String,
+    /// Sampling temperature for the precheck call. Default: `0.1`.
+    #[serde(default = "default_precheck_temperature")]
+    pub temperature: f64,
+    /// Number of recent history turns to include in the precheck prompt.
+    /// Default: `3`.
+    #[serde(default = "default_precheck_history_messages")]
+    pub history_messages: usize,
+    /// Path to a prompt file (relative to the workspace directory). When set
+    /// and readable, replaces the built-in fallback prompt. Default: empty
+    /// (use built-in).
+    #[serde(default)]
+    pub prompt_file: String,
+    /// Inbound messages with trimmed content of this length or less, that are
+    /// not addressed to the bot, do not reply to a bot message, and do not
+    /// carry attachments, take the short-message path: reply if the most
+    /// recent assistant message ended with a question, no-reply otherwise.
+    /// Default: `2`.
+    #[serde(default = "default_precheck_min_content_chars")]
+    pub min_content_chars: usize,
+    /// Substring matchers (case-insensitive). Inbound containing any entry
+    /// short-circuits to reply, skipping the LLM call. Default: empty.
+    #[serde(default)]
+    pub keyword_fast_path: Vec<String>,
+    /// Maximum tokens for the precheck response. Default: `200` (covers
+    /// reasoning models that consume tokens before producing visible content).
+    #[serde(default = "default_precheck_max_tokens")]
+    pub max_tokens: u32,
+}
+
+fn default_precheck_temperature() -> f64 {
+    0.1
+}
+
+fn default_precheck_history_messages() -> usize {
+    3
+}
+
+fn default_precheck_min_content_chars() -> usize {
+    2
+}
+
+fn default_precheck_max_tokens() -> u32 {
+    200
+}
+
+impl Default for ReplyIntentPrecheckConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            model: String::new(),
+            temperature: default_precheck_temperature(),
+            history_messages: default_precheck_history_messages(),
+            prompt_file: String::new(),
+            min_content_chars: default_precheck_min_content_chars(),
+            keyword_fast_path: Vec::new(),
+            max_tokens: default_precheck_max_tokens(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -1215,6 +1292,7 @@ impl Default for AgentConfig {
             loop_detection_failure_streak: default_loop_detection_failure_streak(),
             safety_heartbeat_interval: default_safety_heartbeat_interval(),
             safety_heartbeat_turn_interval: default_safety_heartbeat_turn_interval(),
+            reply_intent_precheck: ReplyIntentPrecheckConfig::default(),
         }
     }
 }

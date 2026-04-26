@@ -232,6 +232,9 @@ end tell"#
                                 .unwrap_or_default()
                                 .as_secs(),
                             thread_ts: None,
+                            addressed_to_bot: false,
+                            mentions_others_only: false,
+                            has_attachments: false,
                         };
 
                         if tx.send(msg).await.is_err() {

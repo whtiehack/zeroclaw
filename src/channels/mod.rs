@@ -380,6 +380,7 @@ struct ChannelRuntimeContext {
     approval_manager: Arc<ApprovalManager>,
     safety_heartbeat: Option<SafetyHeartbeatConfig>,
     startup_perplexity_filter: crate::config::PerplexityFilterConfig,
+    reply_intent_precheck: Arc<crate::config::ReplyIntentPrecheckConfig>,
 }
 
 #[derive(Clone)]
@@ -3686,6 +3687,244 @@ fn log_worker_join_result(result: Result<(), tokio::task::JoinError>) {
     }
 }
 
+// ─────────── Reply-intent precheck ───────────────────────────
+//
+// Optional, gated by `[agent.reply_intent_precheck].enabled`. When enabled,
+// every inbound channel message goes through a layered decision pipeline
+// before the main agent loop spins up. The pipeline short-circuits early
+// when the channel layer already gives a strong signal (mention of bot,
+// mention of others only, attachments, keyword fast-path, very short
+// message with/without follow-up); otherwise it makes a single lightweight
+// LLM classification call.
+//
+// Failure modes are deliberately reply-biased: any unexpected outcome
+// (timeout, parse error) falls back to `Reply` so the user never goes
+// silently unanswered.
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AssistantChannelOutcome {
+    Reply,
+    NoReply { reason: Option<String> },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PrecheckPath {
+    MentionSelf,
+    MentionOthers,
+    Attachments,
+    Keyword,
+    ShortFollowup,
+    ShortNoFollowup,
+    LlmReply,
+    LlmNoReply,
+}
+
+impl PrecheckPath {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::MentionSelf => "mention_self",
+            Self::MentionOthers => "mention_others",
+            Self::Attachments => "attachments",
+            Self::Keyword => "keyword",
+            Self::ShortFollowup => "short_followup",
+            Self::ShortNoFollowup => "short_no_followup",
+            Self::LlmReply => "llm_reply",
+            Self::LlmNoReply => "llm_no_reply",
+        }
+    }
+}
+
+const REPLY_INTENT_PRECHECK_DEFAULT_PROMPT: &str = "\
+You are deciding whether the assistant should send any visible reply to the \
+latest inbound channel message.
+
+Important: You only see this user's own conversation with the assistant. You \
+do NOT see what other people in the channel are saying. Do not assume the \
+user is talking to someone else just because the message is short or \
+context-free.
+
+Output exactly one line:
+- `REPLY`
+- `NO_REPLY: <short reason>`
+
+Reply when the message asks the assistant a question, requests an action, \
+reports an error, describes a malfunction, or is a short follow-up that \
+clearly continues the assistant's last reply.
+
+No-reply when the message contains a mention of someone else and is clearly \
+directed at that person, when it is a sticker/emoji-only reaction or a pure \
+greeting with no request, or when it has no question and no actionable \
+request.
+
+Do NOT answer the user. Output one line only.";
+
+fn last_assistant_ends_with_question(history: &[ChatMessage]) -> bool {
+    let trailing = history.iter().rfind(|m| m.role == "assistant");
+    let Some(msg) = trailing else { return false };
+    let trimmed = msg.content.trim_end();
+    if trimmed.is_empty() {
+        return false;
+    }
+    trimmed.ends_with('?')
+        || trimmed.ends_with('?')
+        || trimmed.ends_with('吗')
+        || trimmed.ends_with('么')
+        || trimmed.ends_with('呢')
+}
+
+fn parse_precheck_response(raw: &str) -> AssistantChannelOutcome {
+    let s = raw.trim();
+    if s.is_empty() {
+        return AssistantChannelOutcome::NoReply { reason: None };
+    }
+    let first_line = s
+        .lines()
+        .next()
+        .unwrap_or("")
+        .trim()
+        .trim_matches('`')
+        .trim();
+    let upper = first_line.to_ascii_uppercase();
+    if upper == "REPLY" || upper.starts_with("REPLY ") || upper.starts_with("REPLY:") {
+        return AssistantChannelOutcome::Reply;
+    }
+    if let Some(rest) = first_line.strip_prefix("NO_REPLY:") {
+        let reason = rest.trim().to_string();
+        return AssistantChannelOutcome::NoReply {
+            reason: (!reason.is_empty()).then_some(reason),
+        };
+    }
+    if upper == "NO_REPLY" || upper == "NO REPLY" {
+        return AssistantChannelOutcome::NoReply { reason: None };
+    }
+    let full_upper = s.to_ascii_uppercase();
+    if full_upper.contains("NO_REPLY") || full_upper.contains("NO REPLY") {
+        return AssistantChannelOutcome::NoReply { reason: None };
+    }
+    if full_upper.contains("REPLY") {
+        return AssistantChannelOutcome::Reply;
+    }
+    AssistantChannelOutcome::NoReply { reason: None }
+}
+
+fn message_hits_keyword_fast_path(content: &str, keywords: &[String]) -> bool {
+    if keywords.is_empty() {
+        return false;
+    }
+    let lower = content.to_ascii_lowercase();
+    keywords.iter().any(|k| {
+        let kl = k.to_ascii_lowercase();
+        !kl.is_empty() && lower.contains(&kl)
+    })
+}
+
+fn precheck_prompt_text(
+    workspace_dir: &std::path::Path,
+    cfg: &crate::config::ReplyIntentPrecheckConfig,
+) -> String {
+    if cfg.prompt_file.is_empty() {
+        return REPLY_INTENT_PRECHECK_DEFAULT_PROMPT.to_string();
+    }
+    let path = workspace_dir.join(&cfg.prompt_file);
+    match std::fs::read_to_string(&path) {
+        Ok(s) if !s.trim().is_empty() => s,
+        _ => REPLY_INTENT_PRECHECK_DEFAULT_PROMPT.to_string(),
+    }
+}
+
+async fn classify_channel_reply_intent(
+    provider: &dyn Provider,
+    cfg: &crate::config::ReplyIntentPrecheckConfig,
+    workspace_dir: &std::path::Path,
+    route_model: &str,
+    prior_history: &[ChatMessage],
+    current_user_content: &str,
+) -> AssistantChannelOutcome {
+    let prompt = precheck_prompt_text(workspace_dir, cfg);
+    let mut convo = String::from("Conversation (most recent last):\n");
+    let n = cfg.history_messages.max(1);
+    let recent: Vec<&ChatMessage> = prior_history
+        .iter()
+        .filter(|m| m.role == "user" || m.role == "assistant")
+        .collect();
+    let start = recent.len().saturating_sub(n);
+    for m in &recent[start..] {
+        let role = if m.role == "assistant" { "assistant" } else { "user" };
+        convo.push_str(&format!("[{role}] {}\n", m.content));
+    }
+    convo.push_str(&format!("[user] {current_user_content}\n"));
+    convo.push_str("\nClassify the latest [user] message.");
+
+    let model = if cfg.model.is_empty() {
+        route_model
+    } else {
+        cfg.model.as_str()
+    };
+    match provider
+        .chat_with_system(Some(prompt.as_str()), &convo, model, cfg.temperature)
+        .await
+    {
+        Ok(raw) => parse_precheck_response(&raw),
+        Err(err) => {
+            tracing::warn!("reply-intent precheck LLM call failed: {err}");
+            AssistantChannelOutcome::Reply
+        }
+    }
+}
+
+async fn run_reply_intent_precheck(
+    cfg: &crate::config::ReplyIntentPrecheckConfig,
+    workspace_dir: &std::path::Path,
+    provider: &dyn Provider,
+    route_model: &str,
+    msg: &traits::ChannelMessage,
+    prior_history: &[ChatMessage],
+) -> (AssistantChannelOutcome, PrecheckPath) {
+    if msg.addressed_to_bot {
+        return (AssistantChannelOutcome::Reply, PrecheckPath::MentionSelf);
+    }
+    if msg.mentions_others_only {
+        return (
+            AssistantChannelOutcome::NoReply {
+                reason: Some("addressed to another user".into()),
+            },
+            PrecheckPath::MentionOthers,
+        );
+    }
+    if msg.has_attachments {
+        return (AssistantChannelOutcome::Reply, PrecheckPath::Attachments);
+    }
+    if message_hits_keyword_fast_path(&msg.content, &cfg.keyword_fast_path) {
+        return (AssistantChannelOutcome::Reply, PrecheckPath::Keyword);
+    }
+    let trimmed = msg.content.trim();
+    if trimmed.chars().count() <= cfg.min_content_chars {
+        if last_assistant_ends_with_question(prior_history) {
+            return (AssistantChannelOutcome::Reply, PrecheckPath::ShortFollowup);
+        }
+        return (
+            AssistantChannelOutcome::NoReply {
+                reason: Some("too short, no question to follow up".into()),
+            },
+            PrecheckPath::ShortNoFollowup,
+        );
+    }
+    let outcome = classify_channel_reply_intent(
+        provider,
+        cfg,
+        workspace_dir,
+        route_model,
+        prior_history,
+        &msg.content,
+    )
+    .await;
+    let path = match &outcome {
+        AssistantChannelOutcome::Reply => PrecheckPath::LlmReply,
+        AssistantChannelOutcome::NoReply { .. } => PrecheckPath::LlmNoReply,
+    };
+    (outcome, path)
+}
+
 fn spawn_scoped_typing_task(
     channel: Arc<dyn Channel>,
     recipient: String,
@@ -4006,6 +4245,70 @@ If this input is legitimate, rephrase the request and avoid instruction-override
             return;
         }
     };
+
+    // ── Reply-intent precheck (optional, gated by config) ───
+    // Runs before any state-mutating step (memory autosave, history append,
+    // typing indicator) so a no-reply outcome leaves the conversation
+    // perfectly clean.
+    if ctx.reply_intent_precheck.enabled {
+        let prior_turns = ctx
+            .conversation_histories
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&history_key)
+            .cloned()
+            .unwrap_or_default();
+        let precheck_started_at = Instant::now();
+        let (outcome, path) = run_reply_intent_precheck(
+            ctx.reply_intent_precheck.as_ref(),
+            ctx.workspace_dir.as_ref(),
+            active_provider.as_ref(),
+            route.model.as_str(),
+            &msg,
+            &prior_turns,
+        )
+        .await;
+        let elapsed_ms = precheck_started_at.elapsed().as_millis();
+        if let AssistantChannelOutcome::NoReply { reason } = outcome {
+            runtime_trace::record_event(
+                "channel_message_no_reply",
+                Some(msg.channel.as_str()),
+                Some(route.provider.as_str()),
+                Some(route.model.as_str()),
+                None,
+                Some(true),
+                reason.as_deref(),
+                serde_json::json!({
+                    "sender": msg.sender,
+                    "elapsed_ms": elapsed_ms,
+                    "phase": "precheck",
+                    "path": path.as_str(),
+                }),
+            );
+            println!(
+                "  🤖 No reply ({elapsed_ms}ms, {}): {}",
+                path.as_str(),
+                reason.as_deref().unwrap_or("no reason"),
+            );
+            return;
+        }
+        runtime_trace::record_event(
+            "channel_message_precheck_pass",
+            Some(msg.channel.as_str()),
+            Some(route.provider.as_str()),
+            Some(route.model.as_str()),
+            None,
+            Some(true),
+            None,
+            serde_json::json!({
+                "sender": msg.sender,
+                "elapsed_ms": elapsed_ms,
+                "phase": "precheck",
+                "path": path.as_str(),
+            }),
+        );
+    }
+
     if runtime_defaults.auto_save_memory {
         let content_for_autosave = strip_attachment_block(&msg.content);
         if content_for_autosave.chars().count() >= AUTOSAVE_MIN_MESSAGE_CHARS {
@@ -6451,6 +6754,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
         } else {
             None
         },
+        reply_intent_precheck: Arc::new(config.agent.reply_intent_precheck.clone()),
     });
 
     run_message_dispatch_loop(rx, runtime_ctx, max_in_flight_messages).await;
@@ -6478,6 +6782,271 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
     use tempfile::TempDir;
+
+    // ─── Reply-intent precheck unit tests ─────────────────────────────
+    mod precheck_tests {
+        use super::*;
+        use crate::config::ReplyIntentPrecheckConfig;
+
+        struct ScriptedPrecheckProvider {
+            reply: anyhow::Result<String>,
+        }
+
+        impl ScriptedPrecheckProvider {
+            fn ok(text: &str) -> Self {
+                Self {
+                    reply: Ok(text.to_string()),
+                }
+            }
+            fn err() -> Self {
+                Self {
+                    reply: Err(anyhow::anyhow!("simulated upstream error")),
+                }
+            }
+        }
+
+        #[async_trait::async_trait]
+        impl Provider for ScriptedPrecheckProvider {
+            async fn chat_with_system(
+                &self,
+                _system_prompt: Option<&str>,
+                _message: &str,
+                _model: &str,
+                _temperature: f64,
+            ) -> anyhow::Result<String> {
+                match &self.reply {
+                    Ok(s) => Ok(s.clone()),
+                    Err(e) => Err(anyhow::anyhow!(e.to_string())),
+                }
+            }
+        }
+
+        fn make_msg(content: &str) -> traits::ChannelMessage {
+            traits::ChannelMessage {
+                id: "1".into(),
+                sender: "u1".into(),
+                reply_target: "c1".into(),
+                content: content.into(),
+                channel: "discord".into(),
+                timestamp: 0,
+                thread_ts: None,
+                addressed_to_bot: false,
+                mentions_others_only: false,
+                has_attachments: false,
+            }
+        }
+
+        #[test]
+        fn parse_response_handles_all_shapes() {
+            assert_eq!(
+                parse_precheck_response("REPLY"),
+                AssistantChannelOutcome::Reply
+            );
+            assert_eq!(
+                parse_precheck_response("`REPLY`"),
+                AssistantChannelOutcome::Reply
+            );
+            assert_eq!(
+                parse_precheck_response("REPLY (continuing earlier topic)"),
+                AssistantChannelOutcome::Reply
+            );
+            assert_eq!(
+                parse_precheck_response("NO_REPLY: greeting only"),
+                AssistantChannelOutcome::NoReply {
+                    reason: Some("greeting only".into())
+                }
+            );
+            assert_eq!(
+                parse_precheck_response("NO_REPLY"),
+                AssistantChannelOutcome::NoReply { reason: None }
+            );
+            assert_eq!(
+                parse_precheck_response(""),
+                AssistantChannelOutcome::NoReply { reason: None }
+            );
+            // Lenient scan when first line is malformed but signal exists.
+            assert_eq!(
+                parse_precheck_response("Sure, NO_REPLY here"),
+                AssistantChannelOutcome::NoReply { reason: None }
+            );
+        }
+
+        #[test]
+        fn keyword_fast_path_is_case_insensitive_and_supports_chinese() {
+            let kws = vec!["alpha".to_string(), "测试词".to_string()];
+            assert!(message_hits_keyword_fast_path("How do I use ALPHA?", &kws));
+            assert!(message_hits_keyword_fast_path("中文测试词命中", &kws));
+            assert!(!message_hits_keyword_fast_path(
+                "totally unrelated text",
+                &kws
+            ));
+            assert!(!message_hits_keyword_fast_path("anything", &[]));
+        }
+
+        #[test]
+        fn last_assistant_question_detects_zh_and_en_punctuation() {
+            let h = vec![
+                ChatMessage::user("..."),
+                ChatMessage::assistant("Which version?"),
+            ];
+            assert!(last_assistant_ends_with_question(&h));
+            let h2 = vec![ChatMessage::assistant("是这个意思吗")];
+            assert!(last_assistant_ends_with_question(&h2));
+            let h3 = vec![ChatMessage::assistant("好的，我去查。")];
+            assert!(!last_assistant_ends_with_question(&h3));
+            let h4: Vec<ChatMessage> = vec![];
+            assert!(!last_assistant_ends_with_question(&h4));
+        }
+
+        #[tokio::test]
+        async fn mention_self_short_circuits_reply() {
+            let provider = ScriptedPrecheckProvider::err();
+            let cfg = ReplyIntentPrecheckConfig::default();
+            let mut m = make_msg("hi");
+            m.addressed_to_bot = true;
+            let (outcome, path) = run_reply_intent_precheck(
+                &cfg,
+                std::path::Path::new("/tmp"),
+                &provider,
+                "model",
+                &m,
+                &[],
+            )
+            .await;
+            assert_eq!(outcome, AssistantChannelOutcome::Reply);
+            assert_eq!(path, PrecheckPath::MentionSelf);
+        }
+
+        #[tokio::test]
+        async fn mention_others_short_circuits_no_reply() {
+            let provider = ScriptedPrecheckProvider::err();
+            let cfg = ReplyIntentPrecheckConfig::default();
+            let mut m = make_msg("@friend please respond");
+            m.mentions_others_only = true;
+            let (outcome, path) = run_reply_intent_precheck(
+                &cfg,
+                std::path::Path::new("/tmp"),
+                &provider,
+                "model",
+                &m,
+                &[],
+            )
+            .await;
+            assert!(matches!(outcome, AssistantChannelOutcome::NoReply { .. }));
+            assert_eq!(path, PrecheckPath::MentionOthers);
+        }
+
+        #[tokio::test]
+        async fn attachments_short_circuit_reply() {
+            let provider = ScriptedPrecheckProvider::err();
+            let cfg = ReplyIntentPrecheckConfig::default();
+            let mut m = make_msg("");
+            m.has_attachments = true;
+            let (outcome, path) = run_reply_intent_precheck(
+                &cfg,
+                std::path::Path::new("/tmp"),
+                &provider,
+                "model",
+                &m,
+                &[],
+            )
+            .await;
+            assert_eq!(outcome, AssistantChannelOutcome::Reply);
+            assert_eq!(path, PrecheckPath::Attachments);
+        }
+
+        #[tokio::test]
+        async fn keyword_short_circuits_reply() {
+            let provider = ScriptedPrecheckProvider::err();
+            let mut cfg = ReplyIntentPrecheckConfig::default();
+            cfg.keyword_fast_path = vec!["alpha".into()];
+            let m = make_msg("how to install ALPHA on win11?");
+            let (outcome, path) = run_reply_intent_precheck(
+                &cfg,
+                std::path::Path::new("/tmp"),
+                &provider,
+                "model",
+                &m,
+                &[],
+            )
+            .await;
+            assert_eq!(outcome, AssistantChannelOutcome::Reply);
+            assert_eq!(path, PrecheckPath::Keyword);
+        }
+
+        #[tokio::test]
+        async fn short_message_with_followup_replies() {
+            let provider = ScriptedPrecheckProvider::err();
+            let cfg = ReplyIntentPrecheckConfig::default();
+            let m = make_msg("ok");
+            let history = vec![ChatMessage::assistant("Which build, x86 or x64?")];
+            let (outcome, path) = run_reply_intent_precheck(
+                &cfg,
+                std::path::Path::new("/tmp"),
+                &provider,
+                "model",
+                &m,
+                &history,
+            )
+            .await;
+            assert_eq!(outcome, AssistantChannelOutcome::Reply);
+            assert_eq!(path, PrecheckPath::ShortFollowup);
+        }
+
+        #[tokio::test]
+        async fn short_message_without_followup_skips() {
+            let provider = ScriptedPrecheckProvider::err();
+            let cfg = ReplyIntentPrecheckConfig::default();
+            let m = make_msg("?");
+            let (outcome, path) = run_reply_intent_precheck(
+                &cfg,
+                std::path::Path::new("/tmp"),
+                &provider,
+                "model",
+                &m,
+                &[],
+            )
+            .await;
+            assert!(matches!(outcome, AssistantChannelOutcome::NoReply { .. }));
+            assert_eq!(path, PrecheckPath::ShortNoFollowup);
+        }
+
+        #[tokio::test]
+        async fn llm_failure_falls_back_to_reply() {
+            let provider = ScriptedPrecheckProvider::err();
+            let cfg = ReplyIntentPrecheckConfig::default();
+            let m = make_msg("a longer message that doesn't hit any other shortcut");
+            let (outcome, _path) = run_reply_intent_precheck(
+                &cfg,
+                std::path::Path::new("/tmp"),
+                &provider,
+                "model",
+                &m,
+                &[],
+            )
+            .await;
+            assert_eq!(outcome, AssistantChannelOutcome::Reply);
+        }
+
+        #[tokio::test]
+        async fn llm_no_reply_propagates() {
+            let provider =
+                ScriptedPrecheckProvider::ok("NO_REPLY: directed at another user");
+            let cfg = ReplyIntentPrecheckConfig::default();
+            let m = make_msg("a longer message that doesn't hit any other shortcut");
+            let (outcome, path) = run_reply_intent_precheck(
+                &cfg,
+                std::path::Path::new("/tmp"),
+                &provider,
+                "model",
+                &m,
+                &[],
+            )
+            .await;
+            assert!(matches!(outcome, AssistantChannelOutcome::NoReply { .. }));
+            assert_eq!(path, PrecheckPath::LlmNoReply);
+        }
+    }
 
     fn make_workspace() -> TempDir {
         let tmp = TempDir::new().unwrap();
@@ -6801,6 +7370,7 @@ mod tests {
             approval_manager: mock_price_approved_manager(),
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
+            reply_intent_precheck: Arc::new(crate::config::ReplyIntentPrecheckConfig::default()),
         };
 
         assert!(compact_sender_history(&ctx, &sender));
@@ -6859,6 +7429,7 @@ mod tests {
             approval_manager: mock_price_approved_manager(),
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
+            reply_intent_precheck: Arc::new(crate::config::ReplyIntentPrecheckConfig::default()),
         };
 
         append_sender_turn(&ctx, &sender, ChatMessage::user("hello"));
@@ -6920,6 +7491,7 @@ mod tests {
             approval_manager: mock_price_approved_manager(),
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
+            reply_intent_precheck: Arc::new(crate::config::ReplyIntentPrecheckConfig::default()),
         };
 
         assert!(rollback_orphan_user_turn(&ctx, &sender, "pending"));
@@ -7639,6 +8211,7 @@ BTC is currently around $65,000 based on latest tool output."#
             approval_manager: mock_price_approved_manager(),
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
+            reply_intent_precheck: Arc::new(crate::config::ReplyIntentPrecheckConfig::default()),
         });
 
         process_channel_message(
@@ -7651,6 +8224,9 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "test-channel".to_string(),
                 timestamp: 1,
                 thread_ts: None,
+                addressed_to_bot: false,
+                mentions_others_only: false,
+                has_attachments: false,
             },
             CancellationToken::new(),
             std::time::Instant::now(),
@@ -7728,6 +8304,7 @@ BTC is currently around $65,000 based on latest tool output."#
             hooks: None,
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
+            reply_intent_precheck: Arc::new(crate::config::ReplyIntentPrecheckConfig::default()),
         });
 
         process_channel_message(
@@ -7740,6 +8317,9 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "test-channel".to_string(),
                 timestamp: 1,
                 thread_ts: None,
+                addressed_to_bot: false,
+                mentions_others_only: false,
+                has_attachments: false,
             },
             CancellationToken::new(),
             std::time::Instant::now(),
@@ -7804,6 +8384,7 @@ BTC is currently around $65,000 based on latest tool output."#
             hooks: None,
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
+            reply_intent_precheck: Arc::new(crate::config::ReplyIntentPrecheckConfig::default()),
         });
 
         process_channel_message(
@@ -7816,6 +8397,9 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "telegram".to_string(),
                 timestamp: 1,
                 thread_ts: None,
+                addressed_to_bot: false,
+                mentions_others_only: false,
+                has_attachments: false,
             },
             CancellationToken::new(),
             std::time::Instant::now(),
@@ -7894,6 +8478,7 @@ BTC is currently around $65,000 based on latest tool output."#
             model_routes: Vec::new(),
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
+            reply_intent_precheck: Arc::new(crate::config::ReplyIntentPrecheckConfig::default()),
         });
 
         process_channel_message(
@@ -7906,6 +8491,9 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "draft-streaming-channel".to_string(),
                 timestamp: 1,
                 thread_ts: None,
+                addressed_to_bot: false,
+                mentions_others_only: false,
+                has_attachments: false,
             },
             CancellationToken::new(),
             std::time::Instant::now(),
@@ -7983,6 +8571,7 @@ BTC is currently around $65,000 based on latest tool output."#
             model_routes: Vec::new(),
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
+            reply_intent_precheck: Arc::new(crate::config::ReplyIntentPrecheckConfig::default()),
         });
 
         process_channel_message(
@@ -7995,6 +8584,9 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "draft-streaming-channel".to_string(),
                 timestamp: 1,
                 thread_ts: None,
+                addressed_to_bot: false,
+                mentions_others_only: false,
+                has_attachments: false,
             },
             CancellationToken::new(),
             std::time::Instant::now(),
@@ -8057,6 +8649,7 @@ BTC is currently around $65,000 based on latest tool output."#
             approval_manager: mock_price_approved_manager(),
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
+            reply_intent_precheck: Arc::new(crate::config::ReplyIntentPrecheckConfig::default()),
         });
 
         process_channel_message(
@@ -8069,6 +8662,9 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "test-channel".to_string(),
                 timestamp: 3,
                 thread_ts: None,
+                addressed_to_bot: false,
+                mentions_others_only: false,
+                has_attachments: false,
             },
             CancellationToken::new(),
             std::time::Instant::now(),
@@ -8133,6 +8729,7 @@ BTC is currently around $65,000 based on latest tool output."#
             approval_manager: mock_price_approved_manager(),
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
+            reply_intent_precheck: Arc::new(crate::config::ReplyIntentPrecheckConfig::default()),
         });
 
         process_channel_message(
@@ -8145,6 +8742,9 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "test-channel".to_string(),
                 timestamp: 2,
                 thread_ts: None,
+                addressed_to_bot: false,
+                mentions_others_only: false,
+                has_attachments: false,
             },
             CancellationToken::new(),
             std::time::Instant::now(),
@@ -8211,6 +8811,7 @@ BTC is currently around $65,000 based on latest tool output."#
             approval_manager: mock_price_approved_manager(),
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
+            reply_intent_precheck: Arc::new(crate::config::ReplyIntentPrecheckConfig::default()),
         });
 
         process_channel_message(
@@ -8223,6 +8824,9 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "telegram".to_string(),
                 timestamp: 1,
                 thread_ts: None,
+                addressed_to_bot: false,
+                mentions_others_only: false,
+                has_attachments: false,
             },
             CancellationToken::new(),
             std::time::Instant::now(),
@@ -8320,6 +8924,7 @@ BTC is currently around $65,000 based on latest tool output."#
             approval_manager: Arc::new(ApprovalManager::from_config(&autonomy_cfg)),
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
+            reply_intent_precheck: Arc::new(crate::config::ReplyIntentPrecheckConfig::default()),
         });
         assert_eq!(
             runtime_ctx
@@ -8344,6 +8949,9 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "telegram".to_string(),
                 timestamp: 1,
                 thread_ts: None,
+                addressed_to_bot: false,
+                mentions_others_only: false,
+                has_attachments: false,
             },
             CancellationToken::new(),
             std::time::Instant::now(),
@@ -8460,6 +9068,7 @@ BTC is currently around $65,000 based on latest tool output."#
             approval_manager: Arc::clone(&approval_manager),
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
+            reply_intent_precheck: Arc::new(crate::config::ReplyIntentPrecheckConfig::default()),
         });
 
         process_channel_message(
@@ -8472,6 +9081,9 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "telegram".to_string(),
                 timestamp: 1,
                 thread_ts: None,
+                addressed_to_bot: false,
+                mentions_others_only: false,
+                has_attachments: false,
             },
             CancellationToken::new(),
             std::time::Instant::now(),
@@ -8551,6 +9163,7 @@ BTC is currently around $65,000 based on latest tool output."#
             approval_manager: Arc::clone(&approval_manager),
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
+            reply_intent_precheck: Arc::new(crate::config::ReplyIntentPrecheckConfig::default()),
         });
 
         process_channel_message(
@@ -8563,6 +9176,9 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "telegram".to_string(),
                 timestamp: 1,
                 thread_ts: None,
+                addressed_to_bot: false,
+                mentions_others_only: false,
+                has_attachments: false,
             },
             CancellationToken::new(),
             std::time::Instant::now(),
@@ -8631,6 +9247,7 @@ BTC is currently around $65,000 based on latest tool output."#
             approval_manager: Arc::new(ApprovalManager::from_config(&autonomy_cfg)),
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
+            reply_intent_precheck: Arc::new(crate::config::ReplyIntentPrecheckConfig::default()),
         });
 
         let runtime_ctx_for_first_turn = runtime_ctx.clone();
@@ -8645,6 +9262,9 @@ BTC is currently around $65,000 based on latest tool output."#
                     channel: "telegram".to_string(),
                     timestamp: 1,
                     thread_ts: None,
+                    addressed_to_bot: false,
+                    mentions_others_only: false,
+                    has_attachments: false,
                 },
                 CancellationToken::new(),
                 std::time::Instant::now(),
@@ -8678,6 +9298,9 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "telegram".to_string(),
                 timestamp: 2,
                 thread_ts: None,
+                addressed_to_bot: false,
+                mentions_others_only: false,
+                has_attachments: false,
             },
             CancellationToken::new(),
             std::time::Instant::now(),
@@ -8798,6 +9421,7 @@ BTC is currently around $65,000 based on latest tool output."#
             approval_manager: Arc::new(ApprovalManager::from_config(&autonomy_cfg)),
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
+            reply_intent_precheck: Arc::new(crate::config::ReplyIntentPrecheckConfig::default()),
         });
         assert_eq!(
             runtime_ctx
@@ -8816,6 +9440,9 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "telegram".to_string(),
                 timestamp: 1,
                 thread_ts: None,
+                addressed_to_bot: false,
+                mentions_others_only: false,
+                has_attachments: false,
             },
             CancellationToken::new(),
             std::time::Instant::now(),
@@ -8915,6 +9542,7 @@ BTC is currently around $65,000 based on latest tool output."#
             approval_manager,
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
+            reply_intent_precheck: Arc::new(crate::config::ReplyIntentPrecheckConfig::default()),
         });
 
         process_channel_message(
@@ -8927,6 +9555,9 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "telegram".to_string(),
                 timestamp: 1,
                 thread_ts: None,
+                addressed_to_bot: false,
+                mentions_others_only: false,
+                has_attachments: false,
             },
             CancellationToken::new(),
             std::time::Instant::now(),
@@ -9027,6 +9658,7 @@ BTC is currently around $65,000 based on latest tool output."#
             approval_manager,
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
+            reply_intent_precheck: Arc::new(crate::config::ReplyIntentPrecheckConfig::default()),
         });
 
         process_channel_message(
@@ -9039,6 +9671,9 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "telegram".to_string(),
                 timestamp: 1,
                 thread_ts: None,
+                addressed_to_bot: false,
+                mentions_others_only: false,
+                has_attachments: false,
             },
             CancellationToken::new(),
             std::time::Instant::now(),
@@ -9121,6 +9756,7 @@ BTC is currently around $65,000 based on latest tool output."#
             approval_manager: Arc::clone(&approval_manager),
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
+            reply_intent_precheck: Arc::new(crate::config::ReplyIntentPrecheckConfig::default()),
         });
 
         process_channel_message(
@@ -9133,6 +9769,9 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "telegram".to_string(),
                 timestamp: 1,
                 thread_ts: None,
+                addressed_to_bot: false,
+                mentions_others_only: false,
+                has_attachments: false,
             },
             CancellationToken::new(),
             std::time::Instant::now(),
@@ -9225,6 +9864,7 @@ BTC is currently around $65,000 based on latest tool output."#
             approval_manager: Arc::clone(&approval_manager),
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
+            reply_intent_precheck: Arc::new(crate::config::ReplyIntentPrecheckConfig::default()),
         });
 
         process_channel_message(
@@ -9237,6 +9877,9 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "telegram".to_string(),
                 timestamp: 1,
                 thread_ts: None,
+                addressed_to_bot: false,
+                mentions_others_only: false,
+                has_attachments: false,
             },
             CancellationToken::new(),
             std::time::Instant::now(),
@@ -9330,6 +9973,7 @@ BTC is currently around $65,000 based on latest tool output."#
             approval_manager: Arc::new(ApprovalManager::from_config(&autonomy_cfg)),
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
+            reply_intent_precheck: Arc::new(crate::config::ReplyIntentPrecheckConfig::default()),
         });
 
         process_channel_message(
@@ -9342,6 +9986,9 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "telegram".to_string(),
                 timestamp: 1,
                 thread_ts: None,
+                addressed_to_bot: false,
+                mentions_others_only: false,
+                has_attachments: false,
             },
             CancellationToken::new(),
             std::time::Instant::now(),
@@ -9377,6 +10024,9 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "telegram".to_string(),
                 timestamp: 2,
                 thread_ts: None,
+                addressed_to_bot: false,
+                mentions_others_only: false,
+                has_attachments: false,
             },
             CancellationToken::new(),
             std::time::Instant::now(),
@@ -9484,6 +10134,7 @@ BTC is currently around $65,000 based on latest tool output."#
             approval_manager: mock_price_approved_manager(),
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
+            reply_intent_precheck: Arc::new(crate::config::ReplyIntentPrecheckConfig::default()),
         });
         maybe_apply_runtime_config_update(runtime_ctx.as_ref())
             .await
@@ -9501,6 +10152,9 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "telegram".to_string(),
                 timestamp: 1,
                 thread_ts: None,
+                addressed_to_bot: false,
+                mentions_others_only: false,
+                has_attachments: false,
             },
             CancellationToken::new(),
             std::time::Instant::now(),
@@ -9583,6 +10237,7 @@ BTC is currently around $65,000 based on latest tool output."#
             approval_manager: Arc::new(ApprovalManager::from_config(&autonomy_cfg)),
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
+            reply_intent_precheck: Arc::new(crate::config::ReplyIntentPrecheckConfig::default()),
         });
 
         process_channel_message(
@@ -9595,6 +10250,9 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "telegram".to_string(),
                 timestamp: 1,
                 thread_ts: None,
+                addressed_to_bot: false,
+                mentions_others_only: false,
+                has_attachments: false,
             },
             CancellationToken::new(),
             std::time::Instant::now(),
@@ -9630,6 +10288,9 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "telegram".to_string(),
                 timestamp: 2,
                 thread_ts: None,
+                addressed_to_bot: false,
+                mentions_others_only: false,
+                has_attachments: false,
             },
             CancellationToken::new(),
             std::time::Instant::now(),
@@ -9736,6 +10397,7 @@ BTC is currently around $65,000 based on latest tool output."#
             approval_manager: Arc::new(ApprovalManager::from_config(&autonomy_cfg)),
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
+            reply_intent_precheck: Arc::new(crate::config::ReplyIntentPrecheckConfig::default()),
         });
 
         process_channel_message(
@@ -9748,6 +10410,9 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "telegram".to_string(),
                 timestamp: 1,
                 thread_ts: None,
+                addressed_to_bot: false,
+                mentions_others_only: false,
+                has_attachments: false,
             },
             CancellationToken::new(),
             std::time::Instant::now(),
@@ -9858,6 +10523,7 @@ BTC is currently around $65,000 based on latest tool output."#
             approval_manager: Arc::new(ApprovalManager::from_config(&autonomy_cfg)),
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
+            reply_intent_precheck: Arc::new(crate::config::ReplyIntentPrecheckConfig::default()),
         });
 
         process_channel_message(
@@ -9870,6 +10536,9 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "telegram".to_string(),
                 timestamp: 1,
                 thread_ts: None,
+                addressed_to_bot: false,
+                mentions_others_only: false,
+                has_attachments: false,
             },
             CancellationToken::new(),
             std::time::Instant::now(),
@@ -9960,6 +10629,7 @@ BTC is currently around $65,000 based on latest tool output."#
             approval_manager: Arc::new(ApprovalManager::from_config(&autonomy_cfg)),
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
+            reply_intent_precheck: Arc::new(crate::config::ReplyIntentPrecheckConfig::default()),
         });
 
         process_channel_message(
@@ -9972,6 +10642,9 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "telegram".to_string(),
                 timestamp: 1,
                 thread_ts: None,
+                addressed_to_bot: false,
+                mentions_others_only: false,
+                has_attachments: false,
             },
             CancellationToken::new(),
             std::time::Instant::now(),
@@ -10002,6 +10675,9 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "telegram".to_string(),
                 timestamp: 2,
                 thread_ts: None,
+                addressed_to_bot: false,
+                mentions_others_only: false,
+                has_attachments: false,
             },
             CancellationToken::new(),
             std::time::Instant::now(),
@@ -10082,6 +10758,7 @@ BTC is currently around $65,000 based on latest tool output."#
             approval_manager: Arc::new(ApprovalManager::from_config(&autonomy_cfg)),
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
+            reply_intent_precheck: Arc::new(crate::config::ReplyIntentPrecheckConfig::default()),
         });
 
         process_channel_message(
@@ -10094,6 +10771,9 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "telegram".to_string(),
                 timestamp: 1,
                 thread_ts: None,
+                addressed_to_bot: false,
+                mentions_others_only: false,
+                has_attachments: false,
             },
             CancellationToken::new(),
             std::time::Instant::now(),
@@ -10123,6 +10803,9 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "telegram".to_string(),
                 timestamp: 2,
                 thread_ts: None,
+                addressed_to_bot: false,
+                mentions_others_only: false,
+                has_attachments: false,
             },
             CancellationToken::new(),
             std::time::Instant::now(),
@@ -10205,6 +10888,7 @@ BTC is currently around $65,000 based on latest tool output."#
             approval_manager: mock_price_approved_manager(),
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
+            reply_intent_precheck: Arc::new(crate::config::ReplyIntentPrecheckConfig::default()),
         });
 
         process_channel_message(
@@ -10217,6 +10901,9 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "telegram".to_string(),
                 timestamp: 2,
                 thread_ts: None,
+                addressed_to_bot: false,
+                mentions_others_only: false,
+                has_attachments: false,
             },
             CancellationToken::new(),
             std::time::Instant::now(),
@@ -10286,6 +10973,7 @@ BTC is currently around $65,000 based on latest tool output."#
             approval_manager: mock_price_approved_manager(),
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
+            reply_intent_precheck: Arc::new(crate::config::ReplyIntentPrecheckConfig::default()),
         });
 
         process_channel_message(
@@ -10298,6 +10986,9 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "telegram".to_string(),
                 timestamp: 3,
                 thread_ts: None,
+                addressed_to_bot: false,
+                mentions_others_only: false,
+                has_attachments: false,
             },
             CancellationToken::new(),
             std::time::Instant::now(),
@@ -10398,6 +11089,7 @@ BTC is currently around $65,000 based on latest tool output."#
             )),
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
+            reply_intent_precheck: Arc::new(crate::config::ReplyIntentPrecheckConfig::default()),
         });
 
         process_channel_message(
@@ -10410,6 +11102,9 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "telegram".to_string(),
                 timestamp: 4,
                 thread_ts: None,
+                addressed_to_bot: false,
+                mentions_others_only: false,
+                has_attachments: false,
             },
             CancellationToken::new(),
             std::time::Instant::now(),
@@ -10598,6 +11293,7 @@ BTC is currently around $65,000 based on latest tool output."#
             )),
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
+            reply_intent_precheck: Arc::new(crate::config::ReplyIntentPrecheckConfig::default()),
         });
 
         maybe_apply_runtime_config_update(runtime_ctx.as_ref())
@@ -10804,6 +11500,7 @@ BTC is currently around $65,000 based on latest tool output."#
             approval_manager: mock_price_approved_manager(),
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
+            reply_intent_precheck: Arc::new(crate::config::ReplyIntentPrecheckConfig::default()),
         });
 
         process_channel_message(
@@ -10816,6 +11513,9 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "test-channel".to_string(),
                 timestamp: 1,
                 thread_ts: None,
+                addressed_to_bot: false,
+                mentions_others_only: false,
+                has_attachments: false,
             },
             CancellationToken::new(),
             std::time::Instant::now(),
@@ -10874,6 +11574,7 @@ BTC is currently around $65,000 based on latest tool output."#
             approval_manager: mock_price_approved_manager(),
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
+            reply_intent_precheck: Arc::new(crate::config::ReplyIntentPrecheckConfig::default()),
         });
 
         process_channel_message(
@@ -10886,6 +11587,9 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "test-channel".to_string(),
                 timestamp: 2,
                 thread_ts: None,
+                addressed_to_bot: false,
+                mentions_others_only: false,
+                has_attachments: false,
             },
             CancellationToken::new(),
             std::time::Instant::now(),
@@ -11058,6 +11762,7 @@ BTC is currently around $65,000 based on latest tool output."#
             )),
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
+            reply_intent_precheck: Arc::new(crate::config::ReplyIntentPrecheckConfig::default()),
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(4);
@@ -11069,6 +11774,9 @@ BTC is currently around $65,000 based on latest tool output."#
             channel: "test-channel".to_string(),
             timestamp: 1,
             thread_ts: None,
+            addressed_to_bot: false,
+            mentions_others_only: false,
+            has_attachments: false,
         })
         .await
         .unwrap();
@@ -11149,6 +11857,7 @@ BTC is currently around $65,000 based on latest tool output."#
             )),
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
+            reply_intent_precheck: Arc::new(crate::config::ReplyIntentPrecheckConfig::default()),
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(8);
@@ -11161,6 +11870,9 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "telegram".to_string(),
                 timestamp: 1,
                 thread_ts: None,
+                addressed_to_bot: false,
+                mentions_others_only: false,
+                has_attachments: false,
             })
             .await
             .unwrap();
@@ -11252,6 +11964,7 @@ BTC is currently around $65,000 based on latest tool output."#
             )),
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
+            reply_intent_precheck: Arc::new(crate::config::ReplyIntentPrecheckConfig::default()),
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(8);
@@ -11264,6 +11977,9 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "telegram".to_string(),
                 timestamp: 1,
                 thread_ts: None,
+                addressed_to_bot: false,
+                mentions_others_only: false,
+                has_attachments: false,
             })
             .await
             .unwrap();
@@ -11337,6 +12053,7 @@ BTC is currently around $65,000 based on latest tool output."#
             )),
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
+            reply_intent_precheck: Arc::new(crate::config::ReplyIntentPrecheckConfig::default()),
         });
 
         process_channel_message(
@@ -11349,6 +12066,9 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "test-channel".to_string(),
                 timestamp: 1,
                 thread_ts: None,
+                addressed_to_bot: false,
+                mentions_others_only: false,
+                has_attachments: false,
             },
             CancellationToken::new(),
             std::time::Instant::now(),
@@ -11408,6 +12128,7 @@ BTC is currently around $65,000 based on latest tool output."#
             )),
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
+            reply_intent_precheck: Arc::new(crate::config::ReplyIntentPrecheckConfig::default()),
         });
 
         process_channel_message(
@@ -11420,6 +12141,9 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "test-channel".to_string(),
                 timestamp: 1,
                 thread_ts: None,
+                addressed_to_bot: false,
+                mentions_others_only: false,
+                has_attachments: false,
             },
             CancellationToken::new(),
             std::time::Instant::now(),
@@ -11800,6 +12524,9 @@ BTC is currently around $65,000 based on latest tool output."#
             channel: "slack".into(),
             timestamp: 1,
             thread_ts: None,
+            addressed_to_bot: false,
+            mentions_others_only: false,
+            has_attachments: false,
         };
 
         assert_eq!(conversation_memory_key(&msg), "slack_U123_msg_abc123");
@@ -11815,6 +12542,9 @@ BTC is currently around $65,000 based on latest tool output."#
             channel: "slack".into(),
             timestamp: 1,
             thread_ts: None,
+            addressed_to_bot: false,
+            mentions_others_only: false,
+            has_attachments: false,
         };
         let msg2 = traits::ChannelMessage {
             id: "msg_2".into(),
@@ -11824,6 +12554,9 @@ BTC is currently around $65,000 based on latest tool output."#
             channel: "slack".into(),
             timestamp: 2,
             thread_ts: None,
+            addressed_to_bot: false,
+            mentions_others_only: false,
+            has_attachments: false,
         };
 
         assert_ne!(
@@ -11842,6 +12575,9 @@ BTC is currently around $65,000 based on latest tool output."#
             channel: "slack".into(),
             timestamp: 1,
             thread_ts: None,
+            addressed_to_bot: false,
+            mentions_others_only: false,
+            has_attachments: false,
         };
 
         let user_key = conversation_memory_key(&msg);
@@ -11862,6 +12598,9 @@ BTC is currently around $65,000 based on latest tool output."#
             channel: "qq".into(),
             timestamp: 1,
             thread_ts: Some("msg-a".into()),
+            addressed_to_bot: false,
+            mentions_others_only: false,
+            has_attachments: false,
         };
         let msg2 = traits::ChannelMessage {
             id: "msg_2".into(),
@@ -11871,6 +12610,9 @@ BTC is currently around $65,000 based on latest tool output."#
             channel: "qq".into(),
             timestamp: 2,
             thread_ts: Some("msg-b".into()),
+            addressed_to_bot: false,
+            mentions_others_only: false,
+            has_attachments: false,
         };
 
         assert_eq!(conversation_history_key(&msg1), "qq_user_open_1");
@@ -11890,6 +12632,9 @@ BTC is currently around $65,000 based on latest tool output."#
             channel: "napcat".into(),
             timestamp: 1,
             thread_ts: Some("msg-a".into()),
+            addressed_to_bot: false,
+            mentions_others_only: false,
+            has_attachments: false,
         };
         let msg2 = traits::ChannelMessage {
             id: "msg_2".into(),
@@ -11899,6 +12644,9 @@ BTC is currently around $65,000 based on latest tool output."#
             channel: "napcat".into(),
             timestamp: 2,
             thread_ts: Some("msg-b".into()),
+            addressed_to_bot: false,
+            mentions_others_only: false,
+            has_attachments: false,
         };
 
         assert_eq!(conversation_history_key(&msg1), "napcat_user_1001");
@@ -11918,6 +12666,9 @@ BTC is currently around $65,000 based on latest tool output."#
             channel: "telegram".into(),
             timestamp: 1,
             thread_ts: None,
+            addressed_to_bot: false,
+            mentions_others_only: false,
+            has_attachments: false,
         };
 
         let enriched = llm_user_content_with_sender_identity(&msg, &msg.content);
@@ -11934,6 +12685,9 @@ BTC is currently around $65,000 based on latest tool output."#
             channel: "wecom".into(),
             timestamp: 1,
             thread_ts: None,
+            addressed_to_bot: false,
+            mentions_others_only: false,
+            has_attachments: false,
         };
 
         let persisted = persisted_channel_user_content(&msg, &msg.content);
@@ -11950,6 +12704,9 @@ BTC is currently around $65,000 based on latest tool output."#
             channel: "telegram".into(),
             timestamp: 1,
             thread_ts: None,
+            addressed_to_bot: false,
+            mentions_others_only: false,
+            has_attachments: false,
         };
 
         let enriched = llm_user_content_with_sender_identity(&msg, &msg.content);
@@ -11966,6 +12723,9 @@ BTC is currently around $65,000 based on latest tool output."#
             channel: "telegram".into(),
             timestamp: 1,
             thread_ts: Some("789".into()),
+            addressed_to_bot: false,
+            mentions_others_only: false,
+            has_attachments: false,
         };
 
         let enriched = llm_user_content_with_sender_identity(&msg, &msg.content);
@@ -11985,6 +12745,9 @@ BTC is currently around $65,000 based on latest tool output."#
             channel: "slack".into(),
             timestamp: 1,
             thread_ts: None,
+            addressed_to_bot: false,
+            mentions_others_only: false,
+            has_attachments: false,
         };
         let msg2 = traits::ChannelMessage {
             id: "msg_2".into(),
@@ -11994,6 +12757,9 @@ BTC is currently around $65,000 based on latest tool output."#
             channel: "slack".into(),
             timestamp: 2,
             thread_ts: None,
+            addressed_to_bot: false,
+            mentions_others_only: false,
+            has_attachments: false,
         };
 
         mem.store(
@@ -12105,6 +12871,7 @@ BTC is currently around $65,000 based on latest tool output."#
             )),
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
+            reply_intent_precheck: Arc::new(crate::config::ReplyIntentPrecheckConfig::default()),
         });
 
         process_channel_message(
@@ -12117,6 +12884,9 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "test-channel".to_string(),
                 timestamp: 1,
                 thread_ts: None,
+                addressed_to_bot: false,
+                mentions_others_only: false,
+                has_attachments: false,
             },
             CancellationToken::new(),
             std::time::Instant::now(),
@@ -12133,6 +12903,9 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "test-channel".to_string(),
                 timestamp: 2,
                 thread_ts: None,
+                addressed_to_bot: false,
+                mentions_others_only: false,
+                has_attachments: false,
             },
             CancellationToken::new(),
             std::time::Instant::now(),
@@ -12204,6 +12977,7 @@ BTC is currently around $65,000 based on latest tool output."#
             )),
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
+            reply_intent_precheck: Arc::new(crate::config::ReplyIntentPrecheckConfig::default()),
         });
 
         process_channel_message(
@@ -12216,6 +12990,9 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "wecom".to_string(),
                 timestamp: 1,
                 thread_ts: Some("req-1".to_string()),
+                addressed_to_bot: false,
+                mentions_others_only: false,
+                has_attachments: false,
             },
             CancellationToken::new(),
             std::time::Instant::now(),
@@ -12232,6 +13009,9 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "wecom".to_string(),
                 timestamp: 2,
                 thread_ts: Some("req-2".to_string()),
+                addressed_to_bot: false,
+                mentions_others_only: false,
+                has_attachments: false,
             },
             CancellationToken::new(),
             std::time::Instant::now(),
@@ -12299,6 +13079,7 @@ BTC is currently around $65,000 based on latest tool output."#
             )),
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
+            reply_intent_precheck: Arc::new(crate::config::ReplyIntentPrecheckConfig::default()),
         });
 
         process_channel_message(
@@ -12311,6 +13092,9 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "qq".to_string(),
                 timestamp: 1,
                 thread_ts: Some("msg-1".to_string()),
+                addressed_to_bot: false,
+                mentions_others_only: false,
+                has_attachments: false,
             },
             CancellationToken::new(),
             std::time::Instant::now(),
@@ -12327,6 +13111,9 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "qq".to_string(),
                 timestamp: 2,
                 thread_ts: Some("msg-2".to_string()),
+                addressed_to_bot: false,
+                mentions_others_only: false,
+                has_attachments: false,
             },
             CancellationToken::new(),
             std::time::Instant::now(),
@@ -12397,6 +13184,7 @@ BTC is currently around $65,000 based on latest tool output."#
             )),
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
+            reply_intent_precheck: Arc::new(crate::config::ReplyIntentPrecheckConfig::default()),
         });
 
         process_channel_message(
@@ -12409,6 +13197,9 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "test-channel".to_string(),
                 timestamp: 1,
                 thread_ts: None,
+                addressed_to_bot: false,
+                mentions_others_only: false,
+                has_attachments: false,
             },
             CancellationToken::new(),
             std::time::Instant::now(),
@@ -12498,6 +13289,7 @@ BTC is currently around $65,000 based on latest tool output."#
             )),
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
+            reply_intent_precheck: Arc::new(crate::config::ReplyIntentPrecheckConfig::default()),
         });
 
         process_channel_message(
@@ -12510,6 +13302,9 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "telegram".to_string(),
                 timestamp: 1,
                 thread_ts: None,
+                addressed_to_bot: false,
+                mentions_others_only: false,
+                has_attachments: false,
             },
             CancellationToken::new(),
             std::time::Instant::now(),
@@ -13380,6 +14175,7 @@ BTC is currently around $65,000 based on latest tool output."#;
             )),
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
+            reply_intent_precheck: Arc::new(crate::config::ReplyIntentPrecheckConfig::default()),
         });
 
         // Simulate a photo attachment message with [IMAGE:] marker.
@@ -13393,6 +14189,9 @@ BTC is currently around $65,000 based on latest tool output."#;
                 channel: "test-channel".to_string(),
                 timestamp: 1,
                 thread_ts: None,
+                addressed_to_bot: false,
+                mentions_others_only: false,
+                has_attachments: false,
             },
             CancellationToken::new(),
             std::time::Instant::now(),
@@ -13458,6 +14257,7 @@ BTC is currently around $65,000 based on latest tool output."#;
             )),
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
+            reply_intent_precheck: Arc::new(crate::config::ReplyIntentPrecheckConfig::default()),
         });
 
         process_channel_message(
@@ -13470,6 +14270,9 @@ BTC is currently around $65,000 based on latest tool output."#;
                 channel: "test-channel".to_string(),
                 timestamp: 1,
                 thread_ts: None,
+                addressed_to_bot: false,
+                mentions_others_only: false,
+                has_attachments: false,
             },
             CancellationToken::new(),
             std::time::Instant::now(),
@@ -13486,6 +14289,9 @@ BTC is currently around $65,000 based on latest tool output."#;
                 channel: "test-channel".to_string(),
                 timestamp: 2,
                 thread_ts: None,
+                addressed_to_bot: false,
+                mentions_others_only: false,
+                has_attachments: false,
             },
             CancellationToken::new(),
             std::time::Instant::now(),

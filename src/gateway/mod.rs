@@ -3413,6 +3413,9 @@ mod tests {
             channel: "whatsapp".into(),
             timestamp: 1,
             thread_ts: None,
+            addressed_to_bot: false,
+            mentions_others_only: false,
+            has_attachments: false,
         };
 
         let key = whatsapp_memory_key(&msg);
@@ -3429,6 +3432,9 @@ mod tests {
             channel: "qq".into(),
             timestamp: 1,
             thread_ts: Some("msg-123".into()),
+            addressed_to_bot: false,
+            mentions_others_only: false,
+            has_attachments: false,
         };
 
         let key = qq_memory_key(&msg);

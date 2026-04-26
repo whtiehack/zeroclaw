@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 
 /// A message received from or sent to a channel
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct ChannelMessage {
     pub id: String,
     pub sender: String,
@@ -12,6 +12,17 @@ pub struct ChannelMessage {
     /// Platform thread identifier (e.g. Slack `ts`, Discord thread ID).
     /// When set, replies should be posted as threaded responses.
     pub thread_ts: Option<String>,
+    /// Channel-layer hint: this inbound is explicitly addressed to the bot
+    /// (e.g. Discord @mention of bot). Used by reply-intent precheck to
+    /// short-circuit the LLM and always reply.
+    pub addressed_to_bot: bool,
+    /// Channel-layer hint: the inbound mentions other users but NOT the bot.
+    /// Used by reply-intent precheck to short-circuit to no-reply.
+    pub mentions_others_only: bool,
+    /// Channel-layer hint: the inbound carries non-text attachments
+    /// (image/file/voice). Used by reply-intent precheck to short-circuit
+    /// to reply (the main model is multi-modal; precheck model may not be).
+    pub has_attachments: bool,
 }
 
 /// Message to send through a channel

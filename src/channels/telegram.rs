@@ -892,6 +892,9 @@ impl TelegramChannel {
                 .unwrap_or_default()
                 .as_secs(),
             thread_ts: thread_id,
+            addressed_to_bot: false,
+            mentions_others_only: false,
+            has_attachments: false,
         })
     }
 
@@ -1806,6 +1809,9 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                 .unwrap_or_default()
                 .as_secs(),
             thread_ts: thread_id,
+            addressed_to_bot: false,
+            mentions_others_only: false,
+            has_attachments: false,
         })
     }
 
@@ -1954,6 +1960,9 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                 .unwrap_or_default()
                 .as_secs(),
             thread_ts: thread_id,
+            addressed_to_bot: false,
+            mentions_others_only: false,
+            has_attachments: false,
         })
     }
 
@@ -2113,6 +2122,9 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                 .unwrap_or_default()
                 .as_secs(),
             thread_ts: thread_id,
+            addressed_to_bot: false,
+            mentions_others_only: false,
+            has_attachments: false,
         })
     }
 

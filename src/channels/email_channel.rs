@@ -540,6 +540,9 @@ impl EmailChannel {
                 channel: "email".to_string(),
                 timestamp: email.timestamp,
                 thread_ts: None,
+                addressed_to_bot: false,
+                mentions_others_only: false,
+                has_attachments: false,
             };
 
             if tx.send(msg).await.is_err() {

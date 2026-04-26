@@ -1133,6 +1133,29 @@ fn mention_tags(bot_user_id: &str) -> [String; 2] {
     [format!("<@{bot_user_id}>"), format!("<@!{bot_user_id}>")]
 }
 
+/// Whether the raw content addresses the bot via mention or only mentions other users.
+/// Returns `(addressed_to_bot, mentions_others_only)`.
+/// - `addressed_to_bot`: `<@bot_id>` or `<@!bot_id>` is present.
+/// - `mentions_others_only`: at least one user mention is present and none of them
+///   point at the bot.
+/// Role mentions (`<@&id>`) are ignored.
+fn classify_user_mentions(content: &str, bot_user_id: &str) -> (bool, bool) {
+    use std::sync::OnceLock;
+    static USER_MENTION_RE: OnceLock<regex::Regex> = OnceLock::new();
+    let re = USER_MENTION_RE.get_or_init(|| regex::Regex::new(r"<@!?(\d+)>").unwrap());
+    let mut addressed = false;
+    let mut others = false;
+    for cap in re.captures_iter(content) {
+        let id = cap.get(1).map(|m| m.as_str()).unwrap_or("");
+        if !bot_user_id.is_empty() && id == bot_user_id {
+            addressed = true;
+        } else {
+            others = true;
+        }
+    }
+    (addressed, others && !addressed)
+}
+
 fn contains_bot_mention(content: &str, bot_user_id: &str) -> bool {
     let tags = mention_tags(bot_user_id);
     content.contains(&tags[0]) || content.contains(&tags[1])
@@ -1238,6 +1261,9 @@ fn try_parse_approval_interaction(
             .unwrap_or_default()
             .as_secs(),
         thread_ts: None,
+        addressed_to_bot: false,
+        mentions_others_only: false,
+        has_attachments: false,
     };
 
     Some((message, interaction_id, interaction_token))
@@ -1330,6 +1356,9 @@ fn try_parse_slash_command_interaction(
             .unwrap_or_default()
             .as_secs(),
         thread_ts: None,
+        addressed_to_bot: false,
+        mentions_others_only: false,
+        has_attachments: false,
     };
 
     Some((message, interaction_id, interaction_token, command_ident))
@@ -1932,6 +1961,8 @@ impl Channel for DiscordChannel {
                         }
                     }
 
+                    let (addressed_to_bot, mentions_others_only) =
+                        classify_user_mentions(content, &bot_user_id);
                     let channel_msg = ChannelMessage {
                         id: if message_id.is_empty() {
                             Uuid::new_v4().to_string()
@@ -1957,6 +1988,9 @@ impl Channel for DiscordChannel {
                         } else {
                             Some(message_id.to_string())
                         },
+                        addressed_to_bot,
+                        mentions_others_only,
+                        has_attachments,
                     };
 
                     if tx.send(channel_msg).await.is_err() {

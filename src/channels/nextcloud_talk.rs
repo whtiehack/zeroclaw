@@ -278,6 +278,9 @@ impl NextcloudTalkChannel {
             channel: "nextcloud_talk".to_string(),
             timestamp,
             thread_ts: None,
+            addressed_to_bot: false,
+            mentions_others_only: false,
+            has_attachments: false,
         });
 
         messages
