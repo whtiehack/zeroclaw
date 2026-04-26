@@ -3758,18 +3758,39 @@ request.
 
 Do NOT answer the user. Output one line only.";
 
-fn last_assistant_ends_with_question(history: &[ChatMessage]) -> bool {
+/// Whether the most recent assistant message looks like an invitation for
+/// the user to reply (question or enumerated list of options).
+/// Used by the short-message path to keep `1` / `2` / `a` style picks alive.
+fn last_assistant_invites_reply(history: &[ChatMessage]) -> bool {
     let trailing = history.iter().rfind(|m| m.role == "assistant");
     let Some(msg) = trailing else { return false };
     let trimmed = msg.content.trim_end();
     if trimmed.is_empty() {
         return false;
     }
-    trimmed.ends_with('?')
+    if trimmed.ends_with('?')
         || trimmed.ends_with('?')
         || trimmed.ends_with('吗')
         || trimmed.ends_with('么')
         || trimmed.ends_with('呢')
+    {
+        return true;
+    }
+    // Enumerated options: at least two lines starting with `1.` / `2)` /
+    // `(1)` / `a)` etc. Catches list-style prompts that don't end with a
+    // question mark (e.g. "请选: 1. A 2. B 3. C").
+    use std::sync::OnceLock;
+    static LIST_RE: OnceLock<regex::Regex> = OnceLock::new();
+    let re = LIST_RE.get_or_init(|| {
+        // Allow either line-start or whitespace before the marker so single-
+        // line prompts like "请选 1. A 2. B 3. C" still trigger.
+        regex::Regex::new(r"(?m)(?:^|\s)(?:\d+\s*[.)、]|\(\s*\d+\s*\)|[A-Za-z]\s*[.)])")
+            .unwrap()
+    });
+    if re.find_iter(trimmed).count() >= 2 {
+        return true;
+    }
+    false
 }
 
 fn parse_precheck_response(raw: &str) -> AssistantChannelOutcome {
@@ -3899,7 +3920,7 @@ async fn run_reply_intent_precheck(
     }
     let trimmed = msg.content.trim();
     if trimmed.chars().count() <= cfg.min_content_chars {
-        if last_assistant_ends_with_question(prior_history) {
+        if last_assistant_invites_reply(prior_history) {
             return (AssistantChannelOutcome::Reply, PrecheckPath::ShortFollowup);
         }
         return (
@@ -6884,18 +6905,40 @@ mod tests {
         }
 
         #[test]
-        fn last_assistant_question_detects_zh_and_en_punctuation() {
+        fn invites_reply_detects_questions_and_list_options() {
             let h = vec![
                 ChatMessage::user("..."),
                 ChatMessage::assistant("Which version?"),
             ];
-            assert!(last_assistant_ends_with_question(&h));
+            assert!(last_assistant_invites_reply(&h));
             let h2 = vec![ChatMessage::assistant("是这个意思吗")];
-            assert!(last_assistant_ends_with_question(&h2));
+            assert!(last_assistant_invites_reply(&h2));
             let h3 = vec![ChatMessage::assistant("好的，我去查。")];
-            assert!(!last_assistant_ends_with_question(&h3));
+            assert!(!last_assistant_invites_reply(&h3));
             let h4: Vec<ChatMessage> = vec![];
-            assert!(!last_assistant_ends_with_question(&h4));
+            assert!(!last_assistant_invites_reply(&h4));
+
+            // Multi-line numeric list (no trailing question mark)
+            let h5 = vec![ChatMessage::assistant(
+                "请选编号:\n1. 选项 A\n2. 选项 B\n3. 选项 C",
+            )];
+            assert!(last_assistant_invites_reply(&h5));
+
+            // Single-line inline list
+            let h6 = vec![ChatMessage::assistant("Choose 1) A 2) B 3) C")];
+            assert!(last_assistant_invites_reply(&h6));
+
+            // Lettered options
+            let h7 = vec![ChatMessage::assistant("a) Apple\nb) Banana")];
+            assert!(last_assistant_invites_reply(&h7));
+
+            // Parenthesized numerics
+            let h8 = vec![ChatMessage::assistant("(1) one\n(2) two")];
+            assert!(last_assistant_invites_reply(&h8));
+
+            // Single number reference is not a list
+            let h9 = vec![ChatMessage::assistant("Update to v1.0 first.")];
+            assert!(!last_assistant_invites_reply(&h9));
         }
 
         #[tokio::test]

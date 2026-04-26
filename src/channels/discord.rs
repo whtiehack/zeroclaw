@@ -1961,8 +1961,22 @@ impl Channel for DiscordChannel {
                         }
                     }
 
-                    let (addressed_to_bot, mentions_others_only) =
+                    let (mention_addressed, mention_others) =
                         classify_user_mentions(content, &bot_user_id);
+                    // Discord reply: when the user replies to one of bot's own
+                    // messages, the gateway payload includes
+                    // `referenced_message.author.id`. Treat it as if the bot
+                    // were directly addressed so the precheck short-circuits
+                    // to Reply (covers follow-ups that have no @mention).
+                    let replies_to_bot = !bot_user_id.is_empty()
+                        && d.get("referenced_message")
+                            .and_then(|r| r.get("author"))
+                            .and_then(|a| a.get("id"))
+                            .and_then(|id| id.as_str())
+                            .map(|id| id == bot_user_id)
+                            .unwrap_or(false);
+                    let addressed_to_bot = mention_addressed || replies_to_bot;
+                    let mentions_others_only = mention_others && !addressed_to_bot;
                     let channel_msg = ChannelMessage {
                         id: if message_id.is_empty() {
                             Uuid::new_v4().to_string()
