@@ -1336,9 +1336,7 @@ fn append_sender_turn(ctx: &ChannelRuntimeContext, sender_key: &str, turn: ChatM
         .unwrap_or_else(|e| e.into_inner());
     let turns = histories.entry(sender_key.to_string()).or_default();
     turns.push(turn);
-    while turns.len() > max_history {
-        turns.remove(0);
-    }
+    crate::agent::history::trim_history(turns, max_history);
 }
 
 /// Extract tool-call (assistant with tool_call content) and tool-result
@@ -2946,13 +2944,17 @@ async fn process_channel_message(
         let estimated =
             crate::agent::context_compressor::estimate_tokens(&prior_turns);
         let threshold = ctx.context_token_budget * 9 / 10;
+        let count_threshold = ctx.prompt_config.agent.max_history_messages;
 
-        if estimated >= threshold {
+        if estimated >= threshold
+            || (count_threshold > 0 && prior_turns.len() >= count_threshold)
+        {
             tracing::info!(
                 channel = %msg.channel,
                 sender = %msg.sender,
                 estimated,
                 threshold,
+                count_threshold,
                 turns = prior_turns.len(),
                 "Channel context compression triggered"
             );
@@ -3016,7 +3018,7 @@ Output concise bullet points. Be thorough but brief.";
                 transcript
             );
 
-            match tokio::time::timeout(
+            let compressed_ok = match tokio::time::timeout(
                 Duration::from_secs(300),
                 active_provider.chat_with_system(
                     Some(COMPRESS_SYSTEM),
@@ -3067,13 +3069,55 @@ Output concise bullet points. Be thorough but brief.";
                         "Channel context compression complete"
                     );
                     prior_turns = new_turns;
+                    true
                 }
                 Ok(Err(e)) => {
                     tracing::warn!("Channel context compression LLM call failed: {e}");
+                    false
                 }
                 Err(_) => {
                     tracing::warn!("Channel context compression timed out after 300s");
+                    false
                 }
+            };
+
+            if !compressed_ok {
+                let before = prior_turns.len();
+                crate::agent::history::trim_history(&mut prior_turns, 30);
+                {
+                    let mut histories = ctx
+                        .conversation_histories
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner());
+                    if let Some(turns) = histories.get_mut(&history_key) {
+                        *turns = prior_turns.clone();
+                    }
+                }
+                if let Some(ref store) = ctx.session_store {
+                    if let Err(e) = store.rewrite(&history_key, &prior_turns) {
+                        tracing::warn!(
+                            "Failed to rewrite session after fallback trim: {e}"
+                        );
+                    }
+                }
+                if let Some(channel) = target_channel.as_ref() {
+                    let _ = channel
+                        .send(
+                            &SendMessage::new(
+                                "⚠️ Compression failed, hard-trimmed history",
+                                &msg.reply_target,
+                            )
+                            .in_thread(msg.thread_ts.clone()),
+                        )
+                        .await;
+                }
+                tracing::info!(
+                    channel = %msg.channel,
+                    sender = %msg.sender,
+                    turns_before = before,
+                    turns_after = prior_turns.len(),
+                    "Channel fallback hard-trim applied after compression failure"
+                );
             }
         }
     }
