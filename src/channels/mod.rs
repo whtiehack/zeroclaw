@@ -5957,7 +5957,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         for key in store.list_sessions() {
-            let mut msgs = store.load(&key);
+            let msgs = store.load(&key);
             if msgs.is_empty() {
                 continue;
             }
