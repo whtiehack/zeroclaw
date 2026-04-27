@@ -290,40 +290,29 @@ fn normalize_cached_channel_turns_merges_consecutive_assistant_turns() {
     assert!(normalized[1].content.contains("assistant part 2"));
 }
 
-/// Verify that an orphan user turn followed by a failure-marker assistant
-/// turn normalizes correctly, so the LLM sees the failed request as closed
-/// and does not re-execute it on the next user message.
+/// After a cancelled / failed run truncates trailing tool/assistant turns
+/// (`truncate_history_after_last_user`), the surviving orphan user turn
+/// merges with the next inbound user message via `normalize_cached_channel_turns`.
+/// This is the end-to-end "A 在处理中 B 进来 → 合并提问" group-chat behavior.
 #[test]
-fn normalize_preserves_failure_marker_after_orphan_user_turn() {
+fn normalize_merges_orphan_user_with_next_inbound() {
+    // Simulated post-cancel state: history kept up through the last user
+    // turn (A's message), then B's message is appended on the next
+    // dispatch.
     let turns = vec![
-        ChatMessage::user("download something from GitHub"),
-        ChatMessage::assistant("[Task failed — not continuing this request]"),
-        ChatMessage::user("what is WAL?"),
+        ChatMessage::user("older question"),
+        ChatMessage::assistant("older answer"),
+        ChatMessage::user("user A asks"),
+        ChatMessage::user("user B asks"),
     ];
 
     let normalized = normalize_cached_channel_turns(turns);
     assert_eq!(normalized.len(), 3);
     assert_eq!(normalized[0].role, "user");
     assert_eq!(normalized[1].role, "assistant");
-    assert!(normalized[1].content.contains("Task failed"));
     assert_eq!(normalized[2].role, "user");
-    assert_eq!(normalized[2].content, "what is WAL?");
-}
-
-/// Same as above but for the timeout variant.
-#[test]
-fn normalize_preserves_timeout_marker_after_orphan_user_turn() {
-    let turns = vec![
-        ChatMessage::user("run a long task"),
-        ChatMessage::assistant("[Task timed out — not continuing this request]"),
-        ChatMessage::user("next question"),
-    ];
-
-    let normalized = normalize_cached_channel_turns(turns);
-    assert_eq!(normalized.len(), 3);
-    assert_eq!(normalized[1].role, "assistant");
-    assert!(normalized[1].content.contains("Task timed out"));
-    assert_eq!(normalized[2].content, "next question");
+    assert!(normalized[2].content.contains("user A asks"));
+    assert!(normalized[2].content.contains("user B asks"));
 }
 
 #[test]
