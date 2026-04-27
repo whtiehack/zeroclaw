@@ -1461,6 +1461,37 @@ fn rollback_orphan_user_turn(
     true
 }
 
+/// Drop trailing assistant/tool turns added during a request that was
+/// interrupted or failed mid-tool-loop, while keeping the last user turn so
+/// it can merge with the next inbound message via
+/// `normalize_cached_channel_turns`. Returns the number of turns removed.
+fn truncate_history_after_last_user(ctx: &ChannelRuntimeContext, sender_key: &str) -> usize {
+    let mut histories = ctx
+        .conversation_histories
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let Some(turns) = histories.get_mut(sender_key) else {
+        return 0;
+    };
+    let Some(idx) = turns.iter().rposition(|t| t.role == "user") else {
+        return 0;
+    };
+    let drop_count = turns.len() - (idx + 1);
+    if drop_count == 0 {
+        return 0;
+    }
+    turns.truncate(idx + 1);
+    if let Some(ref store) = ctx.session_store {
+        for _ in 0..drop_count {
+            if let Err(e) = store.remove_last(sender_key) {
+                tracing::warn!("Failed to truncate session store entry: {e}");
+                break;
+            }
+        }
+    }
+    drop_count
+}
+
 fn is_readable_local_image_reference(reference: &str) -> bool {
     let path = Path::new(reference);
     path.is_file() && std::fs::File::open(path).is_ok()
@@ -1565,31 +1596,6 @@ fn prune_unreadable_local_image_markers_from_history(
     }
 
     removed
-}
-
-fn is_missing_local_image_reference_error(error: &anyhow::Error) -> bool {
-    matches!(
-        error.downcast_ref::<crate::multimodal::MultimodalError>(),
-        Some(
-            crate::multimodal::MultimodalError::ImageSourceNotFound { .. }
-                | crate::multimodal::MultimodalError::LocalReadFailed { .. }
-        )
-    )
-}
-
-fn should_rollback_failed_user_turn(error: &anyhow::Error) -> bool {
-    if error
-        .downcast_ref::<providers::ProviderCapabilityError>()
-        .is_some_and(|capability| capability.capability.eq_ignore_ascii_case("vision"))
-    {
-        return true;
-    }
-
-    if is_missing_local_image_reference_error(error) {
-        return true;
-    }
-
-    crate::providers::reliable::is_non_retryable(error)
 }
 
 fn should_skip_memory_context_entry(key: &str, content: &str) -> bool {
@@ -3457,9 +3463,11 @@ Output concise bullet points. Be thorough but brief.";
 
     match llm_result {
         LlmExecutionResult::Cancelled => {
+            let dropped_turns = truncate_history_after_last_user(ctx.as_ref(), &history_key);
             tracing::info!(
                 channel = %msg.channel,
                 sender = %msg.sender,
+                dropped_turns,
                 "Cancelled in-flight channel request due to newer message"
             );
             runtime_trace::record_event(
@@ -3682,9 +3690,11 @@ Output concise bullet points. Be thorough but brief.";
         LlmExecutionResult::Completed(Ok(Err(e))) => {
             if crate::agent::loop_::is_tool_loop_cancelled(&e) || cancellation_token.is_cancelled()
             {
+                let dropped_turns = truncate_history_after_last_user(ctx.as_ref(), &history_key);
                 tracing::info!(
                     channel = %msg.channel,
                     sender = %msg.sender,
+                    dropped_turns,
                     "Cancelled in-flight channel request due to newer message"
                 );
                 runtime_trace::record_event(
@@ -3766,19 +3776,14 @@ Output concise bullet points. Be thorough but brief.";
                         "elapsed_ms": started_at.elapsed().as_millis(),
                     }),
                 );
-                let should_rollback_user_turn = should_rollback_failed_user_turn(&e);
-                let rolled_back = should_rollback_user_turn
-                    && rollback_orphan_user_turn(ctx.as_ref(), &history_key, &msg.content);
-
-                if !rolled_back {
-                    // Close the orphan user turn so subsequent messages don't
-                    // inherit this failed request as unfinished context.
-                    append_sender_turn(
-                        ctx.as_ref(),
-                        &history_key,
-                        ChatMessage::assistant("[Task failed — not continuing this request]"),
-                    );
-                }
+                // Drop trailing tool/assistant turns and the orphan user
+                // turn instead of appending a sentinel marker. Some models
+                // (e.g., kimi) replay the marker text verbatim as their
+                // next reply. The user-facing error reply is still sent
+                // below; on the next inbound message
+                // normalize_cached_channel_turns merges any survivor.
+                let _ = truncate_history_after_last_user(ctx.as_ref(), &history_key);
+                let _ = rollback_orphan_user_turn(ctx.as_ref(), &history_key, &msg.content);
                 if let Some(channel) = target_channel.as_ref() {
                     if let Some(ref draft_id) = draft_message_id {
                         let _ = channel
@@ -3818,13 +3823,11 @@ Output concise bullet points. Be thorough but brief.";
                 timeout_msg,
                 started_at.elapsed().as_millis()
             );
-            // Close the orphan user turn so subsequent messages don't
-            // inherit this timed-out request as unfinished context.
-            append_sender_turn(
-                ctx.as_ref(),
-                &history_key,
-                ChatMessage::assistant("[Task timed out — not continuing this request]"),
-            );
+            // Same as the failure path: drop trailing tool/assistant turns
+            // and the orphan user turn so the [Task timed out] marker is
+            // not retained for next-turn replay.
+            let _ = truncate_history_after_last_user(ctx.as_ref(), &history_key);
+            let _ = rollback_orphan_user_turn(ctx.as_ref(), &history_key, &msg.content);
             if let Some(channel) = target_channel.as_ref() {
                 let error_text =
                     "⚠️ Request timed out while waiting for the model. Please try again.";
@@ -5958,14 +5961,11 @@ pub async fn start_channels(config: Config) -> Result<()> {
             if msgs.is_empty() {
                 continue;
             }
-            // Close orphaned user turns from crashed sessions.
+            // Leave the orphan user turn alone — appending a sentinel
+            // marker risks downstream models replaying it verbatim.
+            // normalize_cached_channel_turns merges it with the next
+            // inbound user message on resume.
             if msgs.last().is_some_and(|m| m.role == "user") {
-                let closure =
-                    ChatMessage::assistant("[Session interrupted — not continuing this request]");
-                if let Err(e) = store.append(&key, &closure) {
-                    tracing::debug!("Failed to persist orphan closure for {key}: {e}");
-                }
-                msgs.push(closure);
                 orphans_closed += 1;
             }
             hydrated += 1;
