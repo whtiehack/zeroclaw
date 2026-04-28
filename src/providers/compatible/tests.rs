@@ -1554,6 +1554,7 @@ fn convert_messages_for_native_reasoning_content_serialized_only_when_present() 
         tool_call_id: None,
         tool_calls: None,
         reasoning_content: None,
+        cache_control: None,
     };
     let json = serde_json::to_string(&msg_without).unwrap();
     assert!(
@@ -1567,6 +1568,7 @@ fn convert_messages_for_native_reasoning_content_serialized_only_when_present() 
         tool_call_id: None,
         tool_calls: None,
         reasoning_content: Some("thinking...".to_string()),
+        cache_control: None,
     };
     let json = serde_json::to_string(&msg_with).unwrap();
     assert!(
