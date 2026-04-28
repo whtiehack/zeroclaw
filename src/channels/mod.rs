@@ -1414,6 +1414,13 @@ fn strip_old_tool_context(ctx: &ChannelRuntimeContext, sender_key: &str, keep_tu
     }
 }
 
+/// Tag wrapping the per-turn breadcrumb injected by
+/// `strip_old_tool_context_by_turn` when `inject_used_tools_breadcrumb` is on.
+/// `<sys:` is unlikely to appear in normal model output; the output-side
+/// scrub still strips it unconditionally.
+const SYS_USED_TOOLS_OPEN: &str = "<sys:used_tools>";
+const SYS_USED_TOOLS_CLOSE: &str = "</sys:used_tools>";
+
 /// Heuristic: does this assistant message content represent a tool call
 /// rather than a final text response?
 ///
@@ -1442,6 +1449,212 @@ fn is_tool_call_content(content: &str) -> bool {
         }
     }
     false
+}
+
+/// Extract tool names from a single tool-call assistant message.
+/// Returns names in the order they appear inside the message; an empty
+/// vector means no recognisable tool name was found.
+fn extract_tool_names_from_assistant(content: &str) -> Vec<String> {
+    let trimmed = content.trim();
+    if trimmed.is_empty() {
+        return Vec::new();
+    }
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) {
+        // OpenAI native: {"content":..., "tool_calls":[{"name":...}, ...]}
+        if let Some(arr) = value.get("tool_calls").and_then(|v| v.as_array()) {
+            let names: Vec<String> = arr
+                .iter()
+                .filter_map(|tc| tc.get("name").and_then(|v| v.as_str()).map(String::from))
+                .collect();
+            if !names.is_empty() {
+                return names;
+            }
+        }
+        // Legacy {"name": "..."} envelope.
+        if let Some(name) = value.get("name").and_then(|v| v.as_str()) {
+            return vec![name.to_string()];
+        }
+        // Legacy {"tool_call": "<name>"} or {"tool_call": {"name": "<name>"}}.
+        if let Some(tc) = value.get("tool_call") {
+            if let Some(name) = tc.as_str() {
+                return vec![name.to_string()];
+            }
+            if let Some(name) = tc.get("name").and_then(|v| v.as_str()) {
+                return vec![name.to_string()];
+            }
+        }
+    }
+    // <tool_call>name</tool_call> XML form (name or JSON body).
+    if let Some(start) = trimmed.find("<tool_call>") {
+        let after = &trimmed[start + "<tool_call>".len()..];
+        if let Some(end) = after.find("</tool_call>") {
+            let inner = after[..end].trim();
+            if !inner.is_empty() {
+                if inner.starts_with('{') {
+                    if let Ok(value) = serde_json::from_str::<serde_json::Value>(inner) {
+                        if let Some(name) = value.get("name").and_then(|v| v.as_str()) {
+                            return vec![name.to_string()];
+                        }
+                    }
+                } else {
+                    return vec![inner.to_string()];
+                }
+            }
+        }
+    }
+    Vec::new()
+}
+
+/// Aggregate tool names by first-occurrence order with a per-name count.
+/// `Vec<(name, count)>` (rather than a HashMap) keeps the rendered
+/// breadcrumb byte-stable so it does not perturb provider prompt-cache keys.
+fn aggregate_tool_names(names: &[String]) -> Vec<(String, usize)> {
+    let mut acc: Vec<(String, usize)> = Vec::new();
+    for name in names {
+        if let Some(entry) = acc.iter_mut().find(|(n, _)| n == name) {
+            entry.1 += 1;
+        } else {
+            acc.push((name.clone(), 1));
+        }
+    }
+    acc
+}
+
+/// Render `<sys:used_tools>name1, name2 x2, name3</sys:used_tools>`
+/// (count `1` is omitted, `2+` rendered as ` xN`).
+fn format_used_tools_breadcrumb(counts: &[(String, usize)]) -> String {
+    let parts: Vec<String> = counts
+        .iter()
+        .map(|(name, count)| {
+            if *count <= 1 {
+                name.clone()
+            } else {
+                format!("{name} x{count}")
+            }
+        })
+        .collect();
+    format!(
+        "{SYS_USED_TOOLS_OPEN}{}{SYS_USED_TOOLS_CLOSE}",
+        parts.join(", ")
+    )
+}
+
+/// Turn-level pruner. For every turn older than the most recent
+/// `keep_turns` user→assistant exchanges:
+///
+/// - Drops every `role=="tool"` and tool-call assistant message in the
+///   turn (mixed content + tool_calls included — see `is_tool_call_content`).
+/// - When `inject_breadcrumb` is `true` and at least one tool name was
+///   captured, prepends `<sys:used_tools>...</sys:used_tools>\n\n` to the
+///   final assistant text of that turn (idempotent via prefix check).
+/// - Turns whose only assistant entries were tool-call messages (no
+///   final text — typical for crash/cancel mid-turn) are pruned to their
+///   user message(s) only; no synthetic assistant is fabricated.
+///
+/// Recent (`keep_turns`) turns plus any trailing orphan user message are
+/// preserved verbatim, so this composes safely with
+/// `truncate_history_after_last_user` and the orphan-user merge in
+/// `normalize_cached_channel_turns`.
+fn strip_old_tool_context_by_turn(
+    turns: Vec<ChatMessage>,
+    keep_turns: usize,
+    inject_breadcrumb: bool,
+) -> Vec<ChatMessage> {
+    if keep_turns == 0 || turns.is_empty() {
+        return turns;
+    }
+
+    let user_indices: Vec<usize> = turns
+        .iter()
+        .enumerate()
+        .filter_map(|(i, m)| (m.role == "user").then_some(i))
+        .collect();
+
+    // Nothing to prune if we have ≤ keep_turns users in total.
+    if user_indices.len() <= keep_turns {
+        return turns;
+    }
+
+    // First user index that belongs to the protected (recent) tail.
+    let protected_user_idx = user_indices[user_indices.len() - keep_turns];
+
+    // Anything before `head_end` is a candidate for pruning; anything from
+    // `head_end` onward (including the trailing orphan user, if any) is
+    // preserved verbatim.
+    let head_end = protected_user_idx;
+
+    let mut output: Vec<ChatMessage> = Vec::with_capacity(turns.len());
+
+    // Preserve any leading non-user content (rare: only happens if jsonl
+    // somehow starts without a user message). We just copy it.
+    let leading_end = user_indices[0];
+    if leading_end > 0 {
+        output.extend_from_slice(&turns[..leading_end]);
+    }
+
+    // Iterate over each "old" user index → walk that turn until the next
+    // user boundary or `head_end`.
+    let head_user_count = user_indices.len() - keep_turns;
+    for (k, &user_idx) in user_indices.iter().take(head_user_count).enumerate() {
+        let next_user_idx = user_indices.get(k + 1).copied().unwrap_or(head_end);
+        let turn_end = next_user_idx.min(head_end);
+        let turn_slice = &turns[user_idx..turn_end];
+
+        let mut tool_names: Vec<String> = Vec::new();
+        // Locate the final assistant of the turn (last assistant whose
+        // content is NOT a tool-call payload).
+        let final_assistant_pos = turn_slice.iter().rposition(|m| {
+            m.role == "assistant" && !is_tool_call_content(&m.content)
+        });
+
+        // Pass 1: emit user(s) + collect tool names + emit final assistant
+        // (with breadcrumb if requested). Skip role=="tool" and tool-call
+        // assistants entirely.
+        for (offset, msg) in turn_slice.iter().enumerate() {
+            match msg.role.as_str() {
+                "user" => {
+                    output.push(msg.clone());
+                }
+                "tool" => { /* drop */ }
+                "assistant" => {
+                    if is_tool_call_content(&msg.content) {
+                        tool_names.extend(extract_tool_names_from_assistant(&msg.content));
+                        // drop the message itself
+                    } else if Some(offset) == final_assistant_pos {
+                        let mut final_msg = msg.clone();
+                        if inject_breadcrumb && !tool_names.is_empty() {
+                            let already = final_msg
+                                .content
+                                .trim_start()
+                                .starts_with(SYS_USED_TOOLS_OPEN);
+                            if !already {
+                                let counts = aggregate_tool_names(&tool_names);
+                                let breadcrumb = format_used_tools_breadcrumb(&counts);
+                                final_msg.content =
+                                    format!("{breadcrumb}\n\n{}", final_msg.content);
+                            }
+                        }
+                        output.push(final_msg);
+                    } else {
+                        // Non-final plain assistant in middle of turn (rare:
+                        // tool loop with text + later tool call). Preserve
+                        // verbatim — it isn't a tool call, so dropping it
+                        // would lose user-visible context.
+                        output.push(msg.clone());
+                    }
+                }
+                _ => {
+                    // system/other roles: preserve verbatim.
+                    output.push(msg.clone());
+                }
+            }
+        }
+    }
+
+    // Recent tail (and any trailing orphan user) — untouched.
+    output.extend_from_slice(&turns[head_end..]);
+
+    output
 }
 
 fn rollback_orphan_user_turn(
