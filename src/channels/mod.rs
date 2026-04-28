@@ -1368,52 +1368,6 @@ fn extract_current_turn_tool_messages(history: &[ChatMessage]) -> Vec<ChatMessag
         .collect()
 }
 
-/// Remove tool-role and intermediate assistant tool-call messages from
-/// conversation turns older than the most recent `keep_turns` user→assistant
-/// exchanges.  This prevents unbounded history growth while preserving
-/// tool context for the N most recent turns.
-fn strip_old_tool_context(ctx: &ChannelRuntimeContext, sender_key: &str, keep_turns: usize) {
-    let mut histories = ctx
-        .conversation_histories
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-
-    let Some(turns) = histories.get_mut(sender_key) else {
-        return;
-    };
-
-    // Walk backwards to find the boundary: count user messages to
-    // identify which turns are "recent" (protected from stripping).
-    let mut user_count = 0;
-    let mut protect_from = turns.len();
-    for (i, turn) in turns.iter().enumerate().rev() {
-        if turn.role == "user" {
-            user_count += 1;
-            if user_count > keep_turns {
-                // Everything before this index is old enough to strip.
-                protect_from = i + 1; // protect from next message onward
-                break;
-            }
-        }
-    }
-
-    // Remove tool and intermediate assistant messages before the boundary.
-    // An "intermediate assistant" is one whose content looks like a tool
-    // call (contains `<tool_call>` or starts with `{\"tool_call`).
-    let mut i = 0;
-    while i < protect_from && i < turns.len() {
-        let dominated = turns[i].role == "tool"
-            || (turns[i].role == "assistant" && is_tool_call_content(&turns[i].content));
-        if dominated {
-            turns.remove(i);
-            // Adjust boundary since we removed an element.
-            protect_from = protect_from.saturating_sub(1);
-        } else {
-            i += 1;
-        }
-    }
-}
-
 /// Tag wrapping the per-turn breadcrumb injected by
 /// `strip_old_tool_context_by_turn` when `inject_used_tools_breadcrumb` is on.
 /// `<sys:` is unlikely to appear in normal model output; the output-side
@@ -1655,6 +1609,28 @@ fn strip_old_tool_context_by_turn(
     output.extend_from_slice(&turns[head_end..]);
 
     output
+}
+
+/// Canonical entry-point for normalising a channel-history `Vec<ChatMessage>`
+/// at runtime — applied at hydrate time and after every assistant turn so
+/// the in-memory shape stays consistent regardless of the raw jsonl
+/// content (jsonl itself is never rewritten).
+///
+/// 1. `normalize_cached_channel_turns` always runs (state-machine sanity).
+/// 2. `keep_turns == 0` short-circuits to preserve the prior `keep=0`
+///    "disable" semantics — only normalisation, no strip, no breadcrumb.
+/// 3. `strip_old_tool_context_by_turn` prunes older turns and (when
+///    `inject_breadcrumb`) annotates each with a `<sys:used_tools>` tag.
+fn canonicalize_history_for_runtime(
+    turns: Vec<ChatMessage>,
+    keep_turns: usize,
+    inject_breadcrumb: bool,
+) -> Vec<ChatMessage> {
+    let normalized = normalize_cached_channel_turns(turns);
+    if keep_turns == 0 {
+        return normalized;
+    }
+    strip_old_tool_context_by_turn(normalized, keep_turns, inject_breadcrumb)
 }
 
 fn rollback_orphan_user_turn(
@@ -3906,10 +3882,28 @@ Output concise bullet points. Be thorough but brief.";
                 ChatMessage::assistant(&history_response),
             );
 
-            // Strip tool-call messages from turns older than
-            // keep_tool_context_turns to prevent unbounded growth.
-            if keep_tool_turns > 0 {
-                strip_old_tool_context(ctx.as_ref(), &history_key, keep_tool_turns);
+            // Canonicalise post-response: when keep_tool_turns > 0 strip
+            // old tool context (and optionally inject the used-tools
+            // breadcrumb); when keep_tool_turns == 0 only normalise.
+            // Mirrors the hydrate path so in-memory history stays
+            // consistent regardless of jsonl raw content.
+            {
+                let inject_breadcrumb =
+                    ctx.prompt_config.agent.inject_used_tools_breadcrumb;
+                let mut histories = ctx
+                    .conversation_histories
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                if let Some(turns) = histories.remove(&history_key) {
+                    let canonicalised = canonicalize_history_for_runtime(
+                        turns,
+                        keep_tool_turns,
+                        inject_breadcrumb,
+                    );
+                    if !canonicalised.is_empty() {
+                        histories.insert(history_key.clone(), canonicalised);
+                    }
+                }
             }
 
             // Fire-and-forget LLM-driven memory consolidation.
@@ -6225,8 +6219,15 @@ pub async fn start_channels(config: Config) -> Result<()> {
     });
 
     // Hydrate in-memory conversation histories from persisted JSONL session files.
-    // If the last persisted turn is a user message (orphan from a crash mid-query),
-    // close it with a marker so the LLM doesn't try to continue the old request.
+    // The first request after a restart used to see the raw jsonl shape
+    // (no normalisation, no strip), causing prompt-token sizes to spike
+    // until the next post-response strip ran. Canonicalising at hydrate
+    // time makes startup state match the steady state.
+    let keep_turns = runtime_ctx.prompt_config.agent.keep_tool_context_turns;
+    let inject_breadcrumb = runtime_ctx
+        .prompt_config
+        .agent
+        .inject_used_tools_breadcrumb;
     if let Some(ref store) = runtime_ctx.session_store {
         let mut hydrated = 0usize;
         let mut orphans_closed = 0usize;
@@ -6241,13 +6242,17 @@ pub async fn start_channels(config: Config) -> Result<()> {
             }
             // Leave the orphan user turn alone — appending a sentinel
             // marker risks downstream models replaying it verbatim.
-            // normalize_cached_channel_turns merges it with the next
-            // inbound user message on resume.
+            // canonicalize_history_for_runtime preserves the trailing
+            // orphan user so it merges with the next inbound message.
             if msgs.last().is_some_and(|m| m.role == "user") {
                 orphans_closed += 1;
             }
             hydrated += 1;
-            histories.insert(key, msgs);
+            let canonicalised =
+                canonicalize_history_for_runtime(msgs, keep_turns, inject_breadcrumb);
+            if !canonicalised.is_empty() {
+                histories.insert(key, canonicalised);
+            }
         }
         drop(histories);
         if hydrated > 0 {
