@@ -740,6 +740,7 @@ fn build_channel_system_prompt(
     base_prompt: &str,
     channel_name: &str,
     reply_target: &str,
+    inject_used_tools_breadcrumb: bool,
 ) -> String {
     let mut prompt = base_prompt.to_string();
 
@@ -796,6 +797,12 @@ fn build_channel_system_prompt(
             lines.push(format!("sender_userid={userid}"));
         }
         prompt.push_str(&lines.join("\n"));
+    }
+
+    if inject_used_tools_breadcrumb {
+        prompt.push_str(
+            "\n\n`<sys:used_tools>...</sys:used_tools>` in history is context only — never output this tag.\n",
+        );
     }
 
     prompt
@@ -3428,8 +3435,12 @@ Output concise bullet points. Be thorough but brief.";
     } else {
         refreshed_new_session_system_prompt(ctx.as_ref())
     };
-    let system_prompt =
-        build_channel_system_prompt(&base_system_prompt, &msg.channel, &msg.reply_target);
+    let system_prompt = build_channel_system_prompt(
+        &base_system_prompt,
+        &msg.channel,
+        &msg.reply_target,
+        ctx.prompt_config.agent.inject_used_tools_breadcrumb,
+    );
     if !memory_context.is_empty() {
         if let Some(last) = prior_turns.last_mut() {
             if last.role == "user" {

@@ -3063,7 +3063,7 @@ fn prompt_contains_all_sections() {
 
 #[test]
 fn build_channel_system_prompt_includes_wecom_group_static_context() {
-    let prompt = build_channel_system_prompt("Base", "wecom_ws", "group--project-room");
+    let prompt = build_channel_system_prompt("Base", "wecom_ws", "group--project-room", false);
     assert!(prompt.contains("[WECOM_WS_STATIC_CONTEXT_V1]"));
     assert!(prompt.contains("chat_type=group"));
     assert!(prompt.contains("conversation_scope=group--project-room"));
@@ -3071,7 +3071,7 @@ fn build_channel_system_prompt_includes_wecom_group_static_context() {
 
 #[test]
 fn build_channel_system_prompt_includes_wecom_single_static_context() {
-    let prompt = build_channel_system_prompt("Base", "wecom_ws", "user--zeroclaw_user");
+    let prompt = build_channel_system_prompt("Base", "wecom_ws", "user--zeroclaw_user", false);
     assert!(prompt.contains("[WECOM_WS_STATIC_CONTEXT_V1]"));
     assert!(prompt.contains("chat_type=single"));
     assert!(prompt.contains("conversation_scope=user--zeroclaw_user"));
@@ -3080,10 +3080,23 @@ fn build_channel_system_prompt_includes_wecom_single_static_context() {
 
 #[test]
 fn build_channel_system_prompt_includes_wecom_delivery_instructions() {
-    let prompt = build_channel_system_prompt("Base", "wecom_ws", "group--project-room");
+    let prompt = build_channel_system_prompt("Base", "wecom_ws", "group--project-room", false);
     assert!(prompt.contains("When responding on WeCom WS"));
     assert!(prompt.contains("[IMAGE:<absolute-path>]"));
     assert!(prompt.contains("Use local absolute paths"));
+}
+
+#[test]
+fn build_channel_system_prompt_omits_breadcrumb_directive_when_off() {
+    let prompt = build_channel_system_prompt("Base", "wecom_ws", "group--project-room", false);
+    assert!(!prompt.contains("<sys:used_tools>"));
+}
+
+#[test]
+fn build_channel_system_prompt_appends_breadcrumb_directive_when_on() {
+    let prompt = build_channel_system_prompt("Base", "wecom_ws", "group--project-room", true);
+    assert!(prompt.contains("<sys:used_tools>"));
+    assert!(prompt.contains("never output this tag"));
 }
 
 #[test]
