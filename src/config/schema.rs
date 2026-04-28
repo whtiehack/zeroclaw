@@ -1376,6 +1376,14 @@ pub struct AgentConfig {
     /// behavior). Default: `2`.
     #[serde(default = "default_keep_tool_context_turns")]
     pub keep_tool_context_turns: usize,
+
+    /// When stripping old tool context, prepend
+    /// `<sys:used_tools>name1, name2 x2, ...</sys:used_tools>` to the
+    /// surviving final assistant of each pruned turn. Has no effect when
+    /// `keep_tool_context_turns = 0`. Default: `false` (preserves prior
+    /// strip-only behavior; output-side scrubbing still runs unconditionally).
+    #[serde(default)]
+    pub inject_used_tools_breadcrumb: bool,
 }
 
 fn default_max_tool_result_chars() -> usize {
@@ -1427,6 +1435,7 @@ impl Default for AgentConfig {
                 crate::agent::context_compressor::ContextCompressionConfig::default(),
             max_tool_result_chars: default_max_tool_result_chars(),
             keep_tool_context_turns: default_keep_tool_context_turns(),
+            inject_used_tools_breadcrumb: false,
         }
     }
 }
