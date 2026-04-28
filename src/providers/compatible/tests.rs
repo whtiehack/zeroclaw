@@ -1856,6 +1856,52 @@ fn apply_cache_markers_marks_last_text_part_in_parts_content() {
 }
 
 #[test]
+fn apply_cache_markers_native_marks_system_and_last_two() {
+    let messages = vec![
+        NativeMessage {
+            role: "system".to_string(),
+            content: Some(MessageContent::Text("sys".to_string())),
+            tool_call_id: None,
+            tool_calls: None,
+            reasoning_content: None,
+            cache_control: None,
+        },
+        NativeMessage {
+            role: "user".to_string(),
+            content: Some(MessageContent::Text("hi".to_string())),
+            tool_call_id: None,
+            tool_calls: None,
+            reasoning_content: None,
+            cache_control: None,
+        },
+        NativeMessage {
+            role: "assistant".to_string(),
+            content: None,
+            tool_call_id: None,
+            tool_calls: Some(vec![]),
+            reasoning_content: None,
+            cache_control: None,
+        },
+        NativeMessage {
+            role: "tool".to_string(),
+            content: Some(MessageContent::Text("ok".to_string())),
+            tool_call_id: Some("tc-1".to_string()),
+            tool_calls: None,
+            reasoning_content: None,
+            cache_control: None,
+        },
+    ];
+    let marked = OpenAiCompatibleProvider::apply_cache_markers_native(messages);
+    let json = serde_json::to_string(&marked).unwrap();
+    let cache_count = json.matches(r#""cache_control":{"type":"ephemeral"}"#).count();
+    assert_eq!(cache_count, 3, "expected 3 markers, json={json}");
+    assert!(marked[0].cache_control.is_some(), "system marked");
+    assert!(marked[1].cache_control.is_none(), "middle user not marked");
+    assert!(marked[2].cache_control.is_some(), "last-1 marked even with content=None");
+    assert!(marked[3].cache_control.is_some(), "last marked");
+}
+
+#[test]
 fn apply_cache_markers_request_serializes_with_cache_control() {
     let messages = vec![
         Message::new(

@@ -235,6 +235,10 @@ impl OpenAiCompatibleProvider {
     /// (system prompt + tools schema + early history) across requests.
     /// Marker placement: when content is `Text` the marker sits on the
     /// message; when content is `Parts` it sits on the last `Text` part.
+    ///
+    /// Native tool-calling streaming uses `NativeMessage` instead of
+    /// `Message` and is handled by [`apply_cache_markers_native`]. Both
+    /// helpers share the same target-selection strategy.
     fn apply_cache_markers(mut messages: Vec<Message>) -> Vec<Message> {
         fn mark(msg: &mut Message) {
             if msg.cache_control.is_some() {
@@ -253,6 +257,46 @@ impl OpenAiCompatibleProvider {
                         Some(cc) => *cc = Some(CacheControl::ephemeral()),
                         None => msg.cache_control = Some(CacheControl::ephemeral()),
                     }
+                }
+            }
+        }
+
+        if let Some(sys) = messages.iter_mut().find(|m| m.role == "system") {
+            mark(sys);
+        }
+        let n = messages.len();
+        if n >= 2 {
+            mark(&mut messages[n - 2]);
+        }
+        if let Some(last) = messages.last_mut() {
+            mark(last);
+        }
+        messages
+    }
+
+    /// Mark cache_control on `NativeMessage` collections. Same target
+    /// strategy as [`apply_cache_markers`] (first system + last two), but
+    /// the marker sits on `Parts` content's last `Text` part when present,
+    /// otherwise on the message itself (e.g. assistant turns whose
+    /// `content` is `None` because they only carry `tool_calls`).
+    fn apply_cache_markers_native(mut messages: Vec<NativeMessage>) -> Vec<NativeMessage> {
+        fn mark(msg: &mut NativeMessage) {
+            if msg.cache_control.is_some() {
+                return;
+            }
+            match msg.content.as_mut() {
+                Some(MessageContent::Parts(parts)) => {
+                    let slot = parts.iter_mut().rev().find_map(|p| match p {
+                        MessagePart::Text { cache_control, .. } => Some(cache_control),
+                        _ => None,
+                    });
+                    match slot {
+                        Some(cc) => *cc = Some(CacheControl::ephemeral()),
+                        None => msg.cache_control = Some(CacheControl::ephemeral()),
+                    }
+                }
+                _ => {
+                    msg.cache_control = Some(CacheControl::ephemeral());
                 }
             }
         }
@@ -724,6 +768,8 @@ struct NativeMessage {
     /// that require it in assistant tool-call history messages.
     #[serde(skip_serializing_if = "Option::is_none")]
     reasoning_content: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cache_control: Option<CacheControl>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1534,6 +1580,7 @@ impl OpenAiCompatibleProvider {
                                     tool_call_id: None,
                                     tool_calls: Some(tool_calls),
                                     reasoning_content,
+                                    cache_control: None,
                                 };
                             }
                         }
@@ -1558,6 +1605,7 @@ impl OpenAiCompatibleProvider {
                             tool_call_id,
                             tool_calls: None,
                             reasoning_content: None,
+                            cache_control: None,
                         };
                     }
                 }
@@ -1572,6 +1620,7 @@ impl OpenAiCompatibleProvider {
                     tool_call_id: None,
                     tool_calls: None,
                     reasoning_content: None,
+                    cache_control: None,
                 }
             })
             .collect()
@@ -2168,13 +2217,15 @@ impl Provider for OpenAiCompatibleProvider {
 
         let tools = Self::convert_tool_specs(request.tools);
         let payload = if has_tools {
+            let native_messages = Self::convert_messages_for_native(
+                &effective_messages,
+                !self.merge_system_into_user,
+                model,
+            );
+            let native_messages = Self::apply_cache_markers_native(native_messages);
             serde_json::to_value(NativeChatRequest {
                 model: model.to_string(),
-                messages: Self::convert_messages_for_native(
-                    &effective_messages,
-                    !self.merge_system_into_user,
-                    model,
-                ),
+                messages: native_messages,
                 temperature,
                 reasoning_effort: self.reasoning_effort.clone(),
                 tool_stream: if options.enabled {
