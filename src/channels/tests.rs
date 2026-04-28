@@ -6607,3 +6607,385 @@ fn default_keep_tool_context_turns_is_two() {
     let config = crate::config::schema::AgentConfig::default();
     assert_eq!(config.keep_tool_context_turns, 2);
 }
+
+#[test]
+fn default_inject_used_tools_breadcrumb_is_false() {
+    let config = crate::config::schema::AgentConfig::default();
+    assert!(!config.inject_used_tools_breadcrumb);
+}
+
+// ── Tests for prompt-token shrinkage fix:
+// canonicalize_history_for_runtime / strip_old_tool_context_by_turn /
+// strip_sys_used_tools / native tool_call recognition ─────────
+
+fn native_tool_call_message(text: Option<&str>, calls: &[(&str, &str)]) -> ChatMessage {
+    let calls_json: Vec<serde_json::Value> = calls
+        .iter()
+        .map(|(id, name)| {
+            serde_json::json!({
+                "id": *id,
+                "name": *name,
+                "arguments": "{}",
+            })
+        })
+        .collect();
+    let content_value = match text {
+        None => serde_json::Value::Null,
+        Some(t) => serde_json::Value::String(t.to_string()),
+    };
+    let obj = serde_json::json!({
+        "content": content_value,
+        "tool_calls": calls_json,
+    });
+    ChatMessage::assistant(obj.to_string())
+}
+
+#[test]
+fn is_tool_call_content_recognises_native_tool_calls() {
+    let native = native_tool_call_message(None, &[("c1", "shell")]);
+    assert!(is_tool_call_content(&native.content));
+}
+
+#[test]
+fn is_tool_call_content_recognises_mixed_native() {
+    let mixed = native_tool_call_message(Some("interim text"), &[("c1", "shell")]);
+    assert!(is_tool_call_content(&mixed.content));
+}
+
+#[test]
+fn is_tool_call_content_ignores_native_with_empty_array() {
+    // tool_calls present but empty -> NOT a tool call
+    let body = serde_json::json!({
+        "content": "real reply",
+        "tool_calls": [],
+    });
+    assert!(!is_tool_call_content(&body.to_string()));
+}
+
+#[test]
+fn extract_tool_names_native_returns_call_order() {
+    let native = native_tool_call_message(
+        Some("text"),
+        &[("a", "memory_recall"), ("b", "http_request")],
+    );
+    let names = extract_tool_names_from_assistant(&native.content);
+    assert_eq!(names, vec!["memory_recall", "http_request"]);
+}
+
+#[test]
+fn extract_tool_names_legacy_xml_supports_plain_name_or_json() {
+    assert_eq!(
+        extract_tool_names_from_assistant("<tool_call>shell</tool_call>"),
+        vec!["shell"]
+    );
+    assert_eq!(
+        extract_tool_names_from_assistant(
+            "<tool_call>{\"name\":\"http_request\",\"args\":{}}</tool_call>"
+        ),
+        vec!["http_request"]
+    );
+}
+
+#[test]
+fn aggregate_tool_names_first_occurrence_with_counts() {
+    let counts = aggregate_tool_names(&[
+        "memory_recall".to_string(),
+        "http_request".to_string(),
+        "http_request".to_string(),
+        "memory_observe".to_string(),
+    ]);
+    assert_eq!(
+        counts,
+        vec![
+            ("memory_recall".to_string(), 1),
+            ("http_request".to_string(), 2),
+            ("memory_observe".to_string(), 1),
+        ]
+    );
+}
+
+#[test]
+fn format_used_tools_breadcrumb_omits_count_one() {
+    let s = format_used_tools_breadcrumb(&[
+        ("memory_recall".to_string(), 1),
+        ("http_request".to_string(), 2),
+    ]);
+    assert_eq!(
+        s,
+        "<sys:used_tools>memory_recall, http_request x2</sys:used_tools>"
+    );
+}
+
+#[test]
+fn strip_by_turn_keeps_recent_turn_intact() {
+    // keep_turns=1 with one old turn (tool-heavy) and one current turn.
+    let turns = vec![
+        ChatMessage::user("old query"),
+        native_tool_call_message(None, &[("c1", "shell")]),
+        ChatMessage::tool("old tool result"),
+        ChatMessage::assistant("old final reply"),
+        ChatMessage::user("current query"),
+        native_tool_call_message(None, &[("c2", "memory_recall")]),
+        ChatMessage::tool("recent tool result"),
+        ChatMessage::assistant("recent final reply"),
+    ];
+    let out = strip_old_tool_context_by_turn(turns, 1, true);
+    // Old turn collapsed to user + breadcrumb-prefixed final assistant.
+    assert_eq!(out[0].role, "user");
+    assert_eq!(out[0].content, "old query");
+    assert_eq!(out[1].role, "assistant");
+    assert!(out[1].content.starts_with("<sys:used_tools>shell</sys:used_tools>\n\n"));
+    assert!(out[1].content.ends_with("old final reply"));
+    // Recent turn preserved verbatim.
+    assert_eq!(out[2].role, "user");
+    assert_eq!(out[2].content, "current query");
+    assert!(is_tool_call_content(&out[3].content));
+    assert_eq!(out[4].role, "tool");
+    assert_eq!(out[5].role, "assistant");
+    assert_eq!(out[5].content, "recent final reply");
+}
+
+#[test]
+fn strip_by_turn_drops_mixed_native_with_paired_tool() {
+    let turns = vec![
+        ChatMessage::user("old"),
+        native_tool_call_message(Some("interim narration"), &[("c1", "shell")]),
+        ChatMessage::tool("ok"),
+        ChatMessage::assistant("done"),
+        ChatMessage::user("now"),
+        ChatMessage::assistant("ack"),
+    ];
+    let out = strip_old_tool_context_by_turn(turns, 1, true);
+    // Old-turn user + final (with breadcrumb) only — no orphan tool, no
+    // mixed assistant remains.
+    assert_eq!(out.len(), 4);
+    assert_eq!(out[0].role, "user");
+    assert!(out[1].content.starts_with("<sys:used_tools>shell</sys:used_tools>\n\n"));
+    assert_eq!(out[2].role, "user");
+    assert_eq!(out[3].role, "assistant");
+    assert_eq!(out[3].content, "ack");
+}
+
+#[test]
+fn strip_by_turn_legacy_three_forms_recognised() {
+    let turns = vec![
+        ChatMessage::user("old1"),
+        ChatMessage::assistant("<tool_call>shell</tool_call>"),
+        ChatMessage::tool("xml result"),
+        ChatMessage::assistant("done1"),
+        ChatMessage::user("old2"),
+        ChatMessage::assistant("{\"tool_call\":\"http_request\"}"),
+        ChatMessage::tool("legacy json result"),
+        ChatMessage::assistant("done2"),
+        ChatMessage::user("old3"),
+        ChatMessage::assistant("{\"name\":\"memory_recall\",\"args\":{}}"),
+        ChatMessage::tool("name-form result"),
+        ChatMessage::assistant("done3"),
+        ChatMessage::user("now"),
+        ChatMessage::assistant("ack"),
+    ];
+    let out = strip_old_tool_context_by_turn(turns, 1, true);
+    // 3 old turns -> each collapses to user + final-with-breadcrumb,
+    // plus the protected current turn (user + assistant).
+    assert_eq!(out.len(), 8);
+    assert!(out[1].content.starts_with("<sys:used_tools>shell</sys:used_tools>"));
+    assert!(out[3]
+        .content
+        .starts_with("<sys:used_tools>http_request</sys:used_tools>"));
+    assert!(out[5]
+        .content
+        .starts_with("<sys:used_tools>memory_recall</sys:used_tools>"));
+}
+
+#[test]
+fn strip_by_turn_skips_breadcrumb_when_off() {
+    let turns = vec![
+        ChatMessage::user("old"),
+        native_tool_call_message(None, &[("c1", "shell")]),
+        ChatMessage::tool("ok"),
+        ChatMessage::assistant("done"),
+        ChatMessage::user("now"),
+        ChatMessage::assistant("ack"),
+    ];
+    let out = strip_old_tool_context_by_turn(turns, 1, false);
+    // Strip still happens, but no breadcrumb prepended.
+    assert_eq!(out.len(), 4);
+    assert_eq!(out[1].role, "assistant");
+    assert_eq!(out[1].content, "done");
+}
+
+#[test]
+fn strip_by_turn_old_turn_without_final_assistant_drops_tools_only() {
+    // Crash mid-tool-loop: old turn ends with a tool message, no final.
+    let turns = vec![
+        ChatMessage::user("old crashed"),
+        native_tool_call_message(None, &[("c1", "shell")]),
+        ChatMessage::tool("partial result"),
+        ChatMessage::user("next"),
+        ChatMessage::assistant("ack"),
+    ];
+    let out = strip_old_tool_context_by_turn(turns, 1, true);
+    // Old-turn user is preserved; tool/tool-call assistant gone; no
+    // synthetic final assistant fabricated.
+    assert_eq!(out.len(), 3);
+    assert_eq!(out[0].role, "user");
+    assert_eq!(out[0].content, "old crashed");
+    assert_eq!(out[1].role, "user");
+    assert_eq!(out[2].role, "assistant");
+}
+
+#[test]
+fn strip_by_turn_preserves_trailing_orphan_user() {
+    let turns = vec![
+        ChatMessage::user("old"),
+        native_tool_call_message(None, &[("c1", "shell")]),
+        ChatMessage::tool("ok"),
+        ChatMessage::assistant("done"),
+        ChatMessage::user("now"),
+        ChatMessage::assistant("ack"),
+        ChatMessage::user("trailing orphan, awaiting reply"),
+    ];
+    let out = strip_old_tool_context_by_turn(turns, 1, true);
+    // Trailing orphan user must remain at the very end so it merges
+    // with the next inbound message.
+    assert_eq!(out.last().map(|m| m.role.as_str()), Some("user"));
+    assert_eq!(
+        out.last().map(|m| m.content.as_str()),
+        Some("trailing orphan, awaiting reply")
+    );
+}
+
+#[test]
+fn strip_by_turn_idempotent() {
+    let turns = vec![
+        ChatMessage::user("old"),
+        native_tool_call_message(None, &[("c1", "shell"), ("c2", "shell")]),
+        ChatMessage::tool("ok1"),
+        ChatMessage::tool("ok2"),
+        ChatMessage::assistant("done"),
+        ChatMessage::user("now"),
+        ChatMessage::assistant("ack"),
+    ];
+    let once = strip_old_tool_context_by_turn(turns.clone(), 1, true);
+    let twice = strip_old_tool_context_by_turn(once.clone(), 1, true);
+    assert_eq!(once.len(), twice.len());
+    for (a, b) in once.iter().zip(twice.iter()) {
+        assert_eq!(a.role, b.role);
+        assert_eq!(a.content, b.content);
+    }
+    // Breadcrumb did not double up: still exactly one open tag.
+    let breadcrumb_count = twice[1]
+        .content
+        .matches("<sys:used_tools>")
+        .count();
+    assert_eq!(breadcrumb_count, 1);
+}
+
+#[test]
+fn strip_by_turn_breadcrumb_count_is_byte_stable() {
+    // Same logical history rebuilt twice must yield the exact same
+    // breadcrumb string so prompt-cache keys do not churn.
+    let make = || {
+        vec![
+            ChatMessage::user("old"),
+            native_tool_call_message(None, &[("c1", "memory_recall")]),
+            ChatMessage::tool("hit"),
+            native_tool_call_message(None, &[("c2", "http_request"), ("c3", "http_request")]),
+            ChatMessage::tool("a"),
+            ChatMessage::tool("b"),
+            ChatMessage::assistant("done"),
+            ChatMessage::user("now"),
+            ChatMessage::assistant("ack"),
+        ]
+    };
+    let a = strip_old_tool_context_by_turn(make(), 1, true);
+    let b = strip_old_tool_context_by_turn(make(), 1, true);
+    assert_eq!(a[1].content, b[1].content);
+    assert!(a[1].content.starts_with(
+        "<sys:used_tools>memory_recall, http_request x2</sys:used_tools>\n\n"
+    ));
+}
+
+#[test]
+fn canonicalize_keep_zero_only_normalises() {
+    // keep_turns=0 should be a no-op beyond normalisation: native
+    // tool-call assistants and tool messages all survive.
+    let turns = vec![
+        ChatMessage::user("u"),
+        native_tool_call_message(None, &[("c1", "shell")]),
+        ChatMessage::tool("ok"),
+        ChatMessage::assistant("done"),
+    ];
+    let len_before = turns.len();
+    let out = canonicalize_history_for_runtime(turns, 0, true);
+    assert_eq!(out.len(), len_before);
+    assert!(is_tool_call_content(&out[1].content));
+    assert_eq!(out[2].role, "tool");
+}
+
+#[test]
+fn canonicalize_short_history_unchanged() {
+    // ≤ keep_turns user messages -> nothing to prune.
+    let turns = vec![
+        ChatMessage::user("u1"),
+        native_tool_call_message(None, &[("c1", "shell")]),
+        ChatMessage::tool("ok"),
+        ChatMessage::assistant("done"),
+    ];
+    let len_before = turns.len();
+    let out = canonicalize_history_for_runtime(turns, 2, true);
+    assert_eq!(out.len(), len_before);
+}
+
+#[test]
+fn strip_sys_used_tools_pure_tag_returns_empty() {
+    assert_eq!(strip_sys_used_tools("<sys:used_tools>a, b</sys:used_tools>"), "");
+}
+
+#[test]
+fn strip_sys_used_tools_prefix_only_preserves_body() {
+    let input = "<sys:used_tools>a</sys:used_tools>\n\nreal reply";
+    assert_eq!(strip_sys_used_tools(input), "\n\nreal reply");
+}
+
+#[test]
+fn strip_sys_used_tools_middle_preserves_surrounding() {
+    let input = "before\n<sys:used_tools>a</sys:used_tools>\nafter";
+    assert_eq!(strip_sys_used_tools(input), "before\n\nafter");
+}
+
+#[test]
+fn strip_sys_used_tools_multiple_tags_non_greedy() {
+    // Two tags inline must each be removed individually — a greedy
+    // regex would swallow the middle text.
+    let input = "<sys:used_tools>a</sys:used_tools>middle<sys:used_tools>b</sys:used_tools>";
+    assert_eq!(strip_sys_used_tools(input), "middle");
+}
+
+#[test]
+fn strip_sys_used_tools_cross_line_matches() {
+    // (?s) lets `.` match `\n`.
+    let input = "<sys:used_tools>a,\n  b</sys:used_tools>tail";
+    assert_eq!(strip_sys_used_tools(input), "tail");
+}
+
+#[test]
+fn sanitize_channel_response_scrubs_breadcrumb_in_final_reply() {
+    let tools: Vec<Box<dyn Tool>> = Vec::new();
+    let response = "<sys:used_tools>shell</sys:used_tools>\n\nHere is the answer.";
+    let sanitized = sanitize_channel_response(response, &tools);
+    assert!(!sanitized.contains("<sys:used_tools>"));
+    assert!(sanitized.contains("Here is the answer."));
+}
+
+#[test]
+fn draft_pipeline_strips_think_then_sys_used_tools() {
+    // Mirrors the DraftEvent::Progress / Content sequence in mod.rs:
+    //   strip_sys_used_tools(&strip_think_tags_inline(text))
+    let input = "<think>internal reasoning</think><sys:used_tools>shell</sys:used_tools>\n\nVisible draft";
+    let after_think = strip_think_tags_inline(input);
+    let visible = strip_sys_used_tools(&after_think);
+    assert!(!visible.contains("<sys:used_tools>"));
+    assert!(!visible.contains("<think>"));
+    assert!(visible.contains("Visible draft"));
+}
