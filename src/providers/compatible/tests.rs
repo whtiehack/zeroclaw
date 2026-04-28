@@ -69,14 +69,14 @@ fn request_serializes_correctly() {
     let req = ApiChatRequest {
         model: "llama-3.3-70b".to_string(),
         messages: vec![
-            Message {
-                role: "system".to_string(),
-                content: MessageContent::Text("You are ZeroClaw".to_string()),
-            },
-            Message {
-                role: "user".to_string(),
-                content: MessageContent::Text("hello".to_string()),
-            },
+            Message::new(
+                "system".to_string(),
+                MessageContent::Text("You are ZeroClaw".to_string()),
+            ),
+            Message::new(
+                "user".to_string(),
+                MessageContent::Text("hello".to_string()),
+            ),
         ],
         temperature: 0.4,
         stream: Some(false),
@@ -949,10 +949,10 @@ fn request_serializes_with_tools() {
 
     let req = ApiChatRequest {
         model: "test-model".to_string(),
-        messages: vec![Message {
-            role: "user".to_string(),
-            content: MessageContent::Text("What is the weather?".to_string()),
-        }],
+        messages: vec![Message::new(
+            "user".to_string(),
+            MessageContent::Text("What is the weather?".to_string()),
+        )],
         temperature: 0.7,
         stream: Some(false),
         reasoning_effort: None,
@@ -972,10 +972,10 @@ fn zai_tool_requests_enable_tool_stream() {
     let provider = make_provider("zai", "https://api.z.ai/api/paas/v4", None);
     let req = ApiChatRequest {
         model: "glm-5".to_string(),
-        messages: vec![Message {
-            role: "user".to_string(),
-            content: MessageContent::Text("List /tmp".to_string()),
-        }],
+        messages: vec![Message::new(
+            "user".to_string(),
+            MessageContent::Text("List /tmp".to_string()),
+        )],
         temperature: 0.7,
         stream: Some(false),
         reasoning_effort: None,
@@ -1006,10 +1006,10 @@ fn non_zai_tool_requests_omit_tool_stream() {
     let provider = make_provider("test", "https://api.example.com/v1", None);
     let req = ApiChatRequest {
         model: "test-model".to_string(),
-        messages: vec![Message {
-            role: "user".to_string(),
-            content: MessageContent::Text("List /tmp".to_string()),
-        }],
+        messages: vec![Message::new(
+            "user".to_string(),
+            MessageContent::Text("List /tmp".to_string()),
+        )],
         temperature: 0.7,
         stream: Some(false),
         reasoning_effort: None,
@@ -1764,4 +1764,123 @@ fn proxy_tool_event_standard_openai_chunk_returns_none() {
 #[test]
 fn proxy_tool_event_done_sentinel_returns_none() {
     assert!(parse_proxy_tool_event("data: [DONE]").is_none());
+}
+
+#[test]
+fn apply_cache_markers_marks_system_and_last_two() {
+    let messages = vec![
+        Message::new(
+            "system".to_string(),
+            MessageContent::Text("You are ZeroClaw".to_string()),
+        ),
+        Message::new(
+            "user".to_string(),
+            MessageContent::Text("first".to_string()),
+        ),
+        Message::new(
+            "assistant".to_string(),
+            MessageContent::Text("ack".to_string()),
+        ),
+        Message::new(
+            "user".to_string(),
+            MessageContent::Text("second".to_string()),
+        ),
+    ];
+    let marked = OpenAiCompatibleProvider::apply_cache_markers(messages);
+    let json = serde_json::to_string(&marked).unwrap();
+    // system + last 2 marked, middle assistant unmarked
+    let cache_count = json.matches(r#""cache_control":{"type":"ephemeral"}"#).count();
+    assert_eq!(cache_count, 3, "expected 3 cache markers, json={json}");
+    assert!(marked[0].cache_control.is_some(), "system marked");
+    assert!(marked[1].cache_control.is_none(), "middle user not marked");
+    assert!(marked[2].cache_control.is_some(), "last-1 marked");
+    assert!(marked[3].cache_control.is_some(), "last marked");
+}
+
+#[test]
+fn apply_cache_markers_handles_short_history() {
+    // Single system + user
+    let messages = vec![
+        Message::new(
+            "system".to_string(),
+            MessageContent::Text("sys".to_string()),
+        ),
+        Message::new("user".to_string(), MessageContent::Text("hi".to_string())),
+    ];
+    let marked = OpenAiCompatibleProvider::apply_cache_markers(messages);
+    assert!(marked[0].cache_control.is_some());
+    assert!(marked[1].cache_control.is_some());
+}
+
+#[test]
+fn apply_cache_markers_does_not_double_mark_lone_system() {
+    let messages = vec![Message::new(
+        "system".to_string(),
+        MessageContent::Text("sys".to_string()),
+    )];
+    let marked = OpenAiCompatibleProvider::apply_cache_markers(messages);
+    let json = serde_json::to_string(&marked).unwrap();
+    let cache_count = json.matches(r#""cache_control":{"type":"ephemeral"}"#).count();
+    assert_eq!(cache_count, 1, "lone system marked exactly once");
+}
+
+#[test]
+fn apply_cache_markers_marks_last_text_part_in_parts_content() {
+    let parts_content = MessageContent::Parts(vec![
+        MessagePart::Text {
+            text: "hello".to_string(),
+            cache_control: None,
+        },
+        MessagePart::ImageUrl {
+            image_url: ImageUrlPart {
+                url: "https://example.com/x.png".to_string(),
+            },
+        },
+        MessagePart::Text {
+            text: "world".to_string(),
+            cache_control: None,
+        },
+    ]);
+    let messages = vec![Message::new("user".to_string(), parts_content)];
+    let marked = OpenAiCompatibleProvider::apply_cache_markers(messages);
+    let json = serde_json::to_string(&marked).unwrap();
+    // Marker must be on the last text part, not on message level or first part.
+    assert!(
+        json.contains(r#""text":"world","cache_control":{"type":"ephemeral"}"#),
+        "marker on last text part, json={json}"
+    );
+    assert!(
+        !json.contains(r#""text":"hello","cache_control":"#),
+        "first part not marked"
+    );
+}
+
+#[test]
+fn apply_cache_markers_request_serializes_with_cache_control() {
+    let messages = vec![
+        Message::new(
+            "system".to_string(),
+            MessageContent::Text("sys".to_string()),
+        ),
+        Message::new("user".to_string(), MessageContent::Text("u1".to_string())),
+        Message::new("user".to_string(), MessageContent::Text("u2".to_string())),
+    ];
+    let messages = OpenAiCompatibleProvider::apply_cache_markers(messages);
+    let req = ApiChatRequest {
+        model: "glm-5.1".to_string(),
+        messages,
+        temperature: 0.0,
+        stream: Some(false),
+        reasoning_effort: None,
+        tool_stream: None,
+        tools: None,
+        tool_choice: None,
+        max_tokens: None,
+    };
+    let json = serde_json::to_string(&req).unwrap();
+    // Request body must contain cache_control field for upstream prompt-cache.
+    assert!(
+        json.contains(r#""cache_control":{"type":"ephemeral"}"#),
+        "request body carries cache_control, json={json}"
+    );
 }

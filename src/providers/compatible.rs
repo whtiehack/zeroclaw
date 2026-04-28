@@ -229,6 +229,47 @@ impl OpenAiCompatibleProvider {
         self
     }
 
+    /// Mark the first `system` message and the trailing two messages with
+    /// `cache_control: ephemeral`. Mirrors OpenCode `applyCaching` strategy,
+    /// letting OpenAI-compatible upstreams reuse the public prefix
+    /// (system prompt + tools schema + early history) across requests.
+    /// Marker placement: when content is `Text` the marker sits on the
+    /// message; when content is `Parts` it sits on the last `Text` part.
+    fn apply_cache_markers(mut messages: Vec<Message>) -> Vec<Message> {
+        fn mark(msg: &mut Message) {
+            if msg.cache_control.is_some() {
+                return;
+            }
+            match &mut msg.content {
+                MessageContent::Text(_) => {
+                    msg.cache_control = Some(CacheControl::ephemeral());
+                }
+                MessageContent::Parts(parts) => {
+                    let slot = parts.iter_mut().rev().find_map(|p| match p {
+                        MessagePart::Text { cache_control, .. } => Some(cache_control),
+                        _ => None,
+                    });
+                    match slot {
+                        Some(cc) => *cc = Some(CacheControl::ephemeral()),
+                        None => msg.cache_control = Some(CacheControl::ephemeral()),
+                    }
+                }
+            }
+        }
+
+        if let Some(sys) = messages.iter_mut().find(|m| m.role == "system") {
+            mark(sys);
+        }
+        let n = messages.len();
+        if n >= 2 {
+            mark(&mut messages[n - 2]);
+        }
+        if let Some(last) = messages.last_mut() {
+            mark(last);
+        }
+        messages
+    }
+
     /// Collect all `system` role messages, concatenate their content,
     /// and prepend to the first `user` message. Drop all system messages.
     /// Used for providers (e.g. MiniMax) that reject `role: system`.
@@ -438,6 +479,18 @@ struct ApiChatRequest {
 struct Message {
     role: String,
     content: MessageContent,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cache_control: Option<CacheControl>,
+}
+
+impl Message {
+    fn new(role: String, content: MessageContent) -> Self {
+        Self {
+            role,
+            content,
+            cache_control: None,
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -450,8 +503,29 @@ enum MessageContent {
 #[derive(Debug, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum MessagePart {
-    Text { text: String },
-    ImageUrl { image_url: ImageUrlPart },
+    Text {
+        text: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cache_control: Option<CacheControl>,
+    },
+    ImageUrl {
+        image_url: ImageUrlPart,
+    },
+}
+
+/// Anthropic-style `cache_control` marker. OpenAI-compatible providers
+/// (Z.ai GLM, Alibaba qwen, MiniMax, Moonshot Kimi, DeepSeek, MiMo, Fireworks)
+/// gate prompt cache on this field — without it cache hit rate is near 0.
+#[derive(Debug, Serialize, Clone, Copy)]
+struct CacheControl {
+    #[serde(rename = "type")]
+    kind: &'static str,
+}
+
+impl CacheControl {
+    const fn ephemeral() -> Self {
+        Self { kind: "ephemeral" }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -1377,6 +1451,7 @@ impl OpenAiCompatibleProvider {
         if !trimmed_text.is_empty() {
             parts.push(MessagePart::Text {
                 text: trimmed_text.to_string(),
+                cache_control: None,
             });
         }
 
@@ -1621,22 +1696,24 @@ impl Provider for OpenAiCompatibleProvider {
                 Some(sys) => format!("{sys}\n\n{message}"),
                 None => message.to_string(),
             };
-            messages.push(Message {
-                role: "user".to_string(),
-                content: Self::to_message_content("user", &content, !self.merge_system_into_user),
-            });
+            messages.push(Message::new(
+                "user".to_string(),
+                Self::to_message_content("user", &content, !self.merge_system_into_user),
+            ));
         } else {
             if let Some(sys) = system_prompt {
-                messages.push(Message {
-                    role: "system".to_string(),
-                    content: MessageContent::Text(sys.to_string()),
-                });
+                messages.push(Message::new(
+                    "system".to_string(),
+                    MessageContent::Text(sys.to_string()),
+                ));
             }
-            messages.push(Message {
-                role: "user".to_string(),
-                content: Self::to_message_content("user", message, true),
-            });
+            messages.push(Message::new(
+                "user".to_string(),
+                Self::to_message_content("user", message, true),
+            ));
         }
+
+        let messages = Self::apply_cache_markers(messages);
 
         let request = ApiChatRequest {
             model: model.to_string(),
@@ -1738,15 +1815,18 @@ impl Provider for OpenAiCompatibleProvider {
         };
         let api_messages: Vec<Message> = effective_messages
             .iter()
-            .map(|m| Message {
-                role: m.role.clone(),
-                content: Self::to_message_content(
-                    &m.role,
-                    &m.content,
-                    !self.merge_system_into_user,
-                ),
+            .map(|m| {
+                Message::new(
+                    m.role.clone(),
+                    Self::to_message_content(
+                        &m.role,
+                        &m.content,
+                        !self.merge_system_into_user,
+                    ),
+                )
             })
             .collect();
+        let api_messages = Self::apply_cache_markers(api_messages);
 
         let request = ApiChatRequest {
             model: model.to_string(),
@@ -1836,15 +1916,18 @@ impl Provider for OpenAiCompatibleProvider {
         };
         let api_messages: Vec<Message> = effective_messages
             .iter()
-            .map(|m| Message {
-                role: m.role.clone(),
-                content: Self::to_message_content(
-                    &m.role,
-                    &m.content,
-                    !self.merge_system_into_user,
-                ),
+            .map(|m| {
+                Message::new(
+                    m.role.clone(),
+                    Self::to_message_content(
+                        &m.role,
+                        &m.content,
+                        !self.merge_system_into_user,
+                    ),
+                )
             })
             .collect();
+        let api_messages = Self::apply_cache_markers(api_messages);
 
         let request = ApiChatRequest {
             model: model.to_string(),
@@ -2105,17 +2188,20 @@ impl Provider for OpenAiCompatibleProvider {
                 max_tokens: self.max_tokens,
             })
         } else {
-            let messages = effective_messages
+            let messages: Vec<Message> = effective_messages
                 .iter()
-                .map(|message| Message {
-                    role: message.role.clone(),
-                    content: Self::to_message_content(
-                        &message.role,
-                        &message.content,
-                        !self.merge_system_into_user,
-                    ),
+                .map(|message| {
+                    Message::new(
+                        message.role.clone(),
+                        Self::to_message_content(
+                            &message.role,
+                            &message.content,
+                            !self.merge_system_into_user,
+                        ),
+                    )
                 })
                 .collect();
+            let messages = Self::apply_cache_markers(messages);
 
             serde_json::to_value(ApiChatRequest {
                 model: model.to_string(),
@@ -2218,15 +2304,16 @@ impl Provider for OpenAiCompatibleProvider {
 
         let mut messages = Vec::new();
         if let Some(sys) = system_prompt {
-            messages.push(Message {
-                role: "system".to_string(),
-                content: MessageContent::Text(sys.to_string()),
-            });
+            messages.push(Message::new(
+                "system".to_string(),
+                MessageContent::Text(sys.to_string()),
+            ));
         }
-        messages.push(Message {
-            role: "user".to_string(),
-            content: Self::to_message_content("user", message, !self.merge_system_into_user),
-        });
+        messages.push(Message::new(
+            "user".to_string(),
+            Self::to_message_content("user", message, !self.merge_system_into_user),
+        ));
+        let messages = Self::apply_cache_markers(messages);
 
         let request = ApiChatRequest {
             model: model.to_string(),
@@ -2329,15 +2416,18 @@ impl Provider for OpenAiCompatibleProvider {
         };
         let api_messages: Vec<Message> = effective_messages
             .iter()
-            .map(|m| Message {
-                role: m.role.clone(),
-                content: Self::to_message_content(
-                    &m.role,
-                    &m.content,
-                    !self.merge_system_into_user,
-                ),
+            .map(|m| {
+                Message::new(
+                    m.role.clone(),
+                    Self::to_message_content(
+                        &m.role,
+                        &m.content,
+                        !self.merge_system_into_user,
+                    ),
+                )
             })
             .collect();
+        let api_messages = Self::apply_cache_markers(api_messages);
 
         let request = ApiChatRequest {
             model: model.to_string(),
