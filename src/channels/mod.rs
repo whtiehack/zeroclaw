@@ -879,6 +879,24 @@ fn strip_tool_summary_prefix(text: &str) -> String {
     text.to_string()
 }
 
+/// Remove every `<sys:used_tools>...</sys:used_tools>` annotation from
+/// outbound text. These tags are injected into history (see
+/// `strip_old_tool_context_by_turn`) when
+/// `inject_used_tools_breadcrumb` is on; if the LLM ever echoes them
+/// back the user must never see them.
+///
+/// Non-greedy + `(?s)` so multiple tags on a line and tags spanning
+/// newlines are all removed without swallowing surrounding text.
+/// Surrounding whitespace is preserved verbatim — callers can decide
+/// whether to trim further.
+fn strip_sys_used_tools(s: &str) -> String {
+    static SYS_USED_TOOLS_RE: std::sync::LazyLock<regex::Regex> =
+        std::sync::LazyLock::new(|| {
+            regex::Regex::new(r"(?s)<sys:used_tools>.*?</sys:used_tools>").unwrap()
+        });
+    SYS_USED_TOOLS_RE.replace_all(s, "").into_owned()
+}
+
 fn supports_runtime_model_switch(channel_name: &str) -> bool {
     matches!(
         channel_name,
@@ -2520,7 +2538,12 @@ fn sanitize_channel_response(response: &str, tools: &[Box<dyn Tool>]) -> String 
     // Strip any [Used tools: ...] prefix that the LLM may have echoed from
     // history context (#4400). Trim first to handle leading/trailing whitespace.
     let trimmed_response = response.trim();
-    let stripped_summary = strip_tool_summary_prefix(trimmed_response);
+    // Strip <sys:used_tools>...</sys:used_tools> annotations that may have
+    // been echoed from pruned-turn breadcrumbs in history. Done before the
+    // legacy [Used tools:] strip so the bracket prefix detector still sees
+    // the rest of the response unchanged.
+    let scrubbed_breadcrumb = strip_sys_used_tools(trimmed_response);
+    let stripped_summary = strip_tool_summary_prefix(&scrubbed_breadcrumb);
     // Strip XML-style tool-call tags (e.g. <tool_call>...</tool_call>)
     let stripped_xml = strip_tool_call_tags(&stripped_summary);
     // Strip isolated tool-call JSON artifacts
@@ -3476,7 +3499,11 @@ Output concise bullet points. Be thorough but brief.";
                             accumulated.clear();
                         }
                         DraftEvent::Progress(text) => {
-                            let visible = strip_think_tags_inline(&text);
+                            // Same scrub as the final reply — if the model
+                            // happens to emit `<sys:used_tools>` mid-stream,
+                            // it must not appear in the progressively
+                            // rendered draft either.
+                            let visible = strip_sys_used_tools(&strip_think_tags_inline(&text));
                             if let Err(e) = channel
                                 .update_draft_progress(&reply_target, &draft_id, &visible)
                                 .await
@@ -3486,7 +3513,8 @@ Output concise bullet points. Be thorough but brief.";
                         }
                         DraftEvent::Content(text) => {
                             accumulated.push_str(&text);
-                            let visible = strip_think_tags_inline(&accumulated);
+                            let visible =
+                                strip_sys_used_tools(&strip_think_tags_inline(&accumulated));
                             if let Err(e) = channel
                                 .update_draft(&reply_target, &draft_id, &visible)
                                 .await
