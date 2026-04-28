@@ -1416,11 +1416,32 @@ fn strip_old_tool_context(ctx: &ChannelRuntimeContext, sender_key: &str, keep_tu
 
 /// Heuristic: does this assistant message content represent a tool call
 /// rather than a final text response?
+///
+/// Recognises:
+/// - Legacy XML tag (`<tool_call>...</tool_call>`).
+/// - Legacy JSON (`{"tool_call":...}` or `{"name":...}`).
+/// - OpenAI native serialization produced by
+///   `agent::loop_::build_native_assistant_history`, i.e. an object whose
+///   `tool_calls` field is a non-empty array. Mixed messages (non-empty
+///   `content` *and* non-empty `tool_calls`) are also classified as tool
+///   calls so they get pruned together with their paired tool results —
+///   leaving them behind would create orphan tool messages.
 fn is_tool_call_content(content: &str) -> bool {
     let trimmed = content.trim();
-    trimmed.contains("<tool_call>")
+    if trimmed.contains("<tool_call>")
         || trimmed.starts_with("{\"tool_call\"")
         || trimmed.starts_with("{\"name\"")
+    {
+        return true;
+    }
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) {
+        if let Some(arr) = value.get("tool_calls").and_then(|v| v.as_array()) {
+            if !arr.is_empty() {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 fn rollback_orphan_user_turn(
