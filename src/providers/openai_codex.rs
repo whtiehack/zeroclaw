@@ -1166,6 +1166,7 @@ data: [DONE]
             extra_headers: std::collections::HashMap::new(),
             api_path: None,
             provider_max_tokens: None,
+            cache_control_models: Vec::new(),
         };
         let provider =
             OpenAiCodexProvider::new(&options, None).expect("provider should initialize");

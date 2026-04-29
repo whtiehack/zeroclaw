@@ -41,6 +41,9 @@ pub struct OpenAiCompatibleProvider {
     timeout_secs: u64,
     /// Extra HTTP headers to include in all API requests.
     extra_headers: std::collections::HashMap<String, String>,
+    /// Whitelist of model names that should receive Anthropic-style `cache_control`
+    /// markers. Empty = disabled for all models on this provider.
+    cache_control_models: Vec<String>,
     /// Optional reasoning effort for GPT-5/Codex-compatible backends.
     reasoning_effort: Option<String>,
     /// Custom API path suffix (e.g. "/v2/generate").
@@ -183,6 +186,7 @@ impl OpenAiCompatibleProvider {
             native_tool_calling: !merge_system_into_user,
             timeout_secs: 120,
             extra_headers: std::collections::HashMap::new(),
+            cache_control_models: Vec::new(),
             reasoning_effort: None,
             api_path: None,
             max_tokens: None,
@@ -207,6 +211,14 @@ impl OpenAiCompatibleProvider {
         headers: std::collections::HashMap<String, String>,
     ) -> Self {
         self.extra_headers = headers;
+        self
+    }
+
+    /// Set the whitelist of model names that should receive `cache_control` markers.
+    /// Models outside this list have markers stripped to avoid upstream schema rejects
+    /// (e.g., opencode.ai GLM-5.x routes reject extra fields).
+    pub fn with_cache_control_models(mut self, models: Vec<String>) -> Self {
+        self.cache_control_models = models;
         self
     }
 
@@ -236,10 +248,18 @@ impl OpenAiCompatibleProvider {
     /// Marker placement: when content is `Text` the marker sits on the
     /// message; when content is `Parts` it sits on the last `Text` part.
     ///
+    /// Models outside `self.cache_control_models` are returned untouched
+    /// because some upstream replicas (e.g. opencode.ai GLM-5.x) reject
+    /// requests carrying the `cache_control` field.
+    ///
     /// Native tool-calling streaming uses `NativeMessage` instead of
     /// `Message` and is handled by [`apply_cache_markers_native`]. Both
     /// helpers share the same target-selection strategy.
-    fn apply_cache_markers(mut messages: Vec<Message>) -> Vec<Message> {
+    fn apply_cache_markers(&self, mut messages: Vec<Message>, model: &str) -> Vec<Message> {
+        if !self.cache_control_models.iter().any(|m| m == model) {
+            return messages;
+        }
+
         fn mark(msg: &mut Message) {
             if msg.cache_control.is_some() {
                 return;
@@ -279,7 +299,16 @@ impl OpenAiCompatibleProvider {
     /// the marker sits on `Parts` content's last `Text` part when present,
     /// otherwise on the message itself (e.g. assistant turns whose
     /// `content` is `None` because they only carry `tool_calls`).
-    fn apply_cache_markers_native(mut messages: Vec<NativeMessage>) -> Vec<NativeMessage> {
+    /// Subject to the same model whitelist gate as [`apply_cache_markers`].
+    fn apply_cache_markers_native(
+        &self,
+        mut messages: Vec<NativeMessage>,
+        model: &str,
+    ) -> Vec<NativeMessage> {
+        if !self.cache_control_models.iter().any(|m| m == model) {
+            return messages;
+        }
+
         fn mark(msg: &mut NativeMessage) {
             if msg.cache_control.is_some() {
                 return;
@@ -1762,7 +1791,7 @@ impl Provider for OpenAiCompatibleProvider {
             ));
         }
 
-        let messages = Self::apply_cache_markers(messages);
+        let messages = self.apply_cache_markers(messages, model);
 
         let request = ApiChatRequest {
             model: model.to_string(),
@@ -1875,7 +1904,7 @@ impl Provider for OpenAiCompatibleProvider {
                 )
             })
             .collect();
-        let api_messages = Self::apply_cache_markers(api_messages);
+        let api_messages = self.apply_cache_markers(api_messages, model);
 
         let request = ApiChatRequest {
             model: model.to_string(),
@@ -1976,7 +2005,7 @@ impl Provider for OpenAiCompatibleProvider {
                 )
             })
             .collect();
-        let api_messages = Self::apply_cache_markers(api_messages);
+        let api_messages = self.apply_cache_markers(api_messages, model);
 
         let request = ApiChatRequest {
             model: model.to_string(),
@@ -2222,7 +2251,7 @@ impl Provider for OpenAiCompatibleProvider {
                 !self.merge_system_into_user,
                 model,
             );
-            let native_messages = Self::apply_cache_markers_native(native_messages);
+            let native_messages = self.apply_cache_markers_native(native_messages, model);
             serde_json::to_value(NativeChatRequest {
                 model: model.to_string(),
                 messages: native_messages,
@@ -2252,7 +2281,7 @@ impl Provider for OpenAiCompatibleProvider {
                     )
                 })
                 .collect();
-            let messages = Self::apply_cache_markers(messages);
+            let messages = self.apply_cache_markers(messages, model);
 
             serde_json::to_value(ApiChatRequest {
                 model: model.to_string(),
@@ -2364,7 +2393,7 @@ impl Provider for OpenAiCompatibleProvider {
             "user".to_string(),
             Self::to_message_content("user", message, !self.merge_system_into_user),
         ));
-        let messages = Self::apply_cache_markers(messages);
+        let messages = self.apply_cache_markers(messages, model);
 
         let request = ApiChatRequest {
             model: model.to_string(),
@@ -2478,7 +2507,7 @@ impl Provider for OpenAiCompatibleProvider {
                 )
             })
             .collect();
-        let api_messages = Self::apply_cache_markers(api_messages);
+        let api_messages = self.apply_cache_markers(api_messages, model);
 
         let request = ApiChatRequest {
             model: model.to_string(),

@@ -418,6 +418,7 @@ async fn config_toml_roundtrip() {
         provider_timeout_secs: 120,
         provider_max_tokens: None,
         extra_headers: HashMap::new(),
+        cache_control_models: Vec::new(),
         observability: ObservabilityConfig {
             backend: "log".into(),
             ..ObservabilityConfig::default()
@@ -1026,6 +1027,7 @@ async fn config_save_and_load_tmpdir() {
         provider_timeout_secs: 120,
         provider_max_tokens: None,
         extra_headers: HashMap::new(),
+        cache_control_models: Vec::new(),
         observability: ObservabilityConfig::default(),
         autonomy: AutonomyConfig::default(),
         trust: crate::trust::TrustConfig::default(),

@@ -10,6 +10,12 @@ fn make_provider(name: &str, url: &str, key: Option<&str>) -> OpenAiCompatiblePr
     OpenAiCompatibleProvider::new(name, url, key, AuthStyle::Bearer)
 }
 
+/// Test helper: provider with a `cache_control` whitelist.
+fn make_cache_provider(models: Vec<&str>) -> OpenAiCompatibleProvider {
+    make_provider("test", "https://example.com", Some("test-key"))
+        .with_cache_control_models(models.into_iter().map(String::from).collect())
+}
+
 async fn spawn_transport_error_server() -> (String, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -1788,7 +1794,8 @@ fn apply_cache_markers_marks_system_and_last_two() {
             MessageContent::Text("second".to_string()),
         ),
     ];
-    let marked = OpenAiCompatibleProvider::apply_cache_markers(messages);
+    let provider = make_cache_provider(vec!["test-model"]);
+    let marked = provider.apply_cache_markers(messages, "test-model");
     let json = serde_json::to_string(&marked).unwrap();
     // system + last 2 marked, middle assistant unmarked
     let cache_count = json.matches(r#""cache_control":{"type":"ephemeral"}"#).count();
@@ -1809,7 +1816,8 @@ fn apply_cache_markers_handles_short_history() {
         ),
         Message::new("user".to_string(), MessageContent::Text("hi".to_string())),
     ];
-    let marked = OpenAiCompatibleProvider::apply_cache_markers(messages);
+    let provider = make_cache_provider(vec!["test-model"]);
+    let marked = provider.apply_cache_markers(messages, "test-model");
     assert!(marked[0].cache_control.is_some());
     assert!(marked[1].cache_control.is_some());
 }
@@ -1820,7 +1828,8 @@ fn apply_cache_markers_does_not_double_mark_lone_system() {
         "system".to_string(),
         MessageContent::Text("sys".to_string()),
     )];
-    let marked = OpenAiCompatibleProvider::apply_cache_markers(messages);
+    let provider = make_cache_provider(vec!["test-model"]);
+    let marked = provider.apply_cache_markers(messages, "test-model");
     let json = serde_json::to_string(&marked).unwrap();
     let cache_count = json.matches(r#""cache_control":{"type":"ephemeral"}"#).count();
     assert_eq!(cache_count, 1, "lone system marked exactly once");
@@ -1844,7 +1853,8 @@ fn apply_cache_markers_marks_last_text_part_in_parts_content() {
         },
     ]);
     let messages = vec![Message::new("user".to_string(), parts_content)];
-    let marked = OpenAiCompatibleProvider::apply_cache_markers(messages);
+    let provider = make_cache_provider(vec!["test-model"]);
+    let marked = provider.apply_cache_markers(messages, "test-model");
     let json = serde_json::to_string(&marked).unwrap();
     // Marker must be on the last text part, not on message level or first part.
     assert!(
@@ -1855,6 +1865,42 @@ fn apply_cache_markers_marks_last_text_part_in_parts_content() {
         !json.contains(r#""text":"hello","cache_control":"#),
         "first part not marked"
     );
+}
+
+#[test]
+fn apply_cache_markers_skips_when_model_not_in_whitelist() {
+    let messages = vec![
+        Message::new(
+            "system".to_string(),
+            MessageContent::Text("sys".to_string()),
+        ),
+        Message::new("user".to_string(), MessageContent::Text("u1".to_string())),
+        Message::new("user".to_string(), MessageContent::Text("u2".to_string())),
+    ];
+    // Whitelist has kimi-k2.6 but request is for glm-5.1 (rejected by upstream).
+    let provider = make_cache_provider(vec!["kimi-k2.6"]);
+    let marked = provider.apply_cache_markers(messages, "glm-5.1");
+    let json = serde_json::to_string(&marked).unwrap();
+    assert!(
+        !json.contains("cache_control"),
+        "no cache_control fields when model not whitelisted, json={json}"
+    );
+    assert!(marked.iter().all(|m| m.cache_control.is_none()));
+}
+
+#[test]
+fn apply_cache_markers_skips_when_whitelist_empty() {
+    let messages = vec![
+        Message::new(
+            "system".to_string(),
+            MessageContent::Text("sys".to_string()),
+        ),
+        Message::new("user".to_string(), MessageContent::Text("u".to_string())),
+    ];
+    // Empty whitelist = disabled for all models (default config).
+    let provider = make_cache_provider(vec![]);
+    let marked = provider.apply_cache_markers(messages, "kimi-k2.6");
+    assert!(marked.iter().all(|m| m.cache_control.is_none()));
 }
 
 #[test]
@@ -1893,7 +1939,8 @@ fn apply_cache_markers_native_marks_system_and_last_two() {
             cache_control: None,
         },
     ];
-    let marked = OpenAiCompatibleProvider::apply_cache_markers_native(messages);
+    let provider = make_cache_provider(vec!["test-model"]);
+    let marked = provider.apply_cache_markers_native(messages, "test-model");
     let json = serde_json::to_string(&marked).unwrap();
     let cache_count = json.matches(r#""cache_control":{"type":"ephemeral"}"#).count();
     assert_eq!(cache_count, 3, "expected 3 markers, json={json}");
@@ -1901,6 +1948,31 @@ fn apply_cache_markers_native_marks_system_and_last_two() {
     assert!(marked[1].cache_control.is_none(), "middle user not marked");
     assert!(marked[2].cache_control.is_some(), "last-1 marked even with content=None");
     assert!(marked[3].cache_control.is_some(), "last marked");
+}
+
+#[test]
+fn apply_cache_markers_native_skips_when_model_not_in_whitelist() {
+    let messages = vec![
+        NativeMessage {
+            role: "system".to_string(),
+            content: Some(MessageContent::Text("sys".to_string())),
+            tool_call_id: None,
+            tool_calls: None,
+            reasoning_content: None,
+            cache_control: None,
+        },
+        NativeMessage {
+            role: "user".to_string(),
+            content: Some(MessageContent::Text("hi".to_string())),
+            tool_call_id: None,
+            tool_calls: None,
+            reasoning_content: None,
+            cache_control: None,
+        },
+    ];
+    let provider = make_cache_provider(vec!["kimi-k2.6"]);
+    let marked = provider.apply_cache_markers_native(messages, "glm-5.1");
+    assert!(marked.iter().all(|m| m.cache_control.is_none()));
 }
 
 #[test]
@@ -1913,9 +1985,10 @@ fn apply_cache_markers_request_serializes_with_cache_control() {
         Message::new("user".to_string(), MessageContent::Text("u1".to_string())),
         Message::new("user".to_string(), MessageContent::Text("u2".to_string())),
     ];
-    let messages = OpenAiCompatibleProvider::apply_cache_markers(messages);
+    let provider = make_cache_provider(vec!["kimi-k2.6"]);
+    let messages = provider.apply_cache_markers(messages, "kimi-k2.6");
     let req = ApiChatRequest {
-        model: "glm-5.1".to_string(),
+        model: "kimi-k2.6".to_string(),
         messages,
         temperature: 0.0,
         stream: Some(false),

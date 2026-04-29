@@ -481,6 +481,7 @@ pub fn all_tools_with_runtime(
             extra_headers: root_config.extra_headers.clone(),
             api_path: root_config.api_path.clone(),
             provider_max_tokens: root_config.provider_max_tokens,
+            cache_control_models: root_config.cache_control_models.clone(),
         };
         tool_arcs.push(Arc::new(LlmTaskTool::new(
             security.clone(),
@@ -921,6 +922,7 @@ pub fn all_tools_with_runtime(
         provider_max_tokens: root_config.provider_max_tokens,
         extra_headers: root_config.extra_headers.clone(),
         api_path: root_config.api_path.clone(),
+        cache_control_models: root_config.cache_control_models.clone(),
     };
 
     let delegate_handle: Option<DelegateParentToolsHandle> = if agents.is_empty() {

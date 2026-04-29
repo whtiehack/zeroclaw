@@ -709,6 +709,9 @@ pub struct ProviderRuntimeOptions {
     /// Maximum output tokens for LLM provider API requests.
     /// `None` uses the provider's built-in default.
     pub provider_max_tokens: Option<u32>,
+    /// Whitelist of model names that should receive Anthropic-style `cache_control`
+    /// markers on the OpenAI-compatible request path. Empty = disabled.
+    pub cache_control_models: Vec<String>,
 }
 
 impl Default for ProviderRuntimeOptions {
@@ -724,6 +727,7 @@ impl Default for ProviderRuntimeOptions {
             extra_headers: std::collections::HashMap::new(),
             api_path: None,
             provider_max_tokens: None,
+            cache_control_models: Vec::new(),
         }
     }
 }
@@ -742,6 +746,7 @@ pub fn provider_runtime_options_from_config(
         extra_headers: config.extra_headers.clone(),
         api_path: config.api_path.clone(),
         provider_max_tokens: config.provider_max_tokens,
+        cache_control_models: config.cache_control_models.clone(),
     }
 }
 
@@ -1091,6 +1096,7 @@ fn create_provider_with_url_and_options(
         let extra_headers = options.extra_headers.clone();
         let api_path = options.api_path.clone();
         let max_tokens = options.provider_max_tokens;
+        let cache_control_models = options.cache_control_models.clone();
         move |p: OpenAiCompatibleProvider| -> Box<dyn Provider> {
             let mut p = p;
             if let Some(t) = timeout {
@@ -1107,6 +1113,9 @@ fn create_provider_with_url_and_options(
             }
             if let Some(mt) = max_tokens {
                 p = p.with_max_tokens(Some(mt));
+            }
+            if !cache_control_models.is_empty() {
+                p = p.with_cache_control_models(cache_control_models.clone());
             }
             Box::new(p)
         }

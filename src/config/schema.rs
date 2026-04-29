@@ -121,6 +121,13 @@ pub struct Config {
     #[serde(default)]
     pub extra_headers: HashMap<String, String>,
 
+    /// Whitelist of model names that should receive Anthropic-style `cache_control`
+    /// markers on the OpenAI-compatible request path. Models outside this list
+    /// (including `glm-*` which is rejected by upstream opencode.ai schema validators)
+    /// are sent without `cache_control`. Empty (default) = disabled for all models.
+    #[serde(default)]
+    pub cache_control_models: Vec<String>,
+
     /// Observability backend configuration (`[observability]`).
     #[serde(default)]
     pub observability: ObservabilityConfig,
@@ -8322,6 +8329,7 @@ impl Default for Config {
             provider_timeout_secs: default_provider_timeout_secs(),
             provider_max_tokens: None,
             extra_headers: HashMap::new(),
+            cache_control_models: Vec::new(),
             observability: ObservabilityConfig::default(),
             autonomy: AutonomyConfig::default(),
             trust: crate::trust::TrustConfig::default(),
