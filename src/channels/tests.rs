@@ -3096,7 +3096,8 @@ fn build_channel_system_prompt_omits_breadcrumb_directive_when_off() {
 fn build_channel_system_prompt_appends_breadcrumb_directive_when_on() {
     let prompt = build_channel_system_prompt("Base", "wecom_ws", "group--project-room", true);
     assert!(prompt.contains("<sys:used_tools>"));
-    assert!(prompt.contains("never output this tag"));
+    assert!(prompt.contains("do NOT reconstruct command syntax"));
+    assert!(prompt.contains("Never output this tag"));
 }
 
 #[test]

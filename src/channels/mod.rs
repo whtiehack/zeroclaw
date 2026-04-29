@@ -801,7 +801,7 @@ fn build_channel_system_prompt(
 
     if inject_used_tools_breadcrumb {
         prompt.push_str(
-            "\n\n`<sys:used_tools>...</sys:used_tools>` in history is context only — never output this tag.\n",
+            "\n\n`<sys:used_tools>name1, name2 x2, …</sys:used_tools>` is a server-side breadcrumb listing the *names* of tools used in earlier turns that have been trimmed for context — it carries no args, no outputs. Use it only to know which tools were used before; do NOT reconstruct command syntax or argument formats from it. Never output this tag.\n",
         );
     }
 
