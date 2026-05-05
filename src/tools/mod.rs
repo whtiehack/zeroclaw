@@ -38,7 +38,9 @@ pub mod delegate_coordination_status;
 pub mod docx_read;
 #[cfg(feature = "channel-lark")]
 pub mod feishu_doc;
+pub mod file_delete;
 pub mod file_edit;
+pub mod file_move;
 pub mod file_read;
 pub mod file_write;
 pub mod git_operations;
@@ -109,7 +111,9 @@ pub use delegate_coordination_status::DelegateCoordinationStatusTool;
 pub use docx_read::DocxReadTool;
 #[cfg(feature = "channel-lark")]
 pub use feishu_doc::FeishuDocTool;
+pub use file_delete::FileDeleteTool;
 pub use file_edit::FileEditTool;
+pub use file_move::FileMoveTool;
 pub use file_read::FileReadTool;
 pub use file_write::FileWriteTool;
 pub use git_operations::GitOperationsTool;
@@ -359,6 +363,8 @@ pub fn default_tools_with_runtime(
         tools.push(Box::new(FileReadTool::new(security.clone())));
         tools.push(Box::new(FileWriteTool::new(security.clone())));
         tools.push(Box::new(FileEditTool::new(security.clone())));
+        tools.push(Box::new(FileMoveTool::new(security.clone())));
+        tools.push(Box::new(FileDeleteTool::new(security.clone())));
         tools.push(Box::new(ApplyPatchTool::new()));
         tools.push(Box::new(GlobSearchTool::new(security.clone())));
         tools.push(Box::new(ContentSearchTool::new(security.clone())));
@@ -489,6 +495,8 @@ pub fn all_tools_with_runtime(
         tool_arcs.push(Arc::new(FileReadTool::new(security.clone())));
         tool_arcs.push(Arc::new(FileWriteTool::new(security.clone())));
         tool_arcs.push(Arc::new(FileEditTool::new(security.clone())));
+        tool_arcs.push(Arc::new(FileMoveTool::new(security.clone())));
+        tool_arcs.push(Arc::new(FileDeleteTool::new(security.clone())));
         tool_arcs.push(Arc::new(ApplyPatchTool::new()));
         tool_arcs.push(Arc::new(GlobSearchTool::new(security.clone())));
         tool_arcs.push(Arc::new(ContentSearchTool::new(security.clone())));
@@ -924,6 +932,8 @@ mod tests {
         assert!(!names.contains(&"file_read"));
         assert!(!names.contains(&"file_write"));
         assert!(!names.contains(&"file_edit"));
+        assert!(!names.contains(&"file_move"));
+        assert!(!names.contains(&"file_delete"));
         assert!(!names.contains(&"apply_patch"));
         assert!(!names.contains(&"glob_search"));
         assert!(!names.contains(&"content_search"));
@@ -1096,6 +1106,8 @@ mod tests {
         assert!(!names.contains(&"file_read"));
         assert!(!names.contains(&"file_write"));
         assert!(!names.contains(&"file_edit"));
+        assert!(!names.contains(&"file_move"));
+        assert!(!names.contains(&"file_delete"));
         assert!(!names.contains(&"openclaw_migration"));
     }
 
@@ -1144,6 +1156,8 @@ mod tests {
         assert!(names.contains(&"file_read"));
         assert!(names.contains(&"file_write"));
         assert!(names.contains(&"file_edit"));
+        assert!(names.contains(&"file_move"));
+        assert!(names.contains(&"file_delete"));
         assert!(names.contains(&"glob_search"));
         assert!(names.contains(&"content_search"));
     }
