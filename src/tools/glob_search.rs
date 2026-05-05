@@ -7,6 +7,21 @@ use std::time::SystemTime;
 
 const MAX_RESULTS: usize = 1000;
 
+/// Translate user-friendly trailing `**` (intent: "everything under here") into
+/// the strict glob-crate form `**/*`. In `rust-lang/glob`, `**` is its own
+/// path component; standing alone at the end of a pattern it requires another
+/// segment after it, otherwise it expands to nothing. Models reach for
+/// `discord/**` first, so we normalize it transparently.
+fn normalize_glob_pattern(pat: &str) -> String {
+    if pat == "**" {
+        return "**/*".to_string();
+    }
+    if let Some(prefix) = pat.strip_suffix("/**") {
+        return format!("{prefix}/**/*");
+    }
+    pat.to_string()
+}
+
 fn format_size(size: u64) -> String {
     const KB: u64 = 1024;
     const MB: u64 = 1024 * KB;
@@ -107,7 +122,8 @@ impl Tool for GlobSearchTool {
 
         // Build full pattern anchored to workspace
         let workspace = &self.security.workspace_dir;
-        let full_pattern = workspace.join(pattern).to_string_lossy().to_string();
+        let normalized = normalize_glob_pattern(pattern);
+        let full_pattern = workspace.join(&normalized).to_string_lossy().to_string();
 
         let entries = match glob::glob(&full_pattern) {
             Ok(paths) => paths,
@@ -423,6 +439,33 @@ mod tests {
         assert!(lines[0].starts_with("b.txt"));
         assert!(lines[1].starts_with("a.txt"));
         assert!(lines[2].starts_with("c.txt"));
+    }
+
+    #[test]
+    fn normalize_trailing_double_star() {
+        assert_eq!(normalize_glob_pattern("discord/**"), "discord/**/*");
+        assert_eq!(normalize_glob_pattern("**"), "**/*");
+        assert_eq!(normalize_glob_pattern("a/b/**"), "a/b/**/*");
+        // Patterns that already have content after `**` are left alone.
+        assert_eq!(normalize_glob_pattern("discord/**/*"), "discord/**/*");
+        assert_eq!(normalize_glob_pattern("discord/**/*.cs"), "discord/**/*.cs");
+        assert_eq!(normalize_glob_pattern("discord/*"), "discord/*");
+        assert_eq!(normalize_glob_pattern("*.txt"), "*.txt");
+    }
+
+    #[tokio::test]
+    async fn glob_search_trailing_double_star_lists_all_files() {
+        let dir = TempDir::new().unwrap();
+        std::fs::create_dir_all(dir.path().join("sub")).unwrap();
+        std::fs::write(dir.path().join("top.txt"), "").unwrap();
+        std::fs::write(dir.path().join("sub/leaf.txt"), "").unwrap();
+
+        let tool = GlobSearchTool::new(test_security(dir.path().to_path_buf()));
+        let result = tool.execute(json!({"pattern": "**"})).await.unwrap();
+
+        assert!(result.success);
+        assert!(result.output.contains("top.txt"));
+        assert!(result.output.contains("leaf.txt"));
     }
 
     #[tokio::test]
