@@ -1159,8 +1159,7 @@ mod tests {
         let result = tool
             .execute(json!({
                 "path": format!("~/{}", target_rel),
-                "old_string": "beta",
-                "new_string": "delta"
+                "edits": [{"old_string": "beta", "new_string": "delta"}]
             }))
             .await
             .unwrap();

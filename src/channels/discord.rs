@@ -381,6 +381,23 @@ fn sanitize_attachment_filename(name: &str) -> String {
     }
 }
 
+/// Returns true when `name` starts with one or more digits followed by `-`,
+/// matching the upload naming scheme `<message_id>-<safe_name>` produced by
+/// [`write_upload_to_workspace`]. LLM-written / renamed files have semantic
+/// names without a digit-prefix and are intentionally never auto-deleted.
+fn is_user_upload_filename(name: &str) -> bool {
+    let mut chars = name.chars();
+    let mut saw_digit = false;
+    for c in chars.by_ref() {
+        if c.is_ascii_digit() {
+            saw_digit = true;
+            continue;
+        }
+        return saw_digit && c == '-';
+    }
+    false
+}
+
 fn cleanup_stale_uploads(upload_dir: &Path) {
     use std::time::{Duration, SystemTime};
     if !upload_dir.exists() {
@@ -400,6 +417,16 @@ fn cleanup_stale_uploads(upload_dir: &Path) {
         if !meta.is_file() {
             continue;
         }
+        // Only auto-delete files that look like raw user uploads
+        // (`<digits>-...`). LLM-written or renamed files keep their semantic
+        // names and must not be reaped.
+        let file_name = match entry.file_name().to_str() {
+            Some(s) => s.to_string(),
+            None => continue,
+        };
+        if !is_user_upload_filename(&file_name) {
+            continue;
+        }
         let Ok(mtime) = meta.modified() else { continue };
         if let Ok(age) = now.duration_since(mtime) {
             if age > max_age {
@@ -409,6 +436,29 @@ fn cleanup_stale_uploads(upload_dir: &Path) {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod cleanup_tests {
+    use super::is_user_upload_filename;
+
+    #[test]
+    fn user_upload_pattern_matches_digit_dash_prefix() {
+        assert!(is_user_upload_filename("123456789-foo.lua"));
+        assert!(is_user_upload_filename("1-tiny.txt"));
+        assert!(is_user_upload_filename("9876543210-长名字.zip"));
+    }
+
+    #[test]
+    fn user_upload_pattern_rejects_semantic_names() {
+        assert!(!is_user_upload_filename("script.lua"));
+        assert!(!is_user_upload_filename("README.md"));
+        assert!(!is_user_upload_filename("renamed-file.cs"));
+        assert!(!is_user_upload_filename("123abc-mixed.txt"));
+        assert!(!is_user_upload_filename("123"));
+        assert!(!is_user_upload_filename("-leading-dash"));
+        assert!(!is_user_upload_filename(""));
     }
 }
 
