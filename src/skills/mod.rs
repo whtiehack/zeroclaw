@@ -804,6 +804,22 @@ fn append_xml_escaped(out: &mut String, text: &str) {
     }
 }
 
+/// Minimal XML escape for element content.
+///
+/// XML 1.0 only requires `&` and `<` to be escaped inside element content.
+/// Keeping quotes/apostrophes/`>` raw spares the model from spending reasoning
+/// budget on `&quot;`/`&apos;` noise — instructions often contain JSON snippets
+/// where the original quoting is what the model needs to read.
+fn append_xml_content_minimal(out: &mut String, text: &str) {
+    for ch in text.chars() {
+        match ch {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            _ => out.push(ch),
+        }
+    }
+}
+
 fn write_xml_text_element(out: &mut String, indent: usize, tag: &str, value: &str) {
     for _ in 0..indent {
         out.push(' ');
@@ -812,6 +828,19 @@ fn write_xml_text_element(out: &mut String, indent: usize, tag: &str, value: &st
     out.push_str(tag);
     out.push('>');
     append_xml_escaped(out, value);
+    out.push_str("</");
+    out.push_str(tag);
+    out.push_str(">\n");
+}
+
+fn write_xml_content_element(out: &mut String, indent: usize, tag: &str, value: &str) {
+    for _ in 0..indent {
+        out.push(' ');
+    }
+    out.push('<');
+    out.push_str(tag);
+    out.push('>');
+    append_xml_content_minimal(out, value);
     out.push_str("</");
     out.push_str(tag);
     out.push_str(">\n");
@@ -894,7 +923,7 @@ pub fn skills_to_prompt_with_mode(
             if !skill.prompts.is_empty() {
                 let _ = writeln!(prompt, "    <instructions>");
                 for instruction in &skill.prompts {
-                    write_xml_text_element(&mut prompt, 6, "instruction", instruction);
+                    write_xml_content_element(&mut prompt, 6, "instruction", instruction);
                 }
                 let _ = writeln!(prompt, "    </instructions>");
             }

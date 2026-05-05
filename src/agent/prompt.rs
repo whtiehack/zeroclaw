@@ -284,7 +284,7 @@ fn inject_workspace_file(prompt: &mut String, workspace_dir: &Path, filename: &s
             }
         }
         Err(_) => {
-            let _ = writeln!(prompt, "### {filename}\n\n[File not found: {filename}]\n");
+            // File missing → skip silently; placeholder headings waste prompt budget.
         }
     }
 }

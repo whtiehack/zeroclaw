@@ -5635,8 +5635,8 @@ fn inject_workspace_file(
             }
         }
         Err(_) => {
-            // Missing-file marker (matches OpenClaw behavior)
-            let _ = writeln!(prompt, "### {filename}\n\n[File not found: {filename}]\n");
+            // File missing → skip silently; emitting a "[File not found]"
+            // placeholder wastes prompt budget without giving the model anything actionable.
         }
     }
 }
@@ -12312,14 +12312,22 @@ BTC is currently around $65,000 based on latest tool output."#
     }
 
     #[test]
-    fn prompt_missing_file_markers() {
+    fn prompt_missing_files_skipped_silently() {
         let tmp = TempDir::new().unwrap();
         // Empty workspace — no files at all
         let prompt = build_system_prompt(tmp.path(), "model", &[], &[], None, None);
 
-        assert!(prompt.contains("[File not found: SOUL.md]"));
-        assert!(prompt.contains("[File not found: AGENTS.md]"));
-        assert!(prompt.contains("[File not found: IDENTITY.md]"));
+        // Missing files no longer emit placeholder headings or markers.
+        for marker in ["SOUL.md", "AGENTS.md", "IDENTITY.md", "TOOLS.md", "USER.md"] {
+            assert!(
+                !prompt.contains(&format!("### {marker}")),
+                "missing {marker} should not produce a heading"
+            );
+            assert!(
+                !prompt.contains(&format!("[File not found: {marker}]")),
+                "missing {marker} should not produce a placeholder"
+            );
+        }
     }
 
     #[test]
@@ -12485,8 +12493,10 @@ BTC is currently around $65,000 based on latest tool output."#
         assert!(prompt.contains("<name>run&quot;linter&quot;</name>"));
         assert!(prompt.contains("<description>Run &lt;lint&gt; &amp; report</description>"));
         assert!(prompt.contains("<kind>shell&amp;exec</kind>"));
+        // <instruction> uses minimal escape (only `&` and `<`); quotes stay raw
+        // so the model reads JSON-style snippets without unescaping `&quot;`.
         assert!(prompt.contains(
-            "<instruction>Use &lt;tool_call&gt; and &amp; keep output &quot;safe&quot;</instruction>"
+            "<instruction>Use &lt;tool_call&gt; and &amp; keep output \"safe\"</instruction>"
         ));
     }
 
