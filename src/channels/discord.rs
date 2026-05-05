@@ -185,12 +185,9 @@ fn normalize_group_reply_allowed_sender_ids(sender_ids: Vec<String>) -> Vec<Stri
 ///
 /// - `image/*` → `[IMAGE:<url>]` (octet-stream/unknown MIME fall back to extension check)
 /// - `audio/*` → transcribed when `[transcription].enabled = true`
-/// - textlike (text/*, application/{xml,json,yaml,toml,sql,javascript,typescript},
-///   plus common code/config/log extensions when MIME is octet-stream/empty):
-///   ≤256KB inlined as `[name]\n<text>`; 256KB-10MB saved to
-///   `<workspace_dir>/discord-uploads/<message_id>-<safe_name>` and emitted as
-///   `[File:<name> saved to <abs_path> — use file_read]`; >10MB stub-only
-/// - anything else → `[File:<name> (type <ct>, unsupported)]` hint
+/// - textlike or any other non-image/audio attachment ≤10MB → saved to
+///   `<workspace_dir>/discord/<message_id>-<safe_name>` and emitted as
+///   `[File:<name> saved to <abs_path> ({kb} KB) — use file_read]`; >10MB stub
 /// Fetch errors are logged as warnings.
 async fn process_attachments(
     attachments: &[serde_json::Value],
@@ -269,90 +266,9 @@ async fn process_attachments(
                     tracing::warn!(name, error = %error, "discord: audio transcription failed");
                 }
             }
-        } else if is_textlike_attachment(ct, name, url) {
-            let declared_size = att.get("size").and_then(|v| v.as_u64()).unwrap_or(0);
-            if declared_size > MAX_TEXT_STORE_BYTES {
-                let kb = declared_size / 1024;
-                parts.push(format!("[File:{name} ({kb} KB, too large)]"));
-                continue;
-            }
-            if declared_size > MAX_TEXT_ATTACHMENT_BYTES {
-                if let Some(marker) = spill_attachment_to_workspace(
-                    client, url, name, workspace_dir, message_id, declared_size,
-                )
-                .await
-                {
-                    parts.push(marker);
-                } else {
-                    let kb = declared_size / 1024;
-                    parts.push(format!("[File:{name} ({kb} KB, save failed)]"));
-                }
-                continue;
-            }
-            match client.get(url).send().await {
-                Ok(resp) if resp.status().is_success() => {
-                    let len = resp.content_length().unwrap_or(0);
-                    if len > MAX_TEXT_STORE_BYTES {
-                        let kb = len / 1024;
-                        parts.push(format!("[File:{name} ({kb} KB, too large)]"));
-                        continue;
-                    }
-                    if len > MAX_TEXT_ATTACHMENT_BYTES {
-                        match resp.bytes().await {
-                            Ok(bytes) => {
-                                if let Some(marker) = write_upload_to_workspace(
-                                    &bytes,
-                                    name,
-                                    workspace_dir,
-                                    message_id,
-                                )
-                                .await
-                                {
-                                    parts.push(marker);
-                                } else {
-                                    let kb = bytes.len() / 1024;
-                                    parts.push(format!("[File:{name} ({kb} KB, save failed)]"));
-                                }
-                            }
-                            Err(e) => {
-                                tracing::warn!(name, error = %e, "discord: failed reading textlike body");
-                            }
-                        }
-                        continue;
-                    }
-                    if let Ok(text) = resp.text().await {
-                        if text.len() as u64 > MAX_TEXT_STORE_BYTES {
-                            let kb = text.len() / 1024;
-                            parts.push(format!("[File:{name} ({kb} KB, too large)]"));
-                        } else if text.len() as u64 > MAX_TEXT_ATTACHMENT_BYTES {
-                            if let Some(marker) = write_upload_to_workspace(
-                                text.as_bytes(),
-                                name,
-                                workspace_dir,
-                                message_id,
-                            )
-                            .await
-                            {
-                                parts.push(marker);
-                            } else {
-                                let kb = text.len() / 1024;
-                                parts.push(format!("[File:{name} ({kb} KB, save failed)]"));
-                            }
-                        } else {
-                            parts.push(format!("[{name}]\n{text}"));
-                        }
-                    }
-                }
-                Ok(resp) => {
-                    tracing::warn!(name, status = %resp.status(), "discord attachment fetch failed");
-                }
-                Err(e) => {
-                    tracing::warn!(name, error = %e, "discord attachment fetch error");
-                }
-            }
         } else {
             let declared_size = att.get("size").and_then(|v| v.as_u64()).unwrap_or(0);
-            if declared_size > MAX_TEXT_STORE_BYTES {
+            if declared_size > MAX_FILE_STORE_BYTES {
                 let kb = declared_size / 1024;
                 parts.push(format!("[File:{name} ({kb} KB, too large)]"));
                 continue;
@@ -372,10 +288,9 @@ async fn process_attachments(
     parts.join("\n---\n")
 }
 
-const MAX_TEXT_ATTACHMENT_BYTES: u64 = 256 * 1024;
-const MAX_TEXT_STORE_BYTES: u64 = 10 * 1024 * 1024;
-const UPLOAD_DIR_NAME: &str = "discord-uploads";
-const UPLOAD_MAX_AGE_SECS: u64 = 24 * 3600;
+const MAX_FILE_STORE_BYTES: u64 = 10 * 1024 * 1024;
+const UPLOAD_DIR_NAME: &str = "discord";
+const UPLOAD_MAX_AGE_SECS: u64 = 7 * 24 * 3600;
 
 async fn spill_attachment_to_workspace(
     client: &reqwest::Client,
@@ -388,7 +303,7 @@ async fn spill_attachment_to_workspace(
     match client.get(url).send().await {
         Ok(resp) if resp.status().is_success() => match resp.bytes().await {
             Ok(bytes) => {
-                if bytes.len() as u64 > MAX_TEXT_STORE_BYTES {
+                if bytes.len() as u64 > MAX_FILE_STORE_BYTES {
                     let kb = bytes.len() / 1024;
                     return Some(format!("[File:{name} ({kb} KB, too large)]"));
                 }
@@ -444,7 +359,7 @@ async fn write_upload_to_workspace(
     }
     let kb = bytes.len() / 1024;
     Some(format!(
-        "[File:{name} saved to {} ({kb} KB)]",
+        "[File:{name} saved to {} ({kb} KB) — use file_read; you may edit/patch in place]",
         saved_path.display()
     ))
 }
@@ -495,87 +410,6 @@ fn cleanup_stale_uploads(upload_dir: &Path) {
             }
         }
     }
-}
-
-fn is_textlike_attachment(content_type: &str, filename: &str, url: &str) -> bool {
-    let normalized = normalize_content_type(content_type);
-    if !normalized.is_empty() {
-        if normalized.starts_with("text/") {
-            return true;
-        }
-        if matches!(
-            normalized.as_str(),
-            "application/xml"
-                | "application/json"
-                | "application/yaml"
-                | "application/x-yaml"
-                | "application/toml"
-                | "application/x-toml"
-                | "application/javascript"
-                | "application/typescript"
-                | "application/sql"
-        ) {
-            return true;
-        }
-        if normalized != "application/octet-stream" {
-            return false;
-        }
-    }
-    has_textlike_extension(filename) || has_textlike_extension(url)
-}
-
-fn has_textlike_extension(value: &str) -> bool {
-    let Some(ext) = extension_from_media_path(value) else {
-        return false;
-    };
-    matches!(
-        ext.as_str(),
-        "txt"
-            | "log"
-            | "md"
-            | "xml"
-            | "json"
-            | "yaml"
-            | "yml"
-            | "toml"
-            | "ini"
-            | "conf"
-            | "cfg"
-            | "csv"
-            | "tsv"
-            | "sh"
-            | "bash"
-            | "zsh"
-            | "sql"
-            | "rs"
-            | "py"
-            | "js"
-            | "ts"
-            | "jsx"
-            | "tsx"
-            | "go"
-            | "java"
-            | "kt"
-            | "c"
-            | "cpp"
-            | "cc"
-            | "cxx"
-            | "h"
-            | "hpp"
-            | "cs"
-            | "swift"
-            | "rb"
-            | "php"
-            | "pl"
-            | "lua"
-            | "html"
-            | "htm"
-            | "css"
-            | "scss"
-            | "less"
-            | "vue"
-            | "svelte"
-    )
 }
 
 fn normalize_content_type(content_type: &str) -> String {
