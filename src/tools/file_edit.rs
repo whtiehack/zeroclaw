@@ -7,13 +7,14 @@ use serde_json::json;
 use std::path::Path;
 use std::sync::Arc;
 
-/// Edit a file by replacing an exact string match with new content.
+/// Edit a file by applying an ordered list of `old_string` → `new_string`
+/// replacements within the workspace.
 ///
-/// Uses `old_string` → `new_string` replacement within the workspace.
-/// Exact matching is preferred and unchanged. When exact matching finds zero
-/// matches, the tool falls back to whitespace-flexible line matching.
-/// The final match must still be unique (zero matches = not found, multiple
-/// matches = ambiguous). `new_string` may be empty to delete the matched text.
+/// Each entry in `edits` is applied sequentially against an in-memory copy.
+/// Default behavior (`replace_all = false`) requires a unique match per edit,
+/// falling back to whitespace-flexible line matching when exact matching
+/// finds zero hits. Setting `replace_all = true` replaces every occurrence
+/// (useful for renames). If any edit fails, the file is not modified.
 /// Security checks mirror [`super::file_write::FileWriteTool`].
 pub struct FileEditTool {
     security: Arc<SecurityPolicy>,
@@ -210,7 +211,7 @@ impl Tool for FileEditTool {
     }
 
     fn description(&self) -> &str {
-        "Edit a file by replacing text in a file. Exact matching is preferred; if exact matching fails, whitespace-flexible line matching is used. Sensitive files (for example .env and key material) are blocked by default."
+        "Apply one or more edits to a file in a single call. Edits are applied sequentially on an in-memory copy and committed atomically — if any edit fails, the file is not modified. Each edit defaults to a unique-match replacement (exact preferred, whitespace-flexible line matching as fallback); set `replace_all = true` to replace every occurrence (useful for renames). Sensitive files (for example .env and key material) are blocked by default."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -221,16 +222,32 @@ impl Tool for FileEditTool {
                     "type": "string",
                     "description": "Path to the file. Relative paths resolve from workspace; outside paths require policy allowlist."
                 },
-                "old_string": {
-                    "type": "string",
-                    "description": "The text to find and replace. Exact matching is attempted first; if no exact match is found, whitespace-flexible line matching is attempted."
-                },
-                "new_string": {
-                    "type": "string",
-                    "description": "The replacement text (empty string to delete the matched text)"
+                "edits": {
+                    "type": "array",
+                    "minItems": 1,
+                    "description": "Ordered list of edits to apply. Each edit is matched against the result of all previous edits; failure of any edit aborts the entire batch.",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "old_string": {
+                                "type": "string",
+                                "description": "Text to find. Exact matching is attempted first; if no exact match is found, whitespace-flexible line matching is attempted."
+                            },
+                            "new_string": {
+                                "type": "string",
+                                "description": "Replacement text (empty string to delete the matched text)."
+                            },
+                            "replace_all": {
+                                "type": "boolean",
+                                "default": false,
+                                "description": "Replace every occurrence. When false (default) the match must be unique."
+                            }
+                        },
+                        "required": ["old_string", "new_string"]
+                    }
                 }
             },
-            "required": ["path", "old_string", "new_string"]
+            "required": ["path", "edits"]
         })
     }
 
@@ -241,22 +258,46 @@ impl Tool for FileEditTool {
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow::anyhow!("Missing 'path' parameter"))?;
 
-        let old_string = args
-            .get("old_string")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow::anyhow!("Missing 'old_string' parameter"))?;
+        let edits_value = args
+            .get("edits")
+            .ok_or_else(|| anyhow::anyhow!("Missing 'edits' parameter"))?;
+        let edits_array = edits_value
+            .as_array()
+            .ok_or_else(|| anyhow::anyhow!("'edits' must be an array"))?;
 
-        let new_string = args
-            .get("new_string")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow::anyhow!("Missing 'new_string' parameter"))?;
-
-        if old_string.is_empty() {
+        if edits_array.is_empty() {
             return Ok(ToolResult {
                 success: false,
                 output: String::new(),
-                error: Some("old_string must not be empty".into()),
+                error: Some("'edits' must contain at least one edit".into()),
             });
+        }
+
+        let mut edits: Vec<(String, String, bool)> = Vec::with_capacity(edits_array.len());
+        for (idx, item) in edits_array.iter().enumerate() {
+            let obj = item.as_object().ok_or_else(|| {
+                anyhow::anyhow!("edits[{idx}] must be an object with old_string/new_string")
+            })?;
+            let old = obj
+                .get("old_string")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| anyhow::anyhow!("edits[{idx}] missing 'old_string'"))?;
+            let new = obj
+                .get("new_string")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| anyhow::anyhow!("edits[{idx}] missing 'new_string'"))?;
+            let replace_all = obj
+                .get("replace_all")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            if old.is_empty() {
+                return Ok(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(format!("edits[{idx}].old_string must not be empty")),
+                });
+            }
+            edits.push((old.to_string(), new.to_string(), replace_all));
         }
 
         // ── 2. Autonomy check ──────────────────────────────────────
@@ -379,8 +420,8 @@ impl Tool for FileEditTool {
             });
         }
 
-        // ── 9. Read → match → replace → write ─────────────────────
-        let content = match tokio::fs::read_to_string(&resolved_target).await {
+        // ── 9. Read → apply edits sequentially → write once ───────
+        let mut content = match tokio::fs::read_to_string(&resolved_target).await {
             Ok(c) => c,
             Err(e) => {
                 return Ok(ToolResult {
@@ -391,40 +432,66 @@ impl Tool for FileEditTool {
             }
         };
 
-        let match_outcome = match resolve_match(&content, old_string) {
-            Ok(outcome) => outcome,
-            Err(error) => {
-                return Ok(ToolResult {
-                    success: false,
-                    output: String::new(),
-                    error: Some(error),
-                });
-            }
-        };
+        let mut total_replacements = 0usize;
+        let mut flex_used_overall = false;
 
-        if match_outcome.end < match_outcome.start || match_outcome.end > content.len() {
-            return Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some("Internal matching error: invalid replacement range".into()),
-            });
+        for (idx, (old, new, replace_all)) in edits.iter().enumerate() {
+            if *replace_all {
+                let count = content.matches(old.as_str()).count();
+                if count == 0 {
+                    return Ok(ToolResult {
+                        success: false,
+                        output: String::new(),
+                        error: Some(format!("edits[{idx}]: old_string not found in file")),
+                    });
+                }
+                content = content.replace(old.as_str(), new.as_str());
+                total_replacements += count;
+            } else {
+                let outcome = match resolve_match(&content, old) {
+                    Ok(o) => o,
+                    Err(error) => {
+                        return Ok(ToolResult {
+                            success: false,
+                            output: String::new(),
+                            error: Some(format!("edits[{idx}]: {error}")),
+                        });
+                    }
+                };
+                if outcome.end < outcome.start || outcome.end > content.len() {
+                    return Ok(ToolResult {
+                        success: false,
+                        output: String::new(),
+                        error: Some(format!(
+                            "edits[{idx}]: internal matching error (invalid replacement range)"
+                        )),
+                    });
+                }
+                let mut next = String::with_capacity(
+                    content.len() - (outcome.end - outcome.start) + new.len(),
+                );
+                next.push_str(&content[..outcome.start]);
+                next.push_str(new);
+                next.push_str(&content[outcome.end..]);
+                content = next;
+                total_replacements += 1;
+                if outcome.used_whitespace_flex {
+                    flex_used_overall = true;
+                }
+            }
         }
 
-        let mut new_content = String::with_capacity(
-            content.len() - (match_outcome.end - match_outcome.start) + new_string.len(),
-        );
-        new_content.push_str(&content[..match_outcome.start]);
-        new_content.push_str(new_string);
-        new_content.push_str(&content[match_outcome.end..]);
-
-        match tokio::fs::write(&resolved_target, &new_content).await {
+        match tokio::fs::write(&resolved_target, &content).await {
             Ok(()) => Ok(ToolResult {
                 success: true,
                 output: format!(
-                    "Edited {path}: replaced 1 occurrence ({} bytes){}",
-                    new_content.len(),
-                    if match_outcome.used_whitespace_flex {
-                        " (matched with whitespace flexibility)"
+                    "Edited {path}: applied {} edit{}, {} replacement{}{}",
+                    edits.len(),
+                    if edits.len() == 1 { "" } else { "s" },
+                    total_replacements,
+                    if total_replacements == 1 { "" } else { "s" },
+                    if flex_used_overall {
+                        " (whitespace flexibility used)"
                     } else {
                         ""
                     }
@@ -501,12 +568,15 @@ mod tests {
         let tool = FileEditTool::new(test_security(std::env::temp_dir()));
         let schema = tool.parameters_schema();
         assert!(schema["properties"]["path"].is_object());
-        assert!(schema["properties"]["old_string"].is_object());
-        assert!(schema["properties"]["new_string"].is_object());
+        let edits = &schema["properties"]["edits"];
+        assert_eq!(edits["type"], "array");
+        let item_props = &edits["items"]["properties"];
+        assert!(item_props["old_string"].is_object());
+        assert!(item_props["new_string"].is_object());
+        assert!(item_props["replace_all"].is_object());
         let required = schema["required"].as_array().unwrap();
         assert!(required.contains(&json!("path")));
-        assert!(required.contains(&json!("old_string")));
-        assert!(required.contains(&json!("new_string")));
+        assert!(required.contains(&json!("edits")));
     }
 
     #[tokio::test]
@@ -521,15 +591,14 @@ mod tests {
         let tool = FileEditTool::new(test_security(dir.clone()));
         let result = tool
             .execute(json!({
-                "path": "test.txt",
-                "old_string": "hello",
-                "new_string": "goodbye"
+                "path": "test.txt", "edits": [{"old_string": "hello", "new_string": "goodbye"}]
             }))
             .await
             .unwrap();
 
         assert!(result.success, "edit should succeed: {:?}", result.error);
-        assert!(result.output.contains("replaced 1 occurrence"));
+        assert!(result.output.contains("1 edit"));
+        assert!(result.output.contains("1 replacement"));
 
         let content = tokio::fs::read_to_string(dir.join("test.txt"))
             .await
@@ -551,9 +620,7 @@ mod tests {
         let tool = FileEditTool::new(test_security(dir.clone()));
         let result = tool
             .execute(json!({
-                "path": "test.txt",
-                "old_string": "nonexistent",
-                "new_string": "replacement"
+                "path": "test.txt", "edits": [{"old_string": "nonexistent", "new_string": "replacement"}]
             }))
             .await
             .unwrap();
@@ -585,9 +652,7 @@ mod tests {
         let tool = FileEditTool::new(test_security(dir.clone()));
         let result = tool
             .execute(json!({
-                "path": "test.txt",
-                "old_string": "fn main() {\n  println!(\"hi\");\n}\n",
-                "new_string": "fn main() {\n    println!(\"hello\");\n}\n"
+                "path": "test.txt", "edits": [{"old_string": "fn main() {\n  println!(\"hi\");\n}\n", "new_string": "fn main() {\n    println!(\"hello\");\n}\n"}]
             }))
             .await
             .unwrap();
@@ -619,9 +684,7 @@ mod tests {
         let tool = FileEditTool::new(test_security(dir.clone()));
         let result = tool
             .execute(json!({
-                "path": "test.txt",
-                "old_string": "alpha\n  beta\ngamma\n",
-                "new_string": "alpha\n\tdelta\ngamma\n"
+                "path": "test.txt", "edits": [{"old_string": "alpha\n  beta\ngamma\n", "new_string": "alpha\n\tdelta\ngamma\n"}]
             }))
             .await
             .unwrap();
@@ -649,9 +712,7 @@ mod tests {
         let tool = FileEditTool::new(test_security(dir.clone()));
         let result = tool
             .execute(json!({
-                "path": "test.txt",
-                "old_string": "line one\nline two\n",
-                "new_string": "line one\nline 2\n"
+                "path": "test.txt", "edits": [{"old_string": "line one\nline two\n", "new_string": "line one\nline 2\n"}]
             }))
             .await
             .unwrap();
@@ -682,9 +743,7 @@ mod tests {
         let tool = FileEditTool::new(test_security(dir.clone()));
         let result = tool
             .execute(json!({
-                "path": "test.txt",
-                "old_string": "let value = 42;\n",
-                "new_string": "let value = 7;\n"
+                "path": "test.txt", "edits": [{"old_string": "let value = 42;\n", "new_string": "let value = 7;\n"}]
             }))
             .await
             .unwrap();
@@ -715,9 +774,7 @@ mod tests {
         let tool = FileEditTool::new(test_security(dir.clone()));
         let result = tool
             .execute(json!({
-                "path": "test.txt",
-                "old_string": "if cond {\n  work();\n}\n",
-                "new_string": "if cond {\n  done();\n}\n"
+                "path": "test.txt", "edits": [{"old_string": "if cond {\n  work();\n}\n", "new_string": "if cond {\n  done();\n}\n"}]
             }))
             .await
             .unwrap();
@@ -757,9 +814,7 @@ mod tests {
         let tool = FileEditTool::new(test_security(dir.clone()));
         let result = tool
             .execute(json!({
-                "path": "test.txt",
-                "old_string": "gamma\n",
-                "new_string": "delta\n"
+                "path": "test.txt", "edits": [{"old_string": "gamma\n", "new_string": "delta\n"}]
             }))
             .await
             .unwrap();
@@ -785,9 +840,7 @@ mod tests {
         let tool = FileEditTool::new(test_security(dir.clone()));
         let result = tool
             .execute(json!({
-                "path": "test.txt",
-                "old_string": "let value = 1;",
-                "new_string": "let value = 2;"
+                "path": "test.txt", "edits": [{"old_string": "let value = 1;", "new_string": "let value = 2;"}]
             }))
             .await
             .unwrap();
@@ -815,9 +868,7 @@ mod tests {
         let tool = FileEditTool::new(test_security(dir.clone()));
         let result = tool
             .execute(json!({
-                "path": "test.txt",
-                "old_string": "line one\n  line two\nline three",
-                "new_string": "updated block"
+                "path": "test.txt", "edits": [{"old_string": "line one\n  line two\nline three", "new_string": "updated block"}]
             }))
             .await
             .unwrap();
@@ -848,9 +899,7 @@ mod tests {
         let tool = FileEditTool::new(test_security(dir.clone()));
         let result = tool
             .execute(json!({
-                "path": "test.txt",
-                "old_string": "aaa",
-                "new_string": "ccc"
+                "path": "test.txt", "edits": [{"old_string": "aaa", "new_string": "ccc"}]
             }))
             .await
             .unwrap();
@@ -883,9 +932,7 @@ mod tests {
         let tool = FileEditTool::new(test_security(dir.clone()));
         let result = tool
             .execute(json!({
-                "path": "test.txt",
-                "old_string": " remove",
-                "new_string": ""
+                "path": "test.txt", "edits": [{"old_string": " remove", "new_string": ""}]
             }))
             .await
             .unwrap();
@@ -916,9 +963,7 @@ mod tests {
         let tool = FileEditTool::new(test_security(dir.clone()));
         let result = tool
             .execute(json!({
-                "path": ".env",
-                "old_string": "old",
-                "new_string": "new"
+                "path": ".env", "edits": [{"old_string": "old", "new_string": "new"}]
             }))
             .await
             .unwrap();
@@ -948,9 +993,7 @@ mod tests {
         let tool = FileEditTool::new(test_security_allow_sensitive_writes(dir.clone(), true));
         let result = tool
             .execute(json!({
-                "path": ".env",
-                "old_string": "old",
-                "new_string": "new"
+                "path": ".env", "edits": [{"old_string": "old", "new_string": "new"}]
             }))
             .await
             .unwrap();
@@ -977,19 +1020,55 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn file_edit_missing_old_string_param() {
+    async fn file_edit_missing_edits_param() {
+        let tool = FileEditTool::new(test_security(std::env::temp_dir()));
+        let result = tool.execute(json!({"path": "f.txt"})).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn file_edit_edits_must_be_array() {
         let tool = FileEditTool::new(test_security(std::env::temp_dir()));
         let result = tool
-            .execute(json!({"path": "f.txt", "new_string": "b"}))
+            .execute(json!({"path": "f.txt", "edits": "not-an-array"}))
             .await;
         assert!(result.is_err());
     }
 
     #[tokio::test]
-    async fn file_edit_missing_new_string_param() {
+    async fn file_edit_edits_empty_array() {
+        let dir = std::env::temp_dir().join("zeroclaw_test_file_edit_edits_empty");
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        tokio::fs::write(dir.join("test.txt"), "hello")
+            .await
+            .unwrap();
+
+        let tool = FileEditTool::new(test_security(dir.clone()));
+        let result = tool
+            .execute(json!({"path": "test.txt", "edits": []}))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert!(result.error.as_deref().unwrap_or("").contains("at least one edit"));
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn file_edit_edit_missing_old_string() {
         let tool = FileEditTool::new(test_security(std::env::temp_dir()));
         let result = tool
-            .execute(json!({"path": "f.txt", "old_string": "a"}))
+            .execute(json!({"path": "f.txt", "edits": [{"new_string": "b"}]}))
+            .await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn file_edit_edit_missing_new_string() {
+        let tool = FileEditTool::new(test_security(std::env::temp_dir()));
+        let result = tool
+            .execute(json!({"path": "f.txt", "edits": [{"old_string": "a"}]}))
             .await;
         assert!(result.is_err());
     }
@@ -1006,9 +1085,7 @@ mod tests {
         let tool = FileEditTool::new(test_security(dir.clone()));
         let result = tool
             .execute(json!({
-                "path": "test.txt",
-                "old_string": "",
-                "new_string": "x"
+                "path": "test.txt", "edits": [{"old_string": "", "new_string": "x"}]
             }))
             .await
             .unwrap();
@@ -1037,9 +1114,7 @@ mod tests {
         let tool = FileEditTool::new(test_security(dir.clone()));
         let result = tool
             .execute(json!({
-                "path": "../../etc/passwd",
-                "old_string": "root",
-                "new_string": "hacked"
+                "path": "../../etc/passwd", "edits": [{"old_string": "root", "new_string": "hacked"}]
             }))
             .await
             .unwrap();
@@ -1055,9 +1130,7 @@ mod tests {
         let tool = FileEditTool::new(test_security(std::env::temp_dir()));
         let result = tool
             .execute(json!({
-                "path": "/etc/passwd",
-                "old_string": "root",
-                "new_string": "hacked"
+                "path": "/etc/passwd", "edits": [{"old_string": "root", "new_string": "hacked"}]
             }))
             .await
             .unwrap();
@@ -1122,9 +1195,7 @@ mod tests {
         let tool = FileEditTool::new(test_security(workspace.clone()));
         let result = tool
             .execute(json!({
-                "path": "escape_dir/target.txt",
-                "old_string": "a",
-                "new_string": "b"
+                "path": "escape_dir/target.txt", "edits": [{"old_string": "a", "new_string": "b"}]
             }))
             .await
             .unwrap();
@@ -1160,9 +1231,7 @@ mod tests {
         let tool = FileEditTool::new(test_security(workspace.clone()));
         let result = tool
             .execute(json!({
-                "path": "linked.txt",
-                "old_string": "original",
-                "new_string": "hacked"
+                "path": "linked.txt", "edits": [{"old_string": "original", "new_string": "hacked"}]
             }))
             .await
             .unwrap();
@@ -1200,9 +1269,7 @@ mod tests {
         let tool = FileEditTool::new(test_security(workspace.clone()));
         let result = tool
             .execute(json!({
-                "path": "linked.txt",
-                "old_string": "original",
-                "new_string": "hacked"
+                "path": "linked.txt", "edits": [{"old_string": "original", "new_string": "hacked"}]
             }))
             .await
             .unwrap();
@@ -1234,9 +1301,7 @@ mod tests {
         let tool = FileEditTool::new(test_security_with(dir.clone(), AutonomyLevel::ReadOnly, 20));
         let result = tool
             .execute(json!({
-                "path": "test.txt",
-                "old_string": "hello",
-                "new_string": "world"
+                "path": "test.txt", "edits": [{"old_string": "hello", "new_string": "world"}]
             }))
             .await
             .unwrap();
@@ -1268,9 +1333,7 @@ mod tests {
         ));
         let result = tool
             .execute(json!({
-                "path": "test.txt",
-                "old_string": "hello",
-                "new_string": "world"
+                "path": "test.txt", "edits": [{"old_string": "hello", "new_string": "world"}]
             }))
             .await
             .unwrap();
@@ -1299,9 +1362,7 @@ mod tests {
         let tool = FileEditTool::new(test_security(dir.clone()));
         let result = tool
             .execute(json!({
-                "path": "missing.txt",
-                "old_string": "a",
-                "new_string": "b"
+                "path": "missing.txt", "edits": [{"old_string": "a", "new_string": "b"}]
             }))
             .await
             .unwrap();
@@ -1325,14 +1386,139 @@ mod tests {
         let tool = FileEditTool::new(test_security(dir.clone()));
         let result = tool
             .execute(json!({
-                "path": "test\0evil.txt",
-                "old_string": "old",
-                "new_string": "new"
+                "path": "test\0evil.txt", "edits": [{"old_string": "old", "new_string": "new"}]
             }))
             .await
             .unwrap();
         assert!(!result.success);
         assert!(result.error.as_ref().unwrap().contains("not allowed"));
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn file_edit_batch_applies_in_order() {
+        let dir = std::env::temp_dir().join("zeroclaw_test_file_edit_batch_order");
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        tokio::fs::write(dir.join("test.txt"), "alpha beta gamma")
+            .await
+            .unwrap();
+
+        let tool = FileEditTool::new(test_security(dir.clone()));
+        let result = tool
+            .execute(json!({
+                "path": "test.txt",
+                "edits": [
+                    {"old_string": "alpha", "new_string": "ALPHA"},
+                    {"old_string": "beta", "new_string": "BETA"},
+                    {"old_string": "gamma", "new_string": "GAMMA"}
+                ]
+            }))
+            .await
+            .unwrap();
+
+        assert!(result.success, "batch should succeed: {:?}", result.error);
+        assert!(result.output.contains("3 edit"));
+        assert!(result.output.contains("3 replacement"));
+
+        let content = tokio::fs::read_to_string(dir.join("test.txt"))
+            .await
+            .unwrap();
+        assert_eq!(content, "ALPHA BETA GAMMA");
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn file_edit_batch_atomic_on_failure() {
+        let dir = std::env::temp_dir().join("zeroclaw_test_file_edit_batch_atomic");
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        tokio::fs::write(dir.join("test.txt"), "alpha beta gamma")
+            .await
+            .unwrap();
+
+        let tool = FileEditTool::new(test_security(dir.clone()));
+        // Second edit cannot match → entire batch must abort.
+        let result = tool
+            .execute(json!({
+                "path": "test.txt",
+                "edits": [
+                    {"old_string": "alpha", "new_string": "ALPHA"},
+                    {"old_string": "nonexistent", "new_string": "X"},
+                    {"old_string": "gamma", "new_string": "GAMMA"}
+                ]
+            }))
+            .await
+            .unwrap();
+
+        assert!(!result.success, "batch must fail when an edit cannot match");
+        assert!(result.error.as_deref().unwrap_or("").contains("edits[1]"));
+
+        // File must remain untouched.
+        let content = tokio::fs::read_to_string(dir.join("test.txt"))
+            .await
+            .unwrap();
+        assert_eq!(content, "alpha beta gamma");
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn file_edit_replace_all_replaces_every_occurrence() {
+        let dir = std::env::temp_dir().join("zeroclaw_test_file_edit_replace_all");
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        tokio::fs::write(dir.join("test.txt"), "foo bar foo baz foo")
+            .await
+            .unwrap();
+
+        let tool = FileEditTool::new(test_security(dir.clone()));
+        let result = tool
+            .execute(json!({
+                "path": "test.txt",
+                "edits": [{"old_string": "foo", "new_string": "FOO", "replace_all": true}]
+            }))
+            .await
+            .unwrap();
+
+        assert!(result.success, "replace_all should succeed: {:?}", result.error);
+        assert!(result.output.contains("3 replacement"));
+
+        let content = tokio::fs::read_to_string(dir.join("test.txt"))
+            .await
+            .unwrap();
+        assert_eq!(content, "FOO bar FOO baz FOO");
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn file_edit_replace_all_zero_matches_errors() {
+        let dir = std::env::temp_dir().join("zeroclaw_test_file_edit_replace_all_miss");
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        tokio::fs::write(dir.join("test.txt"), "alpha beta")
+            .await
+            .unwrap();
+
+        let tool = FileEditTool::new(test_security(dir.clone()));
+        let result = tool
+            .execute(json!({
+                "path": "test.txt",
+                "edits": [{"old_string": "missing", "new_string": "X", "replace_all": true}]
+            }))
+            .await
+            .unwrap();
+
+        assert!(!result.success);
+        assert!(result.error.as_deref().unwrap_or("").contains("not found"));
+
+        let content = tokio::fs::read_to_string(dir.join("test.txt"))
+            .await
+            .unwrap();
+        assert_eq!(content, "alpha beta");
 
         let _ = tokio::fs::remove_dir_all(&dir).await;
     }

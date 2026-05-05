@@ -3,8 +3,29 @@ use crate::security::SecurityPolicy;
 use async_trait::async_trait;
 use serde_json::json;
 use std::sync::Arc;
+use std::time::SystemTime;
 
 const MAX_RESULTS: usize = 1000;
+
+fn format_size(size: u64) -> String {
+    const KB: u64 = 1024;
+    const MB: u64 = 1024 * KB;
+    const GB: u64 = 1024 * MB;
+    if size >= GB {
+        format!("{:.1} GB", size as f64 / GB as f64)
+    } else if size >= MB {
+        format!("{:.1} MB", size as f64 / MB as f64)
+    } else if size >= KB {
+        format!("{:.1} KB", size as f64 / KB as f64)
+    } else {
+        format!("{size} B")
+    }
+}
+
+fn format_mtime(mtime: SystemTime) -> String {
+    let dt: chrono::DateTime<chrono::Utc> = mtime.into();
+    dt.format("%Y-%m-%d %H:%M UTC").to_string()
+}
 
 /// Search for files by glob pattern within the workspace.
 pub struct GlobSearchTool {
@@ -25,7 +46,7 @@ impl Tool for GlobSearchTool {
 
     fn description(&self) -> &str {
         "Search for files matching a glob pattern within the workspace. \
-         Returns a sorted list of matching file paths relative to the workspace root. \
+         Returns matching files with size and last-modified time, sorted by mtime descending (newest first). \
          Examples: '**/*.rs' (all Rust files), 'src/**/mod.rs' (all mod.rs in src)."
     }
 
@@ -110,7 +131,7 @@ impl Tool for GlobSearchTool {
             }
         };
 
-        let mut results = Vec::new();
+        let mut results: Vec<(String, u64, SystemTime)> = Vec::new();
         let mut truncated = false;
 
         for entry in entries {
@@ -129,14 +150,22 @@ impl Tool for GlobSearchTool {
                 continue; // silently filter symlink escapes
             }
 
+            let meta = match std::fs::metadata(&resolved) {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+
             // Only include files, not directories
-            if resolved.is_dir() {
+            if meta.is_dir() {
                 continue;
             }
 
+            let mtime = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+            let size = meta.len();
+
             // Convert to workspace-relative path
             if let Ok(rel) = resolved.strip_prefix(&workspace_canon) {
-                results.push(rel.to_string_lossy().to_string());
+                results.push((rel.to_string_lossy().to_string(), size, mtime));
             }
 
             if results.len() >= MAX_RESULTS {
@@ -145,13 +174,22 @@ impl Tool for GlobSearchTool {
             }
         }
 
-        results.sort();
+        // Sort by mtime descending (newest first); same mtime → path ascending.
+        results.sort_by(|a, b| b.2.cmp(&a.2).then(a.0.cmp(&b.0)));
 
         let output = if results.is_empty() {
             format!("No files matching pattern '{pattern}' found in workspace.")
         } else {
             use std::fmt::Write;
-            let mut buf = results.join("\n");
+            let mut buf = String::new();
+            for (path, size, mtime) in &results {
+                let _ =
+                    writeln!(buf, "{path}  {size}  {mtime}", size = format_size(*size), mtime = format_mtime(*mtime));
+            }
+            // Trim trailing newline so the truncated/total banner is on its own line.
+            if buf.ends_with('\n') {
+                buf.pop();
+            }
             if truncated {
                 let _ = write!(
                     buf,
@@ -367,10 +405,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn glob_search_results_sorted() {
+    async fn glob_search_results_sorted_by_mtime_desc() {
         let dir = TempDir::new().unwrap();
         std::fs::write(dir.path().join("c.txt"), "").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
         std::fs::write(dir.path().join("a.txt"), "").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
         std::fs::write(dir.path().join("b.txt"), "").unwrap();
 
         let tool = GlobSearchTool::new(test_security(dir.path().to_path_buf()));
@@ -378,11 +418,29 @@ mod tests {
 
         assert!(result.success);
         let lines: Vec<&str> = result.output.lines().collect();
-        // First 3 lines should be the sorted file names
+        // Newest written first; each line is "path  size  mtime".
         assert!(lines.len() >= 3);
-        assert_eq!(lines[0], "a.txt");
-        assert_eq!(lines[1], "b.txt");
-        assert_eq!(lines[2], "c.txt");
+        assert!(lines[0].starts_with("b.txt"));
+        assert!(lines[1].starts_with("a.txt"));
+        assert!(lines[2].starts_with("c.txt"));
+    }
+
+    #[tokio::test]
+    async fn glob_search_output_includes_size_and_mtime() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("data.txt"), "1234567890").unwrap();
+
+        let tool = GlobSearchTool::new(test_security(dir.path().to_path_buf()));
+        let result = tool
+            .execute(json!({"pattern": "data.txt"}))
+            .await
+            .unwrap();
+
+        assert!(result.success);
+        let first = result.output.lines().next().unwrap();
+        assert!(first.starts_with("data.txt"));
+        assert!(first.contains("10 B"));
+        assert!(first.contains("UTC"));
     }
 
     #[tokio::test]
