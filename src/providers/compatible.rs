@@ -579,6 +579,21 @@ impl ResponseMessage {
             .map(|c| strip_think_tags(c))
             .filter(|c| !c.is_empty())
     }
+
+    /// Like `effective_content_optional` but **never** falls back to
+    /// `reasoning_content`. Use when the upstream proxy is known to populate
+    /// `reasoning_content` with thinking summaries that are NOT the assistant's
+    /// final answer (e.g. Codex chat-completions translator emitting summary
+    /// text into the legacy `reasoning_content` field while the actual final
+    /// response sits in a separate later turn). Falling back here would echo
+    /// the summary into persisted history and pollute subsequent turns.
+    fn pure_content_optional(&self) -> Option<String> {
+        self.content
+            .as_ref()
+            .filter(|c| !c.is_empty())
+            .map(|c| strip_think_tags(c))
+            .filter(|c| !c.is_empty())
+    }
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -1866,12 +1881,23 @@ impl OpenAiCompatibleProvider {
             .as_deref()
             .map(NormalizedStopReason::from_openai_finish_reason);
         let message = choice.message;
-        let text = message.effective_content_optional();
         let reasoning_content = message.reasoning_content.clone();
         let reasoning_details = message
             .reasoning_details
             .clone()
             .filter(|v| v.is_array() && !v.as_array().unwrap().is_empty());
+        // When the upstream emits OpenRouter `reasoning_details`, `reasoning_content`
+        // carries the thinking summary, not the user-facing answer. Falling back
+        // would echo the summary into persisted history and pollute the next
+        // turn (LLM mimics "summary + tool + answer" rolling forward). Strict
+        // content-only path here; thinking-only providers (DeepSeek-R1, GLM-4
+        // etc.) keep the legacy fallback because they really do put the answer
+        // in `reasoning_content`.
+        let text = if reasoning_details.is_some() {
+            message.pure_content_optional()
+        } else {
+            message.effective_content_optional()
+        };
         let tool_calls = message
             .tool_calls
             .unwrap_or_default()
@@ -4663,6 +4689,69 @@ mod tests {
         assert_eq!(parsed.text.as_deref(), Some("hello"));
         assert_eq!(parsed.stop_reason, Some(NormalizedStopReason::EndTurn));
         assert_eq!(parsed.raw_stop_reason.as_deref(), Some("stop"));
+    }
+
+    #[test]
+    fn parse_native_response_with_reasoning_details_does_not_fallback_to_reasoning_content() {
+        // Codex chat-completions translator path: when the upstream emits
+        // OpenRouter `reasoning_details`, the legacy `reasoning_content`
+        // carries the *thinking summary*, not the user-facing answer. If the
+        // model only output reasoning + tool_calls (no message content),
+        // `text` MUST stay None — falling back to summary text would echo it
+        // into persisted history and pollute subsequent turns.
+        let choice = Choice {
+            message: ResponseMessage {
+                content: None,
+                reasoning_content: Some("**Clarifying build information**\n\nI know common build numbers like 5875...".to_string()),
+                reasoning_details: Some(serde_json::json!([
+                    {"type":"reasoning.encrypted","data":"ENC","format":"openai-responses-v1","id":"rs_1","index":0}
+                ])),
+                tool_calls: Some(vec![ToolCall {
+                    id: Some("call_1".to_string()),
+                    kind: Some("function".to_string()),
+                    function: Some(Function {
+                        name: Some("memory_observe".to_string()),
+                        arguments: Some("{}".to_string()),
+                    }),
+                    name: None,
+                    arguments: None,
+                    parameters: None,
+                }]),
+            },
+            finish_reason: Some("tool_calls".to_string()),
+        };
+
+        let parsed = OpenAiCompatibleProvider::parse_native_response(choice);
+        // text MUST be None — never echo the reasoning summary as final text
+        assert!(
+            parsed.text.is_none(),
+            "reasoning_details path must not fallback to reasoning_content as text; got: {:?}",
+            parsed.text
+        );
+        // reasoning_content/reasoning_details still threaded through for
+        // round-trip preservation (they go into ChatMessage JSON, not text)
+        assert!(parsed.reasoning_content.is_some());
+        assert!(parsed.reasoning_details.is_some());
+        assert_eq!(parsed.tool_calls.len(), 1);
+    }
+
+    #[test]
+    fn parse_native_response_without_reasoning_details_keeps_legacy_reasoning_fallback() {
+        // Thinking-only providers (DeepSeek-R1, GLM-4) put the actual answer
+        // in `reasoning_content` and leave `content` empty. The legacy
+        // fallback must still work when `reasoning_details` is absent.
+        let choice = Choice {
+            message: ResponseMessage {
+                content: None,
+                reasoning_content: Some("the answer is 42".to_string()),
+                reasoning_details: None,
+                tool_calls: None,
+            },
+            finish_reason: Some("stop".to_string()),
+        };
+
+        let parsed = OpenAiCompatibleProvider::parse_native_response(choice);
+        assert_eq!(parsed.text.as_deref(), Some("the answer is 42"));
     }
 
     #[test]
