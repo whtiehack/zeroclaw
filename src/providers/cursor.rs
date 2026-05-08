@@ -235,6 +235,7 @@ impl Provider for CursorProvider {
             tool_calls: Vec::new(),
             usage: Some(TokenUsage::default()),
             reasoning_content: None,
+            reasoning_details: None,
             quota_metadata: None,
             stop_reason: None,
             raw_stop_reason: None,

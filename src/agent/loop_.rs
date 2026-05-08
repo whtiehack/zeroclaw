@@ -887,6 +887,7 @@ fn build_native_assistant_history(
     text: &str,
     tool_calls: &[ToolCall],
     reasoning_content: Option<&str>,
+    reasoning_details: Option<&serde_json::Value>,
 ) -> String {
     let calls_json: Vec<serde_json::Value> = tool_calls
         .iter()
@@ -917,6 +918,14 @@ fn build_native_assistant_history(
         );
     }
 
+    if let Some(rd) = reasoning_details {
+        if rd.is_array() && !rd.as_array().map(|a| a.is_empty()).unwrap_or(true) {
+            obj.as_object_mut()
+                .unwrap()
+                .insert("reasoning_details".to_string(), rd.clone());
+        }
+    }
+
     obj.to_string()
 }
 
@@ -924,6 +933,7 @@ fn build_native_assistant_history_from_parsed_calls(
     text: &str,
     tool_calls: &[ParsedToolCall],
     reasoning_content: Option<&str>,
+    reasoning_details: Option<&serde_json::Value>,
 ) -> Option<String> {
     let calls_json = tool_calls
         .iter()
@@ -952,6 +962,14 @@ fn build_native_assistant_history_from_parsed_calls(
             "reasoning_content".to_string(),
             serde_json::Value::String(rc.to_string()),
         );
+    }
+
+    if let Some(rd) = reasoning_details {
+        if rd.is_array() && !rd.as_array().map(|a| a.is_empty()).unwrap_or(true) {
+            obj.as_object_mut()
+                .unwrap()
+                .insert("reasoning_details".to_string(), rd.clone());
+        }
     }
 
     Some(obj.to_string())
@@ -1567,6 +1585,7 @@ pub async fn run_tool_call_loop(
                 let mut response_text = resp.text_or_empty().to_string();
                 let mut native_calls = resp.tool_calls;
                 let mut reasoning_content = resp.reasoning_content.clone();
+                let mut reasoning_details = resp.reasoning_details.clone();
                 let mut stop_reason = resp.stop_reason.clone();
                 let mut raw_stop_reason = resp.raw_stop_reason.clone();
                 let (mut resp_input_tokens, mut resp_output_tokens) = resp
@@ -1676,6 +1695,9 @@ pub async fn run_tool_call_loop(
 
                     if continuation_resp.reasoning_content.is_some() {
                         reasoning_content = continuation_resp.reasoning_content.clone();
+                    }
+                    if continuation_resp.reasoning_details.is_some() {
+                        reasoning_details = continuation_resp.reasoning_details.clone();
                     }
                     if !continuation_resp.tool_calls.is_empty() {
                         native_calls = continuation_resp.tool_calls;
@@ -1829,6 +1851,7 @@ pub async fn run_tool_call_loop(
                             &response_text,
                             &calls,
                             reasoning_content.as_deref(),
+                            reasoning_details.as_ref(),
                         )
                         .unwrap_or_else(|| response_text.clone())
                     } else {
@@ -1839,6 +1862,7 @@ pub async fn run_tool_call_loop(
                         &response_text,
                         &native_calls,
                         reasoning_content.as_deref(),
+                        reasoning_details.as_ref(),
                     )
                 };
 
@@ -3975,6 +3999,7 @@ mod tests {
                 tool_calls: Vec::new(),
                 usage: None,
                 reasoning_content: None,
+                reasoning_details: None,
                 quota_metadata: None,
                 stop_reason: None,
                 raw_stop_reason: None,
@@ -4003,6 +4028,7 @@ mod tests {
                     tool_calls: Vec::new(),
                     usage: None,
                     reasoning_content: None,
+                    reasoning_details: None,
                     quota_metadata: None,
                     stop_reason: None,
                     raw_stop_reason: None,
@@ -4090,6 +4116,7 @@ mod tests {
                 tool_calls: Vec::new(),
                 usage: None,
                 reasoning_content: None,
+                reasoning_details: None,
                 quota_metadata: None,
                 stop_reason: None,
                 raw_stop_reason: None,
@@ -5404,6 +5431,7 @@ mod tests {
                 }],
                 usage: None,
                 reasoning_content: None,
+                reasoning_details: None,
                 quota_metadata: None,
                 stop_reason: Some(NormalizedStopReason::MaxTokens),
                 raw_stop_reason: Some("length".to_string()),
@@ -5417,6 +5445,7 @@ mod tests {
                 }],
                 usage: None,
                 reasoning_content: None,
+                reasoning_details: None,
                 quota_metadata: None,
                 stop_reason: Some(NormalizedStopReason::ToolCall),
                 raw_stop_reason: Some("tool_calls".to_string()),
@@ -5426,6 +5455,7 @@ mod tests {
                 tool_calls: Vec::new(),
                 usage: None,
                 reasoning_content: None,
+                reasoning_details: None,
                 quota_metadata: None,
                 stop_reason: Some(NormalizedStopReason::EndTurn),
                 raw_stop_reason: Some("stop".to_string()),
@@ -5502,6 +5532,7 @@ mod tests {
                 }],
                 usage: None,
                 reasoning_content: None,
+                reasoning_details: None,
                 quota_metadata: None,
                 stop_reason: Some(NormalizedStopReason::MaxTokens),
                 raw_stop_reason: Some("length".to_string()),
@@ -5515,6 +5546,7 @@ mod tests {
                 }],
                 usage: None,
                 reasoning_content: None,
+                reasoning_details: None,
                 quota_metadata: None,
                 stop_reason: Some(NormalizedStopReason::ToolCall),
                 raw_stop_reason: Some("tool_calls".to_string()),
@@ -5524,6 +5556,7 @@ mod tests {
                 tool_calls: Vec::new(),
                 usage: None,
                 reasoning_content: None,
+                reasoning_details: None,
                 quota_metadata: None,
                 stop_reason: Some(NormalizedStopReason::EndTurn),
                 raw_stop_reason: Some("stop".to_string()),
@@ -5595,6 +5628,7 @@ mod tests {
                 }],
                 usage: None,
                 reasoning_content: None,
+                reasoning_details: None,
                 quota_metadata: None,
                 stop_reason: Some(NormalizedStopReason::MaxTokens),
                 raw_stop_reason: Some("length".to_string()),
@@ -5604,6 +5638,7 @@ mod tests {
                 tool_calls: Vec::new(),
                 usage: None,
                 reasoning_content: None,
+                reasoning_details: None,
                 quota_metadata: None,
                 stop_reason: Some(NormalizedStopReason::EndTurn),
                 raw_stop_reason: Some("stop".to_string()),
@@ -5665,6 +5700,7 @@ mod tests {
                 tool_calls: Vec::new(),
                 usage: None,
                 reasoning_content: None,
+                reasoning_details: None,
                 quota_metadata: None,
                 stop_reason: Some(NormalizedStopReason::MaxTokens),
                 raw_stop_reason: Some("length".to_string()),
@@ -5674,6 +5710,7 @@ mod tests {
                 tool_calls: Vec::new(),
                 usage: None,
                 reasoning_content: None,
+                reasoning_details: None,
                 quota_metadata: None,
                 stop_reason: Some(NormalizedStopReason::EndTurn),
                 raw_stop_reason: Some("stop".to_string()),
@@ -5723,6 +5760,7 @@ mod tests {
                 tool_calls: Vec::new(),
                 usage: None,
                 reasoning_content: None,
+                reasoning_details: None,
                 quota_metadata: None,
                 stop_reason: Some(NormalizedStopReason::MaxTokens),
                 raw_stop_reason: Some("length".to_string()),
@@ -5732,6 +5770,7 @@ mod tests {
                 tool_calls: Vec::new(),
                 usage: None,
                 reasoning_content: None,
+                reasoning_details: None,
                 quota_metadata: None,
                 stop_reason: Some(NormalizedStopReason::MaxTokens),
                 raw_stop_reason: Some("length".to_string()),
@@ -5741,6 +5780,7 @@ mod tests {
                 tool_calls: Vec::new(),
                 usage: None,
                 reasoning_content: None,
+                reasoning_details: None,
                 quota_metadata: None,
                 stop_reason: Some(NormalizedStopReason::MaxTokens),
                 raw_stop_reason: Some("length".to_string()),
@@ -5750,6 +5790,7 @@ mod tests {
                 tool_calls: Vec::new(),
                 usage: None,
                 reasoning_content: None,
+                reasoning_details: None,
                 quota_metadata: None,
                 stop_reason: Some(NormalizedStopReason::MaxTokens),
                 raw_stop_reason: Some("length".to_string()),
@@ -5800,6 +5841,7 @@ mod tests {
                 tool_calls: Vec::new(),
                 usage: None,
                 reasoning_content: None,
+                reasoning_details: None,
                 quota_metadata: None,
                 stop_reason: Some(NormalizedStopReason::MaxTokens),
                 raw_stop_reason: Some("length".to_string()),
@@ -5809,6 +5851,7 @@ mod tests {
                 tool_calls: Vec::new(),
                 usage: None,
                 reasoning_content: None,
+                reasoning_details: None,
                 quota_metadata: None,
                 stop_reason: Some(NormalizedStopReason::EndTurn),
                 raw_stop_reason: Some("stop".to_string()),
@@ -7671,7 +7714,8 @@ Let me check the result."#;
             name: "shell".into(),
             arguments: "{}".into(),
         }];
-        let result = build_native_assistant_history("answer", &calls, Some("thinking step"));
+        let result =
+            build_native_assistant_history("answer", &calls, Some("thinking step"), None);
         let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
         assert_eq!(parsed["content"].as_str(), Some("answer"));
         assert_eq!(parsed["reasoning_content"].as_str(), Some("thinking step"));
@@ -7685,7 +7729,7 @@ Let me check the result."#;
             name: "shell".into(),
             arguments: "{}".into(),
         }];
-        let result = build_native_assistant_history("answer", &calls, None);
+        let result = build_native_assistant_history("answer", &calls, None, None);
         let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
         assert_eq!(parsed["content"].as_str(), Some("answer"));
         assert!(parsed.get("reasoning_content").is_none());
@@ -7702,6 +7746,7 @@ Let me check the result."#;
             "answer",
             &calls,
             Some("deep thought"),
+            None,
         );
         assert!(result.is_some());
         let parsed: serde_json::Value = serde_json::from_str(result.as_deref().unwrap()).unwrap();
@@ -7717,7 +7762,8 @@ Let me check the result."#;
             arguments: serde_json::json!({"command": "pwd"}),
             tool_call_id: Some("call_2".into()),
         }];
-        let result = build_native_assistant_history_from_parsed_calls("answer", &calls, None);
+        let result =
+            build_native_assistant_history_from_parsed_calls("answer", &calls, None, None);
         assert!(result.is_some());
         let parsed: serde_json::Value = serde_json::from_str(result.as_deref().unwrap()).unwrap();
         assert_eq!(parsed["content"].as_str(), Some("answer"));

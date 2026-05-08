@@ -465,6 +465,7 @@ impl AnthropicProvider {
             tool_calls,
             usage,
             reasoning_content: None,
+            reasoning_details: None,
             quota_metadata: None,
             stop_reason,
             raw_stop_reason,

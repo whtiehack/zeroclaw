@@ -4608,6 +4608,15 @@ pub struct ChannelsConfig {
     /// Default: 300s for on-device LLMs (Ollama) which are slower than cloud APIs.
     #[serde(default = "default_channel_message_timeout_secs")]
     pub message_timeout_secs: u64,
+
+    /// When true, persist the full per-turn history (assistant tool_calls JSON,
+    /// tool result messages, reasoning_details) into the cross-turn
+    /// `conversation_histories` store. When false (default), each completed
+    /// turn collapses to its final assistant text plus a `[Used tools: ...]`
+    /// prefix to save tokens at the cost of losing structured tool/reasoning
+    /// state across user messages.
+    #[serde(default)]
+    pub preserve_full_history: bool,
 }
 
 impl ChannelsConfig {
@@ -4761,6 +4770,7 @@ impl Default for ChannelsConfig {
             clawdtalk: None,
             ack_reaction: AckReactionChannelsConfig::default(),
             message_timeout_secs: default_channel_message_timeout_secs(),
+            preserve_full_history: false,
         }
     }
 }
@@ -10650,6 +10660,7 @@ ws_url = "ws://127.0.0.1:3002"
                 clawdtalk: None,
                 ack_reaction: AckReactionChannelsConfig::default(),
                 message_timeout_secs: 300,
+                preserve_full_history: false,
             },
             memory: MemoryConfig::default(),
             storage: StorageConfig::default(),
@@ -11658,6 +11669,7 @@ allowed_users = ["@ops:matrix.org"]
             clawdtalk: None,
             ack_reaction: AckReactionChannelsConfig::default(),
             message_timeout_secs: 300,
+            preserve_full_history: false,
         };
         let toml_str = toml::to_string_pretty(&c).unwrap();
         let parsed: ChannelsConfig = toml::from_str(&toml_str).unwrap();
@@ -12033,6 +12045,7 @@ allowed_sender_ids = ["U111", "U222"]
             clawdtalk: None,
             ack_reaction: AckReactionChannelsConfig::default(),
             message_timeout_secs: 300,
+            preserve_full_history: false,
         };
         let toml_str = toml::to_string_pretty(&c).unwrap();
         let parsed: ChannelsConfig = toml::from_str(&toml_str).unwrap();

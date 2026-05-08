@@ -90,6 +90,11 @@ struct NativeMessage {
     /// that require it in assistant tool-call history messages.
     #[serde(skip_serializing_if = "Option::is_none")]
     reasoning_content: Option<String>,
+    /// OpenRouter-style `reasoning_details` array (chat completions extension)
+    /// carrying encrypted/summary reasoning state. Pass-through for stateless
+    /// multi-turn reasoning preservation.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_details: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Serialize)]
@@ -223,6 +228,7 @@ impl OpenRouterProvider {
                                     tool_call_id: None,
                                     tool_calls: Some(tool_calls),
                                     reasoning_content,
+                                    reasoning_details: None,
                                 };
                             }
                         }
@@ -246,6 +252,7 @@ impl OpenRouterProvider {
                             tool_call_id,
                             tool_calls: None,
                             reasoning_content: None,
+                            reasoning_details: None,
                         };
                     }
                 }
@@ -256,6 +263,7 @@ impl OpenRouterProvider {
                     tool_call_id: None,
                     tool_calls: None,
                     reasoning_content: None,
+                    reasoning_details: None,
                 }
             })
             .collect()
@@ -311,6 +319,7 @@ impl OpenRouterProvider {
             tool_calls,
             usage: None,
             reasoning_content,
+            reasoning_details: None,
             quota_metadata: None,
             stop_reason,
             raw_stop_reason,
@@ -829,6 +838,7 @@ mod tests {
             message: NativeResponseMessage {
                 content: Some("Here you go.".into()),
                 reasoning_content: None,
+                reasoning_details: None,
                 tool_calls: Some(vec![NativeToolCall {
                     id: Some("call_789".into()),
                     kind: Some("function".into()),
@@ -948,6 +958,7 @@ mod tests {
             message: NativeResponseMessage {
                 content: Some("answer".into()),
                 reasoning_content: Some("thinking step".into()),
+                reasoning_details: None,
                 tool_calls: Some(vec![NativeToolCall {
                     id: Some("call_1".into()),
                     kind: Some("function".into()),
@@ -972,6 +983,7 @@ mod tests {
             message: NativeResponseMessage {
                 content: Some("hello".into()),
                 reasoning_content: None,
+                reasoning_details: None,
                 tool_calls: None,
             },
             finish_reason: Some("stop".into()),
@@ -1052,6 +1064,7 @@ mod tests {
             tool_call_id: None,
             tool_calls: None,
             reasoning_content: None,
+            reasoning_details: None,
         };
         let json = serde_json::to_string(&msg).unwrap();
         assert!(!json.contains("reasoning_content"));
@@ -1065,6 +1078,7 @@ mod tests {
             tool_call_id: None,
             tool_calls: None,
             reasoning_content: Some("thinking...".to_string()),
+            reasoning_details: None,
         };
         let json = serde_json::to_string(&msg).unwrap();
         assert!(json.contains("reasoning_content"));

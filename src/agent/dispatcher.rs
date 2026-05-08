@@ -218,6 +218,7 @@ impl ToolDispatcher for NativeToolDispatcher {
                     text,
                     tool_calls,
                     reasoning_content,
+                    reasoning_details,
                 } => {
                     let mut payload = serde_json::json!({
                         "content": text,
@@ -225,6 +226,9 @@ impl ToolDispatcher for NativeToolDispatcher {
                     });
                     if let Some(rc) = reasoning_content {
                         payload["reasoning_content"] = serde_json::json!(rc);
+                    }
+                    if let Some(rd) = reasoning_details {
+                        payload["reasoning_details"] = rd.clone();
                     }
                     vec![ChatMessage::assistant(payload.to_string())]
                 }
@@ -263,6 +267,7 @@ mod tests {
             tool_calls: vec![],
             usage: None,
             reasoning_content: None,
+            reasoning_details: None,
                 quota_metadata: None,
             stop_reason: None,
             raw_stop_reason: None,
@@ -284,6 +289,7 @@ mod tests {
             }],
             usage: None,
             reasoning_content: None,
+            reasoning_details: None,
             quota_metadata: None,
             stop_reason: None,
             raw_stop_reason: None,
@@ -359,6 +365,7 @@ mod tests {
                 arguments: "{}".into(),
             }],
             reasoning_content: Some("thinking step".into()),
+            reasoning_details: None,
         }];
 
         let messages = dispatcher.to_provider_messages(&history);
@@ -382,6 +389,7 @@ mod tests {
                 arguments: "{}".into(),
             }],
             reasoning_content: None,
+            reasoning_details: None,
         }];
 
         let messages = dispatcher.to_provider_messages(&history);
@@ -402,6 +410,7 @@ mod tests {
                 arguments: "{}".into(),
             }],
             reasoning_content: Some("should be ignored".into()),
+            reasoning_details: None,
         }];
 
         let messages = dispatcher.to_provider_messages(&history);

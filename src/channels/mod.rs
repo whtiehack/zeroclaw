@@ -281,6 +281,7 @@ struct ChannelRuntimeDefaults {
     multimodal: crate::config::MultimodalConfig,
     query_classification: crate::config::QueryClassificationConfig,
     model_routes: Vec<crate::config::ModelRouteConfig>,
+    preserve_full_history: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1294,6 +1295,7 @@ fn runtime_defaults_from_config(config: &Config) -> ChannelRuntimeDefaults {
         multimodal: config.multimodal.clone(),
         query_classification: config.query_classification.clone(),
         model_routes: config.model_routes.clone(),
+        preserve_full_history: config.channels_config.preserve_full_history,
     }
 }
 
@@ -1360,6 +1362,7 @@ fn runtime_defaults_snapshot(ctx: &ChannelRuntimeContext) -> ChannelRuntimeDefau
         multimodal: ctx.multimodal.clone(),
         query_classification: ctx.query_classification.clone(),
         model_routes: ctx.model_routes.clone(),
+        preserve_full_history: false,
     }
 }
 
@@ -2188,6 +2191,17 @@ fn append_sender_turn(ctx: &ChannelRuntimeContext, sender_key: &str, turn: ChatM
     turns.push(turn);
     while turns.len() > MAX_CHANNEL_HISTORY {
         turns.remove(0);
+        // Align to the next user/system turn so we never leave an orphan
+        // tool result message or assistant tool_calls block at the head of
+        // the persisted history (preserve_full_history mode emits multiple
+        // ChatMessages per turn; truncating mid-turn would break call_id
+        // pairing on the next provider request).
+        while let Some(first) = turns.first() {
+            if first.role == "user" || first.role == "system" {
+                break;
+            }
+            turns.remove(0);
+        }
     }
     drop(histories);
     ctx.conversation_touches
@@ -2225,6 +2239,19 @@ fn trim_channel_prompt_history(history: &mut Vec<ChatMessage>) -> bool {
         let removed = history.remove(idx);
         total = total.saturating_sub(estimated_message_tokens(&removed));
         trimmed = true;
+
+        // Align to the next user/system turn boundary so we don't leave an
+        // orphan assistant tool_calls block or tool result message at the
+        // head of the trimmed history (preserve_full_history mode emits
+        // multiple consecutive non-user messages per turn).
+        while let Some(idx) = history.iter().position(|m| m.role != "system") {
+            let next = &history[idx];
+            if next.role == "user" {
+                break;
+            }
+            let removed = history.remove(idx);
+            total = total.saturating_sub(estimated_message_tokens(&removed));
+        }
     }
 
     trimmed
@@ -4794,21 +4821,43 @@ If this input is legitimate, rephrase the request and avoid instruction-override
                 }),
             );
 
-            // Extract condensed tool-use context from the history messages
-            // added during run_tool_call_loop, so the LLM retains awareness
-            // of what it did on subsequent turns.
-            let tool_summary = extract_tool_context_summary(&history, history_len_before_tools);
-            let history_response = if tool_summary.is_empty() || msg.channel == "telegram" {
-                delivered_response.clone()
+            if runtime_defaults.preserve_full_history {
+                // Preserve every ChatMessage produced during run_tool_call_loop
+                // (assistant tool_calls JSON, tool result messages, final
+                // assistant text) so subsequent turns see structured tool +
+                // reasoning state instead of a flattened summary.
+                if history.len() > history_len_before_tools {
+                    for turn in history[history_len_before_tools..].to_vec() {
+                        append_sender_turn(ctx.as_ref(), &history_key, turn);
+                    }
+                } else {
+                    // Defensive: if the loop somehow produced no new history
+                    // entries, persist the rendered response so we never lose
+                    // the assistant turn.
+                    append_sender_turn(
+                        ctx.as_ref(),
+                        &history_key,
+                        ChatMessage::assistant(&delivered_response),
+                    );
+                }
             } else {
-                format!("{tool_summary}\n{delivered_response}")
-            };
+                // Extract condensed tool-use context from the history messages
+                // added during run_tool_call_loop, so the LLM retains awareness
+                // of what it did on subsequent turns.
+                let tool_summary =
+                    extract_tool_context_summary(&history, history_len_before_tools);
+                let history_response = if tool_summary.is_empty() || msg.channel == "telegram" {
+                    delivered_response.clone()
+                } else {
+                    format!("{tool_summary}\n{delivered_response}")
+                };
 
-            append_sender_turn(
-                ctx.as_ref(),
-                &history_key,
-                ChatMessage::assistant(&history_response),
-            );
+                append_sender_turn(
+                    ctx.as_ref(),
+                    &history_key,
+                    ChatMessage::assistant(&history_response),
+                );
+            }
             if runtime_defaults.auto_save_memory
                 && delivered_response.chars().count() >= AUTOSAVE_MIN_MESSAGE_CHARS
             {

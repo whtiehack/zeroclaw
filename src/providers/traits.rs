@@ -142,6 +142,11 @@ pub struct ChatResponse {
     /// sent back in subsequent API requests — some providers reject tool-call
     /// history that omits this field.
     pub reasoning_content: Option<String>,
+    /// OpenRouter-style `reasoning_details` array from chat completions
+    /// responses (chat completions extension covering encrypted/summary/text
+    /// reasoning state). Preserved as opaque JSON so it can be passed back in
+    /// subsequent multi-turn requests for stateless reasoning preservation.
+    pub reasoning_details: Option<serde_json::Value>,
     /// Quota metadata extracted from response headers (if available).
     /// Populated by providers that support quota tracking.
     pub quota_metadata: Option<super::quota_types::QuotaMetadata>,
@@ -190,6 +195,12 @@ pub enum ConversationMessage {
         /// Raw reasoning content from thinking models, preserved for round-trip
         /// fidelity with provider APIs that require it.
         reasoning_content: Option<String>,
+        /// OpenRouter chat completions `reasoning_details` array (encrypted +
+        /// summary reasoning state). Preserved opaque so the dispatcher can
+        /// re-emit it on subsequent provider requests for stateless reasoning
+        /// continuation. `None` when the upstream omitted the field.
+        #[serde(default)]
+        reasoning_details: Option<serde_json::Value>,
     },
     /// Results of tool executions, fed back to the LLM.
     ToolResults(Vec<ToolResultMessage>),
@@ -442,6 +453,7 @@ pub trait Provider: Send + Sync {
                     tool_calls: Vec::new(),
                     usage: None,
                     reasoning_content: None,
+                    reasoning_details: None,
                     quota_metadata: None,
                     stop_reason: None,
                     raw_stop_reason: None,
@@ -457,6 +469,7 @@ pub trait Provider: Send + Sync {
             tool_calls: Vec::new(),
             usage: None,
             reasoning_content: None,
+            reasoning_details: None,
             quota_metadata: None,
             stop_reason: None,
             raw_stop_reason: None,
@@ -495,6 +508,7 @@ pub trait Provider: Send + Sync {
             tool_calls: Vec::new(),
             usage: None,
             reasoning_content: None,
+            reasoning_details: None,
             quota_metadata: None,
             stop_reason: None,
             raw_stop_reason: None,
@@ -627,6 +641,7 @@ mod tests {
             tool_calls: vec![],
             usage: None,
             reasoning_content: None,
+            reasoning_details: None,
             quota_metadata: None,
             stop_reason: None,
             raw_stop_reason: None,
@@ -643,6 +658,7 @@ mod tests {
             }],
             usage: None,
             reasoning_content: None,
+            reasoning_details: None,
             quota_metadata: None,
             stop_reason: None,
             raw_stop_reason: None,
@@ -668,6 +684,7 @@ mod tests {
                 output_tokens: Some(50),
             }),
             reasoning_content: None,
+            reasoning_details: None,
             quota_metadata: None,
             stop_reason: None,
             raw_stop_reason: None,

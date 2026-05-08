@@ -534,6 +534,13 @@ struct ResponseMessage {
     /// in `reasoning_content` instead of `content`. Used as automatic fallback.
     #[serde(default)]
     reasoning_content: Option<String>,
+    /// OpenRouter-style reasoning_details array (chat completions extension):
+    /// `[{type:"reasoning.encrypted",data,format,id,index}, {type:"reasoning.summary",summary,...}, ...]`
+    /// Captured raw so the agent loop can round-trip it across user messages
+    /// for stateless reasoning preservation when the upstream proxy supports
+    /// translating it back into the provider's reasoning items.
+    #[serde(default)]
+    reasoning_details: Option<serde_json::Value>,
     #[serde(default)]
     tool_calls: Option<Vec<ToolCall>>,
 }
@@ -664,6 +671,13 @@ struct NativeMessage {
     /// that require it in assistant tool-call history messages.
     #[serde(skip_serializing_if = "Option::is_none")]
     reasoning_content: Option<String>,
+    /// OpenRouter-style reasoning_details array (chat completions extension)
+    /// carrying encrypted/summary/text reasoning state. Pass-through for
+    /// stateless multi-turn reasoning preservation when the upstream proxy
+    /// (e.g. CPA) can translate it into the upstream provider's reasoning
+    /// item format.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_details: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Serialize)]
@@ -988,6 +1002,7 @@ fn parse_responses_chat_response(response: ResponsesResponse) -> ProviderChatRes
         tool_calls,
         usage: None,
         reasoning_content: None,
+        reasoning_details: None,
         quota_metadata: None,
         stop_reason: None,
         raw_stop_reason: None,
@@ -1666,12 +1681,18 @@ impl OpenAiCompatibleProvider {
                             .and_then(serde_json::Value::as_str)
                             .map(ToString::to_string);
 
+                        let reasoning_details = value
+                            .get("reasoning_details")
+                            .filter(|v| v.is_array())
+                            .cloned();
+
                         native_messages.push(NativeMessage {
                             role: "assistant".to_string(),
                             content: Some(MessageContent::Text(content)),
                             tool_call_id: None,
                             tool_calls: Some(tool_calls),
                             reasoning_content,
+                            reasoning_details,
                         });
                         continue;
                     }
@@ -1702,6 +1723,7 @@ impl OpenAiCompatibleProvider {
                                 tool_call_id: Some(id),
                                 tool_calls: None,
                                 reasoning_content: None,
+                                reasoning_details: None,
                             });
                             continue;
                         }
@@ -1725,6 +1747,7 @@ impl OpenAiCompatibleProvider {
                         tool_call_id: None,
                         tool_calls: None,
                         reasoning_content: None,
+                        reasoning_details: None,
                     });
                     continue;
                 }
@@ -1740,6 +1763,7 @@ impl OpenAiCompatibleProvider {
                 tool_call_id: None,
                 tool_calls: None,
                 reasoning_content: None,
+                reasoning_details: None,
             });
         }
 
@@ -1844,6 +1868,10 @@ impl OpenAiCompatibleProvider {
         let message = choice.message;
         let text = message.effective_content_optional();
         let reasoning_content = message.reasoning_content.clone();
+        let reasoning_details = message
+            .reasoning_details
+            .clone()
+            .filter(|v| v.is_array() && !v.as_array().unwrap().is_empty());
         let tool_calls = message
             .tool_calls
             .unwrap_or_default()
@@ -1872,6 +1900,7 @@ impl OpenAiCompatibleProvider {
             tool_calls,
             usage: None,
             reasoning_content,
+            reasoning_details,
             quota_metadata: None,
             stop_reason,
             raw_stop_reason,
@@ -1898,6 +1927,7 @@ impl OpenAiCompatibleProvider {
             tool_calls: vec![],
             usage: None,
             reasoning_content: None,
+            reasoning_details: None,
             quota_metadata: None,
             stop_reason: None,
             raw_stop_reason: None,
@@ -2223,6 +2253,7 @@ impl Provider for OpenAiCompatibleProvider {
                     tool_calls: vec![],
                     usage: None,
                     reasoning_content: None,
+                    reasoning_details: None,
                     quota_metadata: None,
                     stop_reason: None,
                     raw_stop_reason: None,
@@ -2303,6 +2334,7 @@ impl Provider for OpenAiCompatibleProvider {
             tool_calls,
             usage,
             reasoning_content,
+            reasoning_details: None,
             quota_metadata: None,
             stop_reason,
             raw_stop_reason,
@@ -3485,6 +3517,7 @@ mod tests {
                     parameters: None,
                 }]),
                 reasoning_content: None,
+                reasoning_details: None,
             },
             finish_reason: Some("tool_calls".to_string()),
         };
@@ -4589,6 +4622,7 @@ mod tests {
             message: ResponseMessage {
                 content: Some("answer".to_string()),
                 reasoning_content: Some("thinking step".to_string()),
+                reasoning_details: None,
                 tool_calls: Some(vec![ToolCall {
                     id: Some("call_1".to_string()),
                     kind: Some("function".to_string()),
@@ -4618,6 +4652,7 @@ mod tests {
             message: ResponseMessage {
                 content: Some("hello".to_string()),
                 reasoning_content: None,
+                reasoning_details: None,
                 tool_calls: None,
             },
             finish_reason: Some("stop".to_string()),
@@ -4681,6 +4716,7 @@ mod tests {
             tool_call_id: None,
             tool_calls: None,
             reasoning_content: None,
+            reasoning_details: None,
         };
         let json = serde_json::to_string(&msg_without).unwrap();
         assert!(
@@ -4694,6 +4730,7 @@ mod tests {
             tool_call_id: None,
             tool_calls: None,
             reasoning_content: Some("thinking...".to_string()),
+            reasoning_details: None,
         };
         let json = serde_json::to_string(&msg_with).unwrap();
         assert!(
