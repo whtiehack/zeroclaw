@@ -1012,7 +1012,38 @@ fn build_channel_system_prompt(
     prompt
 }
 
-fn normalize_cached_channel_turns(turns: Vec<ChatMessage>) -> Vec<ChatMessage> {
+fn normalize_cached_channel_turns(
+    turns: Vec<ChatMessage>,
+    preserve_full_history: bool,
+) -> Vec<ChatMessage> {
+    if preserve_full_history {
+        // preserve_full_history breaks the strict user/assistant invariant:
+        // history may contain assistant tool_calls JSON, tool result rows, and
+        // multiple assistant turns inside one user-message reply (run_tool_call_loop
+        // emits an assistant + tool pair per LLM iteration). Pass everything
+        // through unchanged except the interrupted-turn case (consecutive user
+        // messages get merged so the channel can recover from a dropped reply).
+        let mut normalized = Vec::with_capacity(turns.len());
+        for turn in turns {
+            if turn.role == "user" {
+                if let Some(last) = normalized.last_mut() {
+                    let last_msg: &mut ChatMessage = last;
+                    if last_msg.role == "user" {
+                        if !turn.content.is_empty() {
+                            if !last_msg.content.is_empty() {
+                                last_msg.content.push_str("\n\n");
+                            }
+                            last_msg.content.push_str(&turn.content);
+                        }
+                        continue;
+                    }
+                }
+            }
+            normalized.push(turn);
+        }
+        return normalized;
+    }
+
     let mut normalized = Vec::with_capacity(turns.len());
     let mut expecting_user = true;
 
@@ -2164,7 +2195,9 @@ fn compact_sender_history(ctx: &ChannelRuntimeContext, sender_key: &str) -> bool
     let keep_from = turns
         .len()
         .saturating_sub(CHANNEL_HISTORY_COMPACT_KEEP_MESSAGES);
-    let mut compacted = normalize_cached_channel_turns(turns[keep_from..].to_vec());
+    let preserve_full_history = runtime_defaults_snapshot(ctx).preserve_full_history;
+    let mut compacted =
+        normalize_cached_channel_turns(turns[keep_from..].to_vec(), preserve_full_history);
 
     for turn in &mut compacted {
         if turn.content.chars().count() > CHANNEL_HISTORY_COMPACT_CONTENT_CHARS {
@@ -4468,7 +4501,8 @@ If this input is legitimate, rephrase the request and avoid instruction-override
         .get(&history_key)
         .cloned()
         .unwrap_or_default();
-    let mut prior_turns = normalize_cached_channel_turns(prior_turns_raw);
+    let mut prior_turns =
+        normalize_cached_channel_turns(prior_turns_raw, runtime_defaults.preserve_full_history);
 
     if let Some(last_turn) = prior_turns.last_mut() {
         if last_turn.role == "user" {
@@ -7448,7 +7482,7 @@ mod tests {
             ChatMessage::user("summarize this"),
         ];
 
-        let normalized = normalize_cached_channel_turns(turns);
+        let normalized = normalize_cached_channel_turns(turns, false);
         assert_eq!(normalized.len(), 1);
         assert_eq!(normalized[0].role, "user");
         assert!(normalized[0].content.contains("forwarded content"));
@@ -7464,13 +7498,62 @@ mod tests {
             ChatMessage::user("next user"),
         ];
 
-        let normalized = normalize_cached_channel_turns(turns);
+        let normalized = normalize_cached_channel_turns(turns, false);
         assert_eq!(normalized.len(), 3);
         assert_eq!(normalized[0].role, "user");
         assert_eq!(normalized[1].role, "assistant");
         assert_eq!(normalized[2].role, "user");
         assert!(normalized[1].content.contains("assistant part 1"));
         assert!(normalized[1].content.contains("assistant part 2"));
+    }
+
+    #[test]
+    fn normalize_cached_channel_turns_preserve_full_history_keeps_tools_and_consecutive_assistants(
+    ) {
+        // preserve_full_history=true: a single user turn produces multiple
+        // assistant + tool messages from run_tool_call_loop. Default mode
+        // would collapse them into one assistant string and drop tool rows;
+        // preserve mode must keep every row intact (only consecutive user
+        // merge for interrupted-turn recovery still applies).
+        let turns = vec![
+            ChatMessage::user("query 1"),
+            ChatMessage::assistant(r#"{"content":null,"tool_calls":[{"id":"c1","name":"t","arguments":"{}"}]}"#),
+            ChatMessage::tool(r#"{"tool_call_id":"c1","content":"ok"}"#),
+            ChatMessage::assistant(r#"{"content":null,"tool_calls":[{"id":"c2","name":"t","arguments":"{}"}]}"#),
+            ChatMessage::tool(r#"{"tool_call_id":"c2","content":"ok"}"#),
+            ChatMessage::assistant("final natural language reply"),
+            ChatMessage::user("query 2"),
+        ];
+
+        let normalized = normalize_cached_channel_turns(turns, true);
+        assert_eq!(normalized.len(), 7);
+        assert_eq!(normalized[0].role, "user");
+        assert_eq!(normalized[1].role, "assistant");
+        assert!(normalized[1].content.starts_with(r#"{"content":null"#));
+        assert_eq!(normalized[2].role, "tool");
+        assert_eq!(normalized[3].role, "assistant");
+        assert_eq!(normalized[4].role, "tool");
+        assert_eq!(normalized[5].role, "assistant");
+        assert_eq!(normalized[5].content, "final natural language reply");
+        assert_eq!(normalized[6].role, "user");
+    }
+
+    #[test]
+    fn normalize_cached_channel_turns_preserve_full_history_still_merges_consecutive_users() {
+        // Even in preserve mode, an interrupted turn (user without persisted
+        // assistant reply, then a fresh user message) should merge into one.
+        let turns = vec![
+            ChatMessage::user("first user"),
+            ChatMessage::assistant("reply"),
+            ChatMessage::user("interrupted"),
+            ChatMessage::user("follow up"),
+        ];
+
+        let normalized = normalize_cached_channel_turns(turns, true);
+        assert_eq!(normalized.len(), 3);
+        assert_eq!(normalized[2].role, "user");
+        assert!(normalized[2].content.contains("interrupted"));
+        assert!(normalized[2].content.contains("follow up"));
     }
 
     /// Verify that an orphan user turn followed by a failure-marker assistant
@@ -7484,7 +7567,7 @@ mod tests {
             ChatMessage::user("what is WAL?"),
         ];
 
-        let normalized = normalize_cached_channel_turns(turns);
+        let normalized = normalize_cached_channel_turns(turns, false);
         assert_eq!(normalized.len(), 3);
         assert_eq!(normalized[0].role, "user");
         assert_eq!(normalized[1].role, "assistant");
@@ -7502,7 +7585,7 @@ mod tests {
             ChatMessage::user("next question"),
         ];
 
-        let normalized = normalize_cached_channel_turns(turns);
+        let normalized = normalize_cached_channel_turns(turns, false);
         assert_eq!(normalized.len(), 3);
         assert_eq!(normalized[1].role, "assistant");
         assert!(normalized[1].content.contains("Task timed out"));
@@ -14296,7 +14379,7 @@ BTC is currently around $65,000 based on latest tool output."#;
     #[test]
     fn normalize_merges_consecutive_user_turns() {
         let turns = vec![ChatMessage::user("hello"), ChatMessage::user("world")];
-        let result = normalize_cached_channel_turns(turns);
+        let result = normalize_cached_channel_turns(turns, false);
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].role, "user");
         assert_eq!(result[0].content, "hello\n\nworld");
@@ -14309,7 +14392,7 @@ BTC is currently around $65,000 based on latest tool output."#;
             ChatMessage::assistant("hi"),
             ChatMessage::user("bye"),
         ];
-        let result = normalize_cached_channel_turns(turns);
+        let result = normalize_cached_channel_turns(turns, false);
         assert_eq!(result.len(), 3);
         assert_eq!(result[0].content, "hello");
         assert_eq!(result[1].content, "hi");
@@ -14323,7 +14406,7 @@ BTC is currently around $65,000 based on latest tool output."#;
             ChatMessage::user("b"),
             ChatMessage::user("c"),
         ];
-        let result = normalize_cached_channel_turns(turns);
+        let result = normalize_cached_channel_turns(turns, false);
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].role, "user");
         assert_eq!(result[0].content, "a\n\nb\n\nc");
@@ -14331,7 +14414,7 @@ BTC is currently around $65,000 based on latest tool output."#;
 
     #[test]
     fn normalize_empty_input() {
-        let result = normalize_cached_channel_turns(vec![]);
+        let result = normalize_cached_channel_turns(vec![], false);
         assert!(result.is_empty());
     }
 
