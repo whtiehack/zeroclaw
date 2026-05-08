@@ -3880,6 +3880,48 @@ fn precheck_prompt_text(
     }
 }
 
+/// Render an assistant `ChatMessage.content` for the precheck prompt.
+///
+/// When `[channels_config].preserve_full_history = true`, the persisted
+/// content of an assistant turn is the JSON payload produced by
+/// `build_native_assistant_history` (`{content, tool_calls, reasoning_content,
+/// reasoning_details}`). Splatting that raw JSON into the precheck prompt
+/// pollutes the router's view with encrypted reasoning blobs and obscures the
+/// actual reply text. Compress it back to natural language with a brief
+/// `(used: ...)` tool-name footer when applicable.
+fn render_assistant_for_precheck(content: &str) -> String {
+    let trimmed = content.trim_start();
+    if !trimmed.starts_with('{') {
+        return content.to_string();
+    }
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(content) else {
+        return content.to_string();
+    };
+    if !value.is_object() {
+        return content.to_string();
+    }
+    let text = value
+        .get("content")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("")
+        .trim();
+    let tools: Vec<&str> = value
+        .get("tool_calls")
+        .and_then(serde_json::Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|tc| tc.get("name").and_then(serde_json::Value::as_str))
+                .collect()
+        })
+        .unwrap_or_default();
+    match (text.is_empty(), tools.is_empty()) {
+        (true, true) => String::new(),
+        (false, true) => text.to_string(),
+        (true, false) => format!("(used: {})", tools.join(", ")),
+        (false, false) => format!("{text} (used: {})", tools.join(", ")),
+    }
+}
+
 async fn classify_channel_reply_intent(
     provider: &dyn Provider,
     cfg: &crate::config::ReplyIntentPrecheckConfig,
@@ -3898,7 +3940,15 @@ async fn classify_channel_reply_intent(
     let start = recent.len().saturating_sub(n);
     for m in &recent[start..] {
         let role = if m.role == "assistant" { "assistant" } else { "user" };
-        convo.push_str(&format!("[{role}] {}\n", m.content));
+        let rendered = if m.role == "assistant" {
+            render_assistant_for_precheck(&m.content)
+        } else {
+            m.content.clone()
+        };
+        if rendered.is_empty() {
+            continue;
+        }
+        convo.push_str(&format!("[{role}] {rendered}\n"));
     }
     convo.push_str(&format!("[user] {current_user_content}\n"));
     convo.push_str("\nClassify the latest [user] message.");
@@ -6938,6 +6988,56 @@ mod tests {
             assert_eq!(
                 parse_precheck_response("Sure, NO_REPLY here"),
                 AssistantChannelOutcome::NoReply { reason: None }
+            );
+        }
+
+        // ─── render_assistant_for_precheck (preserve_full_history JSON guard) ───
+        #[test]
+        fn render_assistant_plain_text_passes_through() {
+            assert_eq!(
+                render_assistant_for_precheck("hello world"),
+                "hello world"
+            );
+        }
+
+        #[test]
+        fn render_assistant_invalid_json_passes_through() {
+            assert_eq!(
+                render_assistant_for_precheck("{ broken"),
+                "{ broken"
+            );
+        }
+
+        #[test]
+        fn render_assistant_extracts_content_and_tool_summary() {
+            let payload = r#"{"content":"checked the file","tool_calls":[{"id":"c1","name":"file_read"},{"id":"c2","name":"glob_search"}],"reasoning_details":[{"type":"reasoning.encrypted","data":"ENC"}]}"#;
+            assert_eq!(
+                render_assistant_for_precheck(payload),
+                "checked the file (used: file_read, glob_search)"
+            );
+        }
+
+        #[test]
+        fn render_assistant_tool_only_returns_used_marker() {
+            let payload = r#"{"content":null,"tool_calls":[{"id":"c1","name":"glob_search"}]}"#;
+            assert_eq!(
+                render_assistant_for_precheck(payload),
+                "(used: glob_search)"
+            );
+        }
+
+        #[test]
+        fn render_assistant_empty_payload_returns_empty() {
+            let payload = r#"{"content":null,"tool_calls":[]}"#;
+            assert_eq!(render_assistant_for_precheck(payload), "");
+        }
+
+        #[test]
+        fn render_assistant_json_array_passes_through() {
+            // Arrays are not the assistant-history shape; treat as raw text.
+            assert_eq!(
+                render_assistant_for_precheck("[1,2,3]"),
+                "[1,2,3]"
             );
         }
 
@@ -11130,6 +11230,7 @@ BTC is currently around $65,000 based on latest tool output."#
                         multimodal: crate::config::MultimodalConfig::default(),
                         query_classification: crate::config::QueryClassificationConfig::default(),
                         model_routes: Vec::new(),
+                        preserve_full_history: false,
                     },
                     perplexity_filter: crate::config::PerplexityFilterConfig::default(),
                     outbound_leak_guard: crate::config::OutboundLeakGuardConfig::default(),

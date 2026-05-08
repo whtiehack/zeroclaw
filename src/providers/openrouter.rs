@@ -155,6 +155,10 @@ struct NativeResponseMessage {
     /// Reasoning/thinking models may return output in `reasoning_content`.
     #[serde(default)]
     reasoning_content: Option<String>,
+    /// OpenRouter `reasoning_details` array (chat completions extension).
+    /// Captured raw so callers can round-trip reasoning state across turns.
+    #[serde(default)]
+    reasoning_details: Option<serde_json::Value>,
     #[serde(default)]
     tool_calls: Option<Vec<NativeToolCall>>,
 }
