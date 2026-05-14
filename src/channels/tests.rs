@@ -2618,6 +2618,154 @@ async fn message_dispatch_interrupts_in_flight_telegram_request_and_preserves_co
 }
 
 #[tokio::test]
+async fn message_dispatch_serializes_same_scope_when_interrupt_disabled() {
+    let channel_impl = Arc::new(TelegramRecordingChannel::default());
+    let channel: Arc<dyn Channel> = channel_impl.clone();
+
+    let mut channels_by_name = HashMap::new();
+    channels_by_name.insert(channel.name().to_string(), channel);
+
+    let provider_impl = Arc::new(DelayedHistoryCaptureProvider {
+        delay: Duration::from_millis(200),
+        calls: std::sync::Mutex::new(Vec::new()),
+    });
+
+    let runtime_ctx = Arc::new(ChannelRuntimeContext {
+        channels_by_name: Arc::new(channels_by_name),
+        provider: provider_impl.clone(),
+        default_provider: Arc::new("test-provider".to_string()),
+        memory: Arc::new(NoopMemory),
+        tools_registry: Arc::new(vec![]),
+        observer: Arc::new(NoopObserver),
+        system_prompt: Arc::new("test-system-prompt".to_string()),
+        model: Arc::new("test-model".to_string()),
+        temperature: 0.0,
+        auto_save_memory: false,
+        max_tool_iterations: 10,
+        min_relevance_score: 0.0,
+        min_query_chars: 8,
+        conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+        pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
+        provider_cache: Arc::new(Mutex::new(HashMap::new())),
+        route_overrides: Arc::new(Mutex::new(HashMap::new())),
+        api_key: None,
+        api_url: None,
+        reliability: Arc::new(crate::config::ReliabilityConfig::default()),
+        provider_runtime_options: providers::ProviderRuntimeOptions::default(),
+        workspace_dir: Arc::new(std::env::temp_dir()),
+        prompt_config: Arc::new(crate::config::Config::default()),
+        message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+        interrupt_on_new_message: InterruptOnNewMessageConfig {
+            telegram: false,
+            slack: false,
+            discord: false,
+            mattermost: false,
+            matrix: false,
+            wecom_ws: false,
+        },
+        multimodal: crate::config::MultimodalConfig::default(),
+        media_pipeline: crate::config::MediaPipelineConfig::default(),
+        transcription_config: crate::config::TranscriptionConfig::default(),
+        hooks: None,
+        non_cli_excluded_tools: Arc::new(Vec::new()),
+        autonomy_level: AutonomyLevel::default(),
+        tool_call_dedup_exempt: Arc::new(Vec::new()),
+        model_routes: Arc::new(Vec::new()),
+        query_classification: crate::config::QueryClassificationConfig::default(),
+        ack_reactions: true,
+        show_tool_calls: true,
+        session_store: None,
+        approval_manager: Arc::new(ApprovalManager::for_non_interactive(
+            &crate::config::AutonomyConfig::default(),
+        )),
+        activated_tools: None,
+        cost_tracking: None,
+        pacing: crate::config::PacingConfig::default(),
+        max_tool_result_chars: 0,
+        context_token_budget: 0,
+        debouncer: Arc::new(debounce::MessageDebouncer::new(Duration::ZERO)),
+    });
+
+    let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(8);
+    let send_task = tokio::spawn(async move {
+        tx.send(traits::ChannelMessage {
+            id: "msg-1".to_string(),
+            sender: "alice".to_string(),
+            reply_target: "chat-1".to_string(),
+            content: "first question".to_string(),
+            channel: "telegram".to_string(),
+            timestamp: 1,
+            thread_ts: None,
+            interruption_scope_id: None,
+            attachments: vec![],
+        })
+        .await
+        .unwrap();
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        tx.send(traits::ChannelMessage {
+            id: "msg-2".to_string(),
+            sender: "alice".to_string(),
+            reply_target: "chat-1".to_string(),
+            content: "second question".to_string(),
+            channel: "telegram".to_string(),
+            timestamp: 2,
+            thread_ts: None,
+            interruption_scope_id: None,
+            attachments: vec![],
+        })
+        .await
+        .unwrap();
+    });
+
+    let started = Instant::now();
+    run_message_dispatch_loop(rx, runtime_ctx, 4).await;
+    let elapsed = started.elapsed();
+    send_task.await.unwrap();
+
+    // Serial execution should take ~2x the per-turn delay; parallel would be ~1x.
+    assert!(
+        elapsed >= Duration::from_millis(380),
+        "expected serial dispatch (>=380ms for two 200ms turns), got {:?}",
+        elapsed
+    );
+
+    let sent_messages = channel_impl.sent_messages.lock().await;
+    assert_eq!(
+        sent_messages.len(),
+        2,
+        "both turns must run to completion in serial mode, got {sent_messages:?}"
+    );
+    assert!(sent_messages[0].contains("response-1"));
+    assert!(sent_messages[1].contains("response-2"));
+    drop(sent_messages);
+
+    let calls = provider_impl
+        .calls
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    assert_eq!(calls.len(), 2);
+    let second_call = &calls[1];
+    assert!(
+        second_call
+            .iter()
+            .any(|(role, content)| role == "user" && content.contains("first question")),
+        "second turn must see the first user message: {second_call:?}"
+    );
+    assert!(
+        second_call
+            .iter()
+            .any(|(role, content)| role == "assistant" && content.contains("response-1")),
+        "second turn must see the first assistant response (proves history was finalized before turn 2 started): {second_call:?}"
+    );
+    assert!(
+        second_call
+            .iter()
+            .any(|(role, content)| role == "user" && content.contains("second question")),
+        "second turn must include its own user message: {second_call:?}"
+    );
+}
+
+#[tokio::test]
 async fn message_dispatch_interrupts_in_flight_slack_request_and_preserves_context() {
     let channel_impl = Arc::new(SlackRecordingChannel::default());
     let channel: Arc<dyn Channel> = channel_impl.clone();

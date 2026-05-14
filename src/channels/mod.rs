@@ -4204,16 +4204,27 @@ async fn dispatch_worker(
             )
         };
 
-        if interrupt_enabled {
-            if let Some(previous) = previous {
+        // Always wait for the previous turn on the same scope key to finish before
+        // starting this one, so the shared conversation history is mutated by at
+        // most one turn at a time. When `interrupt_enabled` is on, signal the
+        // previous turn to cancel first; otherwise it runs to completion and we
+        // simply queue behind it (serial mode).
+        if let Some(previous) = previous {
+            if interrupt_enabled {
                 tracing::info!(
                     channel = %msg.channel,
                     sender = %msg.sender,
                     "Interrupting previous in-flight request for sender"
                 );
                 previous.cancellation.cancel();
-                previous.completion.wait().await;
+            } else {
+                tracing::info!(
+                    channel = %msg.channel,
+                    sender = %msg.sender,
+                    "Queuing behind previous in-flight request for sender scope"
+                );
             }
+            previous.completion.wait().await;
         }
     }
 
