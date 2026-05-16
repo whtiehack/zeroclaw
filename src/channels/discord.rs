@@ -1005,6 +1005,26 @@ fn encode_emoji_for_discord(emoji: &str) -> String {
     encoded
 }
 
+/// Parse Discord rate-limit headers and return a clamped retry delay in ms.
+///
+/// Prefers `X-RateLimit-Reset-After` (fractional seconds, precise per-bucket),
+/// falls back to standard `Retry-After`. Returns `None` if neither parses;
+/// callers should default to a conservative wait.
+fn parse_discord_retry_after_ms(headers: &reqwest::header::HeaderMap) -> Option<u64> {
+    let parse = |name: &str| -> Option<f64> {
+        headers
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.trim().parse::<f64>().ok())
+            .filter(|v| v.is_finite() && *v >= 0.0)
+    };
+
+    let secs = parse("x-ratelimit-reset-after").or_else(|| parse("retry-after"))?;
+    // Clamp to a sane window: at least 50ms, at most 3s — anything longer
+    // means the reaction is no longer worth posting.
+    Some((secs * 1000.0).clamp(50.0, 3000.0) as u64)
+}
+
 fn discord_reaction_url(channel_id: &str, message_id: &str, emoji: &str) -> String {
     let raw_id = message_id.strip_prefix("discord_").unwrap_or(message_id);
     let encoded_emoji = encode_emoji_for_discord(emoji);
@@ -1828,52 +1848,20 @@ impl Channel for DiscordChannel {
                         .get("attachments")
                         .and_then(|a| a.as_array())
                         .map_or(false, |a| !a.is_empty());
-                    let clean_content = match normalize_incoming_content(
-                        content,
-                        require_mention,
-                        &bot_user_id,
-                    ) {
-                        Some(c) => c,
-                        None if has_attachments && !require_mention => String::new(),
-                        None => continue,
-                    };
 
-                    let message_id = d.get("id").and_then(|i| i.as_str()).unwrap_or("");
-                    let attachment_text = {
-                        let atts = d
-                            .get("attachments")
-                            .and_then(|a| a.as_array())
-                            .cloned()
-                            .unwrap_or_default();
-                        process_attachments(
-                            &atts,
-                            &self.http_client(),
-                            self.transcription.as_ref(),
-                            self.workspace_dir.as_deref(),
-                            message_id,
-                        )
-                        .await
-                    };
-                    let quoted_prefix = d
-                        .get("referenced_message")
-                        .and_then(|r| build_quoted_block(r, &bot_user_id))
-                        .unwrap_or_default();
-                    let body = if attachment_text.is_empty() {
-                        clean_content
-                    } else {
-                        format!("{clean_content}\n\n[Attachments]\n{attachment_text}")
-                    };
-                    let final_content = if quoted_prefix.is_empty() {
-                        body
-                    } else {
-                        format!("{quoted_prefix}{body}")
-                    };
+                    // ACK reaction is posted BEFORE normalize_incoming_content's
+                    // early-exit so sticker / pure-embed / mention-only messages
+                    // still get a reaction.
+                    let message_id = d
+                        .get("id")
+                        .and_then(|i| i.as_str())
+                        .unwrap_or("")
+                        .to_string();
                     let channel_id = d
                         .get("channel_id")
                         .and_then(|c| c.as_str())
                         .unwrap_or("")
                         .to_string();
-
                     if !message_id.is_empty() && !channel_id.is_empty() {
                         let reaction_channel = DiscordChannel::new(
                             self.bot_token.clone(),
@@ -1883,9 +1871,9 @@ impl Channel for DiscordChannel {
                             self.mention_only,
                         );
                         let reaction_channel_id = channel_id.clone();
-                        let reaction_message_id = message_id.to_string();
+                        let reaction_message_id = message_id.clone();
                         let reaction_ctx = AckReactionContext {
-                            text: &final_content,
+                            text: content,
                             sender_id: Some(author_id),
                             chat_id: Some(&channel_id),
                             chat_type: if is_group_message {
@@ -1909,7 +1897,7 @@ impl Channel for DiscordChannel {
                                     )
                                     .await
                                 {
-                                    tracing::debug!(
+                                    tracing::warn!(
                                         "Discord: failed to add ACK reaction for message {reaction_message_id}: {err}"
                                     );
                                 }
@@ -1917,6 +1905,45 @@ impl Channel for DiscordChannel {
                         }
                     }
 
+                    let clean_content = match normalize_incoming_content(
+                        content,
+                        require_mention,
+                        &bot_user_id,
+                    ) {
+                        Some(c) => c,
+                        None if has_attachments && !require_mention => String::new(),
+                        None => continue,
+                    };
+
+                    let attachment_text = {
+                        let atts = d
+                            .get("attachments")
+                            .and_then(|a| a.as_array())
+                            .cloned()
+                            .unwrap_or_default();
+                        process_attachments(
+                            &atts,
+                            &self.http_client(),
+                            self.transcription.as_ref(),
+                            self.workspace_dir.as_deref(),
+                            &message_id,
+                        )
+                        .await
+                    };
+                    let quoted_prefix = d
+                        .get("referenced_message")
+                        .and_then(|r| build_quoted_block(r, &bot_user_id))
+                        .unwrap_or_default();
+                    let body = if attachment_text.is_empty() {
+                        clean_content
+                    } else {
+                        format!("{clean_content}\n\n[Attachments]\n{attachment_text}")
+                    };
+                    let final_content = if quoted_prefix.is_empty() {
+                        body
+                    } else {
+                        format!("{quoted_prefix}{body}")
+                    };
                     let (mention_addressed, mention_others) =
                         classify_user_mentions(content, &bot_user_id);
                     // Discord reply: when the user replies to one of bot's own
@@ -2360,17 +2387,34 @@ impl Channel for DiscordChannel {
         emoji: &str,
     ) -> anyhow::Result<()> {
         let url = discord_reaction_url(channel_id, message_id, emoji);
+        let mut attempt: u8 = 0;
 
-        let resp = self
-            .http_client()
-            .put(&url)
-            .header("Authorization", format!("Bot {}", self.bot_token))
-            .header("Content-Length", "0")
-            .send()
-            .await?;
+        loop {
+            let resp = self
+                .http_client()
+                .put(&url)
+                .header("Authorization", format!("Bot {}", self.bot_token))
+                .header("Content-Length", "0")
+                .send()
+                .await?;
 
-        if !resp.status().is_success() {
             let status = resp.status();
+            if status.is_success() {
+                return Ok(());
+            }
+
+            // Discord rate-limits reactions aggressively (1/250ms per message,
+            // ~50/s globally). Retry once on 429 using server-provided delay.
+            if status.as_u16() == 429 && attempt == 0 {
+                let retry_after_ms = parse_discord_retry_after_ms(resp.headers())
+                    .unwrap_or(500);
+                let _ = resp.text().await;
+                tokio::time::sleep(std::time::Duration::from_millis(retry_after_ms))
+                    .await;
+                attempt += 1;
+                continue;
+            }
+
             let err = resp
                 .text()
                 .await
@@ -2378,8 +2422,6 @@ impl Channel for DiscordChannel {
             let sanitized = crate::providers::sanitize_api_error(&err);
             anyhow::bail!("Discord add reaction failed ({status}): {sanitized}");
         }
-
-        Ok(())
     }
 
     async fn remove_reaction(
