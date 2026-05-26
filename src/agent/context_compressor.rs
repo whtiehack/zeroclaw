@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
 use crate::memory::traits::Memory;
+use crate::multimodal;
 use crate::providers::traits::{ChatMessage, Provider};
 
 // ---------------------------------------------------------------------------
@@ -269,6 +270,11 @@ impl ContextCompressor {
             }
             // Skip base64 images
             if msg.content.contains("data:image/") {
+                continue;
+            }
+            // Skip messages carrying image markers — slicing them mid-marker
+            // would drop the closing ']' and break downstream parsers.
+            if msg.content.contains("[IMAGE:") {
                 continue;
             }
             let original_len = msg.content.len();
@@ -573,13 +579,57 @@ fn build_transcript(messages: &[ChatMessage], max_chars: usize) -> String {
     let mut transcript = String::new();
     for msg in messages {
         let role = msg.role.to_uppercase();
-        let _ = writeln!(transcript, "{role}: {}", msg.content.trim());
+        let body = redact_image_markers(msg.content.trim());
+        let _ = writeln!(transcript, "{role}: {body}");
     }
 
     if transcript.len() > max_chars {
         truncate_chars(&transcript, max_chars)
     } else {
         transcript
+    }
+}
+
+/// Replace `[IMAGE:...]` markers with short text placeholders so the
+/// summarizer LLM receives only textual context. Images themselves are never
+/// forwarded into the compaction prompt — neither as URLs nor as base64
+/// payloads. The placeholder preserves enough hint (last path segment, or a
+/// fixed "inline-base64-omitted" tag) for the summary to mention that an
+/// image was produced at this step.
+fn redact_image_markers(content: &str) -> String {
+    let (cleaned, refs) = multimodal::parse_image_markers(content);
+    if refs.is_empty() {
+        return content.to_string();
+    }
+    let mut out = cleaned;
+    for image_ref in &refs {
+        if !out.is_empty() {
+            out.push(' ');
+        }
+        out.push_str(&image_placeholder(image_ref));
+    }
+    out
+}
+
+fn image_placeholder(image_ref: &str) -> String {
+    let trimmed = image_ref.trim();
+    if trimmed.starts_with("data:") {
+        return "<image:inline-base64-omitted>".to_string();
+    }
+    let path = std::path::Path::new(trimmed);
+    let file = path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(trimmed);
+    let parent = path
+        .parent()
+        .and_then(|p| p.file_name())
+        .and_then(|s| s.to_str())
+        .unwrap_or("");
+    if parent.is_empty() {
+        format!("<image:{file}>")
+    } else {
+        format!("<image:{parent}/{file}>")
     }
 }
 

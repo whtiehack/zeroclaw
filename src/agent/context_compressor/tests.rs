@@ -127,6 +127,82 @@ fn test_build_transcript_truncates() {
 }
 
 #[test]
+fn test_build_transcript_redacts_local_image_path() {
+    let messages = vec![msg(
+        "tool",
+        "Generated chart [IMAGE:/zeroclaw-data/workspace/skills/kline-chart/output/000001.SS_1h.png]",
+    )];
+    let t = build_transcript(&messages, 10_000);
+    assert!(
+        !t.contains("/zeroclaw-data/"),
+        "transcript leaked absolute path: {t}"
+    );
+    assert!(
+        t.contains("<image:output/000001.SS_1h.png>"),
+        "missing placeholder: {t}"
+    );
+    assert!(t.contains("Generated chart"), "text dropped: {t}");
+}
+
+#[test]
+fn test_build_transcript_redacts_data_uri() {
+    let messages = vec![msg(
+        "user",
+        "see [IMAGE:data:image/png;base64,iVBORw0KGgoAAAA=]",
+    )];
+    let t = build_transcript(&messages, 10_000);
+    assert!(
+        t.contains("<image:inline-base64-omitted>"),
+        "missing data-uri placeholder: {t}"
+    );
+    assert!(
+        !t.contains("base64,iVBOR"),
+        "transcript leaked base64 payload: {t}"
+    );
+}
+
+#[test]
+fn test_build_transcript_preserves_text_when_no_markers() {
+    let messages = vec![
+        msg("user", "hello world"),
+        msg("assistant", "hi there"),
+    ];
+    let t = build_transcript(&messages, 10_000);
+    assert!(t.contains("USER: hello world"));
+    assert!(t.contains("ASSISTANT: hi there"));
+    assert!(!t.contains("<image:"));
+}
+
+#[test]
+fn test_build_transcript_handles_multiple_images_in_one_message() {
+    let messages = vec![msg(
+        "tool",
+        "two charts [IMAGE:/data/output/a.png] [IMAGE:/data/output/b.png]",
+    )];
+    let t = build_transcript(&messages, 10_000);
+    assert!(
+        t.contains("<image:output/a.png>"),
+        "first placeholder missing: {t}"
+    );
+    assert!(
+        t.contains("<image:output/b.png>"),
+        "second placeholder missing: {t}"
+    );
+    assert!(
+        !t.contains("/data/output"),
+        "transcript leaked path: {t}"
+    );
+}
+
+#[test]
+fn test_build_transcript_image_only_message_keeps_placeholder() {
+    let messages = vec![msg("tool", "[IMAGE:/tmp/only.png]")];
+    let t = build_transcript(&messages, 10_000);
+    assert!(t.contains("<image:tmp/only.png>"), "placeholder missing: {t}");
+    assert!(!t.contains("/tmp/only.png"));
+}
+
+#[test]
 fn test_truncate_chars() {
     assert_eq!(truncate_chars("hello world", 5), "hello...");
     assert_eq!(truncate_chars("hi", 10), "hi");
@@ -208,6 +284,24 @@ fn test_fast_trim_skips_images() {
     let saved = compressor.fast_trim_tool_results(&mut history);
     assert_eq!(saved, 0);
     assert!(history[0].content.len() > 5_000);
+}
+
+#[test]
+fn test_fast_trim_skips_image_markers() {
+    let config = ContextCompressionConfig {
+        protect_first_n: 0,
+        protect_last_n: 0,
+        tool_result_retrim_chars: 100,
+        ..Default::default()
+    };
+    let compressor = ContextCompressor::new(config, 128_000);
+    // Marker placed late so a trim that ignored it would slice through ']'
+    // and corrupt the marker before downstream redaction can run.
+    let content = format!("{}[IMAGE:/abs/output/chart.png]", "x".repeat(5_000));
+    let mut history = vec![msg("tool", &content)];
+    let saved = compressor.fast_trim_tool_results(&mut history);
+    assert_eq!(saved, 0, "message with [IMAGE: marker must not be trimmed");
+    assert!(history[0].content.ends_with("chart.png]"));
 }
 
 #[test]
