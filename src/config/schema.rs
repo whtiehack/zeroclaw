@@ -7715,6 +7715,10 @@ pub struct WeComWsConfig {
     /// Only effective when `stream_mode` is not `off`.
     #[serde(default = "default_wecom_ws_draft_update_interval_ms")]
     pub draft_update_interval_ms: u64,
+    /// Optional bridge that runs a configured command when a template-card button is clicked.
+    /// When absent the feature is disabled and template-card events are only logged.
+    #[serde(default)]
+    pub card_button_exec: Option<CardButtonExecConfig>,
 }
 
 impl ChannelConfig for WeComWsConfig {
@@ -7724,6 +7728,25 @@ impl ChannelConfig for WeComWsConfig {
     fn desc() -> &'static str {
         "WeCom AI Bot (WebSocket)"
     }
+}
+
+/// Generic bridge: maps a template-card button click (`template_card_event`) to an external
+/// command. The channel stays business-agnostic — all routing/authorization lives in the command.
+///
+/// On an allowed click the channel spawns `command` with `args` followed by four positional
+/// arguments: `<event_key> <scope> <userid> <task_id>`. Arguments are passed as argv (never via a
+/// shell), so button keys / user ids cannot inject shell syntax.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct CardButtonExecConfig {
+    /// Program to execute (e.g. `bash`).
+    pub command: String,
+    /// Fixed leading arguments prepended before the click context (e.g. the dispatch script path).
+    #[serde(default)]
+    pub args: Vec<String>,
+    /// Exact-match allowlist of button `event_key`s permitted to trigger execution.
+    /// Empty denies all; a single `"*"` allows any key.
+    #[serde(default)]
+    pub allowed_keys: Vec<String>,
 }
 
 /// QQ Official Bot configuration (Tencent QQ Bot SDK)
