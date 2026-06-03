@@ -14,10 +14,12 @@ use crate::cron::{
     JobType, Schedule, SessionTarget,
 };
 use crate::security::SecurityPolicy;
+use crate::tools::notify_user::{NotifyContext, NOTIFY_TARGET};
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use futures_util::{stream, StreamExt};
 use std::process::Stdio;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use tokio::process::Command;
 use tokio::time::{self, Duration};
@@ -297,7 +299,27 @@ async fn run_agent_job(
         String::new()
     };
 
-    let prefixed_prompt = format!("{memory_context}[cron:{} {name}] {prompt}", job.id);
+    let mut prefixed_prompt = format!("{memory_context}[cron:{} {name}] {prompt}", job.id);
+
+    // Notify-mode jobs: the agent's final reply is NOT auto-delivered (deliver_if_configured
+    // only acts on "announce"). The sole delivery path is the notify_user tool, whose target
+    // we publish via the NOTIFY_TARGET task-local for the duration of the run. No tool call
+    // ⇒ the job stays completely silent.
+    let notify_ctx = if job.delivery.mode.eq_ignore_ascii_case("notify") {
+        prefixed_prompt.push_str(
+            "\n\n[delivery: notify mode] Your normal reply text will NOT be sent to anyone. \
+             The ONLY way to deliver a message to the user is to call the `notify_user` tool \
+             with a `message`. If there is something worth reporting, call it; if there is \
+             nothing to report, do not call it — just end your turn and the job stays silent.",
+        );
+        Some(Arc::new(NotifyContext {
+            channel: job.delivery.channel.clone().unwrap_or_default(),
+            to: job.delivery.to.clone().unwrap_or_default(),
+            delivered: AtomicUsize::new(0),
+        }))
+    } else {
+        None
+    };
     let model_override = job.model.clone();
 
     // Cron prompts are templated task instructions, not user intent — disable
@@ -306,33 +328,45 @@ async fn run_agent_job(
     let mut cron_config = config.clone();
     cron_config.memory.auto_save = false;
 
-    let run_result = match job.session_target {
-        SessionTarget::Main | SessionTarget::Isolated => {
-            Box::pin(crate::agent::run(
-                cron_config,
-                Some(prefixed_prompt),
-                None,
-                model_override,
-                config.default_temperature,
-                vec![],
-                false,
-                None,
-                job.allowed_tools.clone(),
-                true,
-            ))
-            .await
-        }
+    let agent_fut = match job.session_target {
+        SessionTarget::Main | SessionTarget::Isolated => Box::pin(crate::agent::run(
+            cron_config,
+            Some(prefixed_prompt),
+            None,
+            model_override,
+            config.default_temperature,
+            vec![],
+            false,
+            None,
+            job.allowed_tools.clone(),
+            true,
+        )),
+    };
+    // Notify mode publishes the delivery target to tools via the NOTIFY_TARGET task-local
+    // for the duration of the run; other modes run unchanged.
+    let run_result = match notify_ctx {
+        Some(ref ctx) => NOTIFY_TARGET.scope(Arc::clone(ctx), agent_fut).await,
+        None => agent_fut.await,
     };
 
     match run_result {
-        Ok(response) => (
-            true,
-            if response.trim().is_empty() {
-                "agent job executed".to_string()
+        Ok(response) => {
+            if let Some(ctx) = notify_ctx {
+                // Notify mode: the final reply was never delivered; record what the
+                // notify_user tool actually pushed (or that the job stayed silent).
+                let delivered = ctx.delivered.load(Ordering::SeqCst);
+                let summary = if delivered == 0 {
+                    format!("[notify: silent — nothing reported]\n{}", response.trim())
+                } else {
+                    format!("[notify: delivered {delivered} message(s)]")
+                };
+                (true, summary)
+            } else if response.trim().is_empty() {
+                (true, "agent job executed".to_string())
             } else {
-                response
-            },
-        ),
+                (true, response)
+            }
+        }
         Err(e) => (false, format!("agent job failed: {e}")),
     }
 }

@@ -76,6 +76,7 @@ pub mod model_routing_config;
 pub mod model_switch;
 pub mod node_capabilities;
 pub mod node_tool;
+pub mod notify_user;
 pub mod notion_tool;
 pub mod opencode_cli;
 pub mod pdf_read;
@@ -173,6 +174,7 @@ pub use model_routing_config::ModelRoutingConfigTool;
 pub use model_switch::ModelSwitchTool;
 #[allow(unused_imports)]
 pub use node_tool::NodeTool;
+pub use notify_user::NotifyUserTool;
 pub use notion_tool::NotionTool;
 pub use opencode_cli::OpenCodeCliTool;
 pub use pdf_read::PdfReadTool;
@@ -818,6 +820,10 @@ pub fn all_tools_with_runtime(
     let escalate_tool = EscalateToHumanTool::new(security.clone(), workspace_dir.to_path_buf());
     let escalate_handle = escalate_tool.channel_map_handle();
     tool_arcs.push(Arc::new(escalate_tool));
+
+    // Proactive notification tool for notify-mode cron jobs — always registered.
+    // Resolves its delivery target from the NOTIFY_TARGET task-local set by the scheduler.
+    tool_arcs.push(Arc::new(NotifyUserTool::new(security.clone())));
 
     // Microsoft 365 Graph API integration
     if root_config.microsoft365.enabled {

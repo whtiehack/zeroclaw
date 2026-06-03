@@ -53,13 +53,15 @@ pub(crate) fn validate_delivery_config(delivery: Option<&DeliveryConfig>) -> Res
     if delivery.mode.eq_ignore_ascii_case("none") {
         return Ok(());
     }
-    if !delivery.mode.eq_ignore_ascii_case("announce") {
+    if !delivery.mode.eq_ignore_ascii_case("announce")
+        && !delivery.mode.eq_ignore_ascii_case("notify")
+    {
         bail!("unsupported delivery mode: {}", delivery.mode);
     }
 
     let channel = delivery.channel.as_deref().map(str::trim);
     let Some(channel) = channel.filter(|value| !value.is_empty()) else {
-        bail!("delivery.channel is required for announce mode");
+        bail!("delivery.channel is required for {} mode", delivery.mode);
     };
     match channel.to_ascii_lowercase().as_str() {
         "telegram" | "discord" | "slack" | "mattermost" | "signal" | "matrix" | "qq"
@@ -73,7 +75,7 @@ pub(crate) fn validate_delivery_config(delivery: Option<&DeliveryConfig>) -> Res
         .map(str::trim)
         .is_some_and(|value| !value.is_empty());
     if !has_target {
-        bail!("delivery.to is required for announce mode");
+        bail!("delivery.to is required for {} mode", delivery.mode);
     }
 
     Ok(())
