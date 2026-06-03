@@ -7715,10 +7715,12 @@ pub struct WeComWsConfig {
     /// Only effective when `stream_mode` is not `off`.
     #[serde(default = "default_wecom_ws_draft_update_interval_ms")]
     pub draft_update_interval_ms: u64,
-    /// Optional bridge that runs a configured command when a template-card button is clicked.
-    /// When absent the feature is disabled and template-card events are only logged.
+    /// Optional card-click route table. Maps a route name to a sink; a clicked button whose
+    /// `event_key` is `route:<name>:<payload>` is dispatched to `card_routes[<name>]`. Buttons
+    /// without a `route:` prefix fall back to the model. Absent/empty = no routes (all clicks
+    /// go to the model).
     #[serde(default)]
-    pub card_button_exec: Option<CardButtonExecConfig>,
+    pub card_routes: Option<std::collections::HashMap<String, CardRouteSink>>,
 }
 
 impl ChannelConfig for WeComWsConfig {
@@ -7730,23 +7732,26 @@ impl ChannelConfig for WeComWsConfig {
     }
 }
 
-/// Generic bridge: maps a template-card button click (`template_card_event`) to an external
-/// command. The channel stays business-agnostic — all routing/authorization lives in the command.
-///
-/// On an allowed click the channel spawns `command` with `args` followed by four positional
-/// arguments: `<event_key> <scope> <userid> <task_id>`. Arguments are passed as argv (never via a
-/// shell), so button keys / user ids cannot inject shell syntax.
+/// A card-click route sink. The channel resolves a clicked button whose `event_key` is
+/// `route:<name>:<payload>` against the `card_routes` map (keyed by `<name>`) and dispatches the
+/// click to the matching sink. The channel stays business-agnostic — all authorization lives in
+/// the sink (e.g. the dispatched command validates permission itself).
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-pub struct CardButtonExecConfig {
-    /// Program to execute (e.g. `bash`).
-    pub command: String,
-    /// Fixed leading arguments prepended before the click context (e.g. the dispatch script path).
-    #[serde(default)]
-    pub args: Vec<String>,
-    /// Exact-match allowlist of button `event_key`s permitted to trigger execution.
-    /// Empty denies all; a single `"*"` allows any key.
-    #[serde(default)]
-    pub allowed_keys: Vec<String>,
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum CardRouteSink {
+    /// Spawn a program when a button on this route is clicked. The channel runs `command` with
+    /// `args` followed by four positional arguments: `<payload> <scope> <userid> <task_id>` (the
+    /// `route:<name>:` prefix is stripped from `payload`). The full callback body is also exposed
+    /// via the `WECOM_EVENT_JSON` env var, and the 5s-bounded response id via `WECOM_RESP_REQ_ID`
+    /// (POST `{req_id, card}` to the local `/respond` socket to update the clicked card).
+    /// Arguments are passed as argv (never via a shell), so ids cannot inject shell syntax.
+    Command {
+        /// Program to execute (e.g. `bash`).
+        command: String,
+        /// Fixed leading arguments prepended before the click context (e.g. the dispatch script path).
+        #[serde(default)]
+        args: Vec<String>,
+    },
 }
 
 /// QQ Official Bot configuration (Tencent QQ Bot SDK)

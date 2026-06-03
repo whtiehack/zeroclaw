@@ -616,7 +616,7 @@ fn test_wecom_ws_config() -> crate::config::schema::WeComWsConfig {
         interrupt_on_new_message: false,
         stream_mode: StreamMode::Partial,
         draft_update_interval_ms: 300,
-        card_button_exec: None,
+        card_routes: None,
     }
 }
 
@@ -2277,15 +2277,16 @@ async fn send_with_thread_req_id_falls_back_and_remembers_expiration() {
 // ── Template-card button bridge ──────────────────────────────────────
 
 #[test]
-fn card_event_key_allowed_matches_exact_and_wildcard() {
-    let exact = vec!["town:static".to_string(), "g4:static".to_string()];
-    assert!(card_event_key_allowed(&exact, "town:static"));
-    assert!(card_event_key_allowed(&exact, "g4:static"));
-    assert!(!card_event_key_allowed(&exact, "town:restart"));
-    // empty allowlist denies everything
-    assert!(!card_event_key_allowed(&[], "town:static"));
-    // wildcard allows any key
-    assert!(card_event_key_allowed(&["*".to_string()], "anything:goes"));
+fn parse_route_event_key_splits_route_and_payload() {
+    // route:<name>:<payload> → (name, payload); payload keeps its own colons
+    assert_eq!(
+        parse_route_event_key("route:exec:town:static"),
+        Some(("exec", "town:static"))
+    );
+    assert_eq!(parse_route_event_key("route:exec"), Some(("exec", "")));
+    // plain keys (no reserved prefix) route to the model
+    assert_eq!(parse_route_event_key("approve:order-123"), None);
+    assert_eq!(parse_route_event_key("town:static"), None);
 }
 
 #[test]
@@ -2311,6 +2312,32 @@ fn extract_template_card_event_fields_from_body() {
         extract_template_card_event_task_id(&body).as_deref(),
         Some("hotupdate-town-static")
     );
+    assert_eq!(
+        extract_template_card_event_card_type(&body).as_deref(),
+        Some("button_interaction")
+    );
+    assert!(extract_template_card_event_selected_items(&body).is_none());
+}
+
+#[test]
+fn extract_template_card_event_selected_items_for_vote() {
+    let body = serde_json::json!({
+        "event": {
+            "eventtype": "template_card_event",
+            "template_card_event": {
+                "card_type": "vote_interaction",
+                "event_key": "vote",
+                "task_id": "poll-1",
+                "selected_items": {
+                    "selected_item": [
+                        { "question_key": "q1", "option_ids": { "option_id": ["a"] } }
+                    ]
+                }
+            }
+        }
+    });
+    let sel = extract_template_card_event_selected_items(&body).expect("selected_items present");
+    assert_eq!(sel["selected_item"][0]["question_key"], "q1");
 }
 
 #[cfg(unix)]
@@ -2326,37 +2353,52 @@ fn local_send_request_accepts_card_without_message() {
     assert!(req.card.is_some());
 }
 
+#[cfg(unix)]
 #[test]
-fn card_button_exec_config_parses_from_toml() {
+fn local_respond_request_parses_req_id_and_card() {
+    let req: WeComLocalRespondRequest = serde_json::from_value(serde_json::json!({
+        "req_id": "REQ-1",
+        "card": { "card_type": "button_interaction", "task_id": "t1" }
+    }))
+    .unwrap();
+    assert_eq!(req.req_id, "REQ-1");
+    assert_eq!(req.card["card_type"], "button_interaction");
+}
+
+#[test]
+fn card_routes_config_parses_from_toml() {
     let toml_str = r#"
 bot_id = "b"
 secret = "s"
 
-[card_button_exec]
+[card_routes.exec]
+type = "command"
 command = "bash"
 args = ["/zeroclaw-data/workspace/skills/town-hotupdate/card-dispatch.sh"]
-allowed_keys = ["town:static", "g4:static"]
 "#;
     let cfg: crate::config::schema::WeComWsConfig = toml::from_str(toml_str).unwrap();
-    let exec = cfg.card_button_exec.expect("card_button_exec present");
-    assert_eq!(exec.command, "bash");
-    assert_eq!(exec.allowed_keys, vec!["town:static", "g4:static"]);
-    assert_eq!(exec.args.len(), 1);
+    let routes = cfg.card_routes.expect("card_routes present");
+    match routes.get("exec").expect("exec route present") {
+        crate::config::schema::CardRouteSink::Command { command, args } => {
+            assert_eq!(command, "bash");
+            assert_eq!(args.len(), 1);
+        }
+    }
 }
 
 #[test]
-fn wecom_ws_config_card_button_exec_defaults_none() {
+fn wecom_ws_config_card_routes_defaults_none() {
     let toml_str = r#"
 bot_id = "b"
 secret = "s"
 "#;
     let cfg: crate::config::schema::WeComWsConfig = toml::from_str(toml_str).unwrap();
-    assert!(cfg.card_button_exec.is_none());
+    assert!(cfg.card_routes.is_none());
 }
 
 #[test]
-fn parse_card_markers_builds_button_card_and_strips_marker() {
-    let msg = "构建完成 ✅\n[CARD title=构建完成 | desc=耗时2m | btn=重新构建:build:retry | btn=查看日志:build:log]";
+fn parse_card_markers_builds_button_card_and_strips_block() {
+    let msg = "构建完成 ✅\n[[ZC_CARD]]\n{\"title\":\"构建完成\",\"desc\":\"耗时2m\",\"buttons\":[{\"text\":\"重新构建\",\"key\":\"build:retry\",\"style\":2},{\"text\":\"查看日志\",\"key\":\"build:log\"}]}\n[[/ZC_CARD]]";
     let (text, cards) = parse_card_markers(msg);
     assert_eq!(text, "构建完成 ✅");
     assert_eq!(cards.len(), 1);
@@ -2367,18 +2409,39 @@ fn parse_card_markers_builds_button_card_and_strips_marker() {
     let btns = card["button_list"].as_array().unwrap();
     assert_eq!(btns.len(), 2);
     assert_eq!(btns[0]["text"], "重新构建");
-    // event key may itself contain ':' — split on the FIRST colon only
+    assert_eq!(btns[0]["style"], 2);
+    // event key may itself contain ':' — JSON strings carry it verbatim
     assert_eq!(btns[0]["key"], "build:retry");
+    assert_eq!(btns[1]["style"], 1); // default when omitted
     assert_eq!(btns[1]["key"], "build:log");
-    assert!(card["task_id"].as_str().unwrap().starts_with("llmcard-"));
+    // no task_id label given → left absent (auto-filled at send time)
+    assert!(card.get("task_id").is_none());
 }
 
 #[test]
-fn parse_card_markers_rejects_marker_without_buttons() {
-    let msg = "hi [CARD title=no buttons here]";
+fn parse_card_markers_label_task_id_gets_unique_suffix() {
+    let msg = "[[ZC_CARD]]{\"title\":\"t\",\"task_id\":\"order-123\",\"buttons\":[{\"text\":\"ok\",\"key\":\"approve:order-123\"}]}[[/ZC_CARD]]";
+    let (_text, cards) = parse_card_markers(msg);
+    let tid = cards[0]["task_id"].as_str().unwrap();
+    assert!(tid.starts_with("order-123-"));
+    assert!(tid.len() > "order-123-".len());
+}
+
+#[test]
+fn parse_card_markers_raw_passthrough_with_card_type() {
+    let msg = "[[ZC_CARD]]{\"card_type\":\"text_notice\",\"main_title\":{\"title\":\"hi\"},\"card_action\":{\"type\":1,\"url\":\"https://x\"}}[[/ZC_CARD]]";
+    let (_text, cards) = parse_card_markers(msg);
+    assert_eq!(cards.len(), 1);
+    assert_eq!(cards[0]["card_type"], "text_notice");
+}
+
+#[test]
+fn parse_card_markers_drops_card_without_buttons() {
+    let msg = "hi [[ZC_CARD]]{\"title\":\"no buttons\"}[[/ZC_CARD]] bye";
     let (text, cards) = parse_card_markers(msg);
     assert!(cards.is_empty());
-    assert_eq!(text, "hi [CARD title=no buttons here]");
+    // invalid block dropped (not leaked as raw JSON), surrounding text kept
+    assert_eq!(text, "hi  bye");
 }
 
 #[test]
@@ -2390,25 +2453,21 @@ fn parse_card_markers_leaves_non_card_brackets_untouched() {
 }
 
 #[test]
-fn sanitize_card_task_id_keeps_only_legal_chars() {
-    assert_eq!(sanitize_card_task_id("hot_update-1@x"), "hot_update-1@x");
-    assert_eq!(sanitize_card_task_id("a b/c:d"), "abcd");
-    assert!(sanitize_card_task_id("中文!!!").starts_with("llmcard-"));
+fn strip_card_markers_for_draft_hides_unclosed_block() {
+    // a partially-streamed card must not surface raw JSON in the draft
+    let partial = "进度 50%\n[[ZC_CARD]]{\"title\":\"做完了\",\"buttons\":[{\"text";
+    assert_eq!(strip_card_markers_for_draft(partial), "进度 50%");
+    // a complete block is stripped too
+    let complete =
+        "done [[ZC_CARD]]{\"title\":\"t\",\"buttons\":[{\"text\":\"x\",\"key\":\"k\"}]}[[/ZC_CARD]]";
+    assert_eq!(strip_card_markers_for_draft(complete), "done");
 }
 
 #[test]
-fn card_button_is_exec_splits_exec_vs_llm() {
-    let mut cfg = test_wecom_ws_config();
-    cfg.card_button_exec = Some(crate::config::schema::CardButtonExecConfig {
-        command: "bash".into(),
-        args: vec![],
-        allowed_keys: vec!["town:static".into()],
-    });
-    let ch = WeComWsChannel::new(&cfg, Path::new("/tmp")).unwrap();
-    assert!(ch.card_button_is_exec("town:static")); // exec ("单独的那种")
-    assert!(!ch.card_button_is_exec("build:retry")); // LLM ("LLM 的")
-
-    // unconfigured → every click routes to the model
-    let ch2 = WeComWsChannel::new(&test_wecom_ws_config(), Path::new("/tmp")).unwrap();
-    assert!(!ch2.card_button_is_exec("town:static"));
+fn card_task_id_from_label_sanitizes_and_suffixes() {
+    assert!(card_task_id_from_label("order-123").starts_with("order-123-"));
+    // illegal chars stripped, suffix still appended
+    assert!(card_task_id_from_label("a b/c:d").starts_with("abcd-"));
+    // all-illegal label → llmcard fallback
+    assert!(card_task_id_from_label("中文!!!").starts_with("llmcard-"));
 }

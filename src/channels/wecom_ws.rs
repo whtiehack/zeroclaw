@@ -1,5 +1,5 @@
 use super::traits::{Channel, ChannelMessage, SendMessage};
-use crate::config::schema::CardButtonExecConfig;
+use crate::config::schema::CardRouteSink;
 use crate::config::StreamMode;
 use aes::Aes256;
 use anyhow::{Context, Result};
@@ -132,6 +132,41 @@ async fn handle_wecom_local_send(
                 "ok": false,
                 "error": err.to_string()
             })),
+        ),
+    }
+}
+
+#[cfg(unix)]
+#[derive(Debug, Deserialize)]
+struct WeComLocalRespondRequest {
+    /// The `req_id` from the `template_card_event` callback (valid ~5s).
+    req_id: String,
+    /// WeCom `template_card` object to replace the clicked card with.
+    card: Value,
+}
+
+/// Update the card a user just clicked, in response to a `template_card_event`. Route command
+/// handlers receive the event `req_id` via `WECOM_RESP_REQ_ID` and POST `{req_id, card}` here to
+/// flip the clicked card to a "processing"/error state within the 5s window. Only
+/// `aibot_respond_update_msg` is available — WeCom has no developer→server error-code channel for
+/// events, so an "error" is just an error-styled card.
+#[cfg(unix)]
+async fn handle_wecom_local_respond(
+    State(channel): State<WeComWsChannel>,
+    Json(payload): Json<WeComLocalRespondRequest>,
+) -> (StatusCode, Json<Value>) {
+    let req_id = payload.req_id.trim().to_string();
+    if req_id.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "ok": false, "error": "req_id is required" })),
+        );
+    }
+    match channel.respond_update_card(&req_id, payload.card).await {
+        Ok(()) => (StatusCode::OK, Json(serde_json::json!({ "ok": true }))),
+        Err(err) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "ok": false, "error": err.to_string() })),
         ),
     }
 }
@@ -284,7 +319,7 @@ struct WeComRuntimeConfig {
     max_file_size_bytes: u64,
     stream_mode: StreamMode,
     draft_update_interval_ms: u64,
-    card_button_exec: Option<CardButtonExecConfig>,
+    card_routes: Option<HashMap<String, CardRouteSink>>,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -388,7 +423,7 @@ impl WeComWsChannel {
                 max_file_size_bytes: config.max_file_size_mb.saturating_mul(1024 * 1024),
                 stream_mode: config.stream_mode,
                 draft_update_interval_ms: config.draft_update_interval_ms,
-                card_button_exec: config.card_button_exec.clone(),
+                card_routes: config.card_routes.clone(),
             },
             client,
             ws_tx: Arc::new(tokio::sync::Mutex::new(None)),
@@ -477,6 +512,7 @@ impl WeComWsChannel {
 
         let app = Router::new()
             .route("/send", post(handle_wecom_local_send))
+            .route("/respond", post(handle_wecom_local_respond))
             .with_state(self.clone());
 
         tokio::spawn(async move {
@@ -1252,6 +1288,8 @@ impl WeComWsChannel {
             "template_card_event" => {
                 let event_key = extract_template_card_event_key(&body).unwrap_or_default();
                 let task_id = extract_template_card_event_task_id(&body).unwrap_or_default();
+                let card_type = extract_template_card_event_card_type(&body).unwrap_or_default();
+                let selected_items = extract_template_card_event_selected_items(&body);
                 let userid = body
                     .get("from")
                     .and_then(|f| f.get("userid"))
@@ -1275,19 +1313,33 @@ impl WeComWsChannel {
                     format!("user--{userid}")
                 };
                 tracing::info!(
-                    "WeCom template_card_event received: event_key={event_key} scope={scope} userid={userid} task_id={task_id}"
+                    "WeCom template_card_event received: event_key={event_key} card_type={card_type} scope={scope} userid={userid} task_id={task_id}"
                 );
                 if event_key.is_empty() {
                     tracing::warn!(
                         "WeCom template_card_event missing event_key; nothing to dispatch"
                     );
-                } else if self.card_button_is_exec(&event_key) {
-                    // “单独的那种”：key 在 exec 白名单内，直接触发命令，绕过 LLM。
-                    self.maybe_dispatch_card_button(&event_key, &scope, &userid, &task_id);
+                } else if let Some((route_name, payload)) = parse_route_event_key(&event_key) {
+                    // 路由键 `route:<名>:<payload>`：命中配置 → 派发到 sink（绕过 LLM）；未配置名 → drop+log。
+                    match self.cfg.card_routes.as_ref().and_then(|m| m.get(route_name)) {
+                        Some(sink) => self.dispatch_card_route(
+                            sink, payload, &scope, &userid, &task_id, &req_id, &body,
+                        ),
+                        None => tracing::warn!(
+                            "WeCom template_card_event: unknown route '{route_name}' (event_key={event_key}), dropped"
+                        ),
+                    }
                 } else {
-                    // “LLM 的”：注入一条消息回框架，由 LLM 处理（它发的卡片它接）。
+                    // 普通 key：注入消息回框架，由 LLM 处理（它发的卡它接）。
                     self.route_card_click_to_framework(
-                        tx, &event_key, &task_id, &scope, &userid, &body,
+                        tx,
+                        &event_key,
+                        &task_id,
+                        &card_type,
+                        selected_items.as_ref(),
+                        &scope,
+                        &userid,
+                        &body,
                     )
                     .await;
                 }
@@ -1310,72 +1362,68 @@ impl WeComWsChannel {
         }
     }
 
-    /// Bridge a template-card button click to the configured external command.
-    ///
-    /// No-op unless `card_button_exec` is configured and `event_key` is allowlisted. The command
-    /// receives `<event_key> <scope> <userid> <task_id>` as trailing argv (never via a shell), so
-    /// the (semi-trusted) ids cannot inject shell syntax. The child is spawned detached and reaped
-    /// in the background; all business logic / authorization lives inside the command itself.
-    fn maybe_dispatch_card_button(&self, event_key: &str, scope: &str, userid: &str, task_id: &str) {
-        let Some(exec) = self.cfg.card_button_exec.as_ref() else {
-            tracing::info!(
-                "WeCom template_card_event: card_button_exec not configured, event_key={event_key} ignored"
-            );
-            return;
-        };
-        if !card_event_key_allowed(&exec.allowed_keys, event_key) {
-            tracing::warn!(
-                "WeCom template_card_event: event_key={event_key} not in allowed_keys, ignored"
-            );
-            return;
-        }
+    /// Dispatch a routed card-button click (`route:<name>:<payload>`) to its configured sink,
+    /// bypassing the model. Business-agnostic: the sink performs its own authorization. The 5s-
+    /// bounded response id (`resp_req_id`) and the full callback `body` are forwarded so the sink
+    /// can update the clicked card via the local `/respond` socket. Spawned detached + reaped.
+    fn dispatch_card_route(
+        &self,
+        sink: &CardRouteSink,
+        payload: &str,
+        scope: &str,
+        userid: &str,
+        task_id: &str,
+        resp_req_id: &str,
+        body: &Value,
+    ) {
+        match sink {
+            CardRouteSink::Command { command, args } => {
+                let event_json = serde_json::to_string(body).unwrap_or_default();
+                let mut cmd = tokio::process::Command::new(command);
+                cmd.args(args)
+                    .arg(payload)
+                    .arg(scope)
+                    .arg(userid)
+                    .arg(task_id)
+                    .env("WECOM_RESP_REQ_ID", resp_req_id)
+                    .env("WECOM_EVENT_JSON", event_json)
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null());
 
-        let mut cmd = tokio::process::Command::new(&exec.command);
-        cmd.args(&exec.args)
-            .arg(event_key)
-            .arg(scope)
-            .arg(userid)
-            .arg(task_id)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null());
-
-        match cmd.spawn() {
-            Ok(mut child) => {
-                tracing::info!(
-                    "WeCom card button dispatched: event_key={event_key} scope={scope} userid={userid} pid={:?}",
-                    child.id()
-                );
-                // Reap the short-lived dispatcher so it doesn't linger as a zombie.
-                tokio::spawn(async move {
-                    let _ = child.wait().await;
-                });
-            }
-            Err(err) => {
-                tracing::error!(
-                    "WeCom card button dispatch failed to spawn ({}): {err}",
-                    exec.command
-                );
+                match cmd.spawn() {
+                    Ok(mut child) => {
+                        tracing::info!(
+                            "WeCom card route dispatched: payload={payload} scope={scope} userid={userid} pid={:?}",
+                            child.id()
+                        );
+                        // Reap the short-lived dispatcher so it doesn't linger as a zombie.
+                        tokio::spawn(async move {
+                            let _ = child.wait().await;
+                        });
+                    }
+                    Err(err) => {
+                        tracing::error!(
+                            "WeCom card route command spawn failed ({command}): {err}"
+                        );
+                    }
+                }
             }
         }
     }
 
-    /// Whether a clicked button routes to the direct-exec bridge (vs. back to the model).
-    fn card_button_is_exec(&self, event_key: &str) -> bool {
-        self.cfg
-            .card_button_exec
-            .as_ref()
-            .is_some_and(|e| card_event_key_allowed(&e.allowed_keys, event_key))
-    }
-
-    /// Route a (non-exec) card button click back to the framework as a synthetic message so the
-    /// model that sent the card can handle the interaction. Replies go out as an active push
-    /// (`thread_ts: None`) since event callbacks carry no stream `req_id`.
+    /// Route a (non-routed, model-bound) card button click back to the framework as a synthetic
+    /// message so the model that sent the card can handle the interaction. Carries the curated
+    /// interaction fields (event_key/task_id/card_type/selected_items) — not transport metadata.
+    /// Replies go out as an active push (`thread_ts: None`) since event callbacks carry no stream
+    /// `req_id`.
     async fn route_card_click_to_framework(
         &self,
         tx: &mpsc::Sender<ChannelMessage>,
         event_key: &str,
         task_id: &str,
+        card_type: &str,
+        selected_items: Option<&Value>,
         scope: &str,
         userid: &str,
         body: &Value,
@@ -1399,6 +1447,14 @@ impl WeComWsChannel {
         let mut content = format!("[{now}] [\u{5361}\u{7247}\u{6309}\u{94ae}\u{70b9}\u{51fb}] event_key={event_key}");
         if !task_id.is_empty() {
             content.push_str(&format!(" task_id={task_id}"));
+        }
+        if !card_type.is_empty() {
+            content.push_str(&format!(" card_type={card_type}"));
+        }
+        if let Some(sel) = selected_items {
+            if let Ok(sel_json) = serde_json::to_string(sel) {
+                content.push_str(&format!(" selected_items={sel_json}"));
+            }
         }
         if is_group && !userid.is_empty() {
             content = format!("[sender_userid={userid}] {content}");
@@ -2010,7 +2066,8 @@ impl WeComWsChannel {
 
     /// Push an interactive template card to a conversation scope via `aibot_send_msg`.
     /// `card` is the raw WeCom `template_card` object (e.g. a `button_interaction` card).
-    async fn send_template_card_to_scope(&self, scope: &str, card: Value) -> Result<()> {
+    async fn send_template_card_to_scope(&self, scope: &str, mut card: Value) -> Result<()> {
+        ensure_card_task_id(&mut card);
         let payload = serde_json::json!({
             "msgtype": "template_card",
             "template_card": card,
@@ -2018,6 +2075,24 @@ impl WeComWsChannel {
         self.ws_send_scoped_message(scope, payload, "aibot_send_msg")
             .await?;
         tracing::info!(scope = %scope, "WeCom template_card delivered");
+        Ok(())
+    }
+
+    /// Update the clicked template card in response to a `template_card_event`, keyed by the
+    /// event's `req_id` (valid ~5s). Waits for the WeCom ACK so errcodes (e.g. 42014) are logged.
+    async fn respond_update_card(&self, req_id: &str, mut card: Value) -> Result<()> {
+        ensure_card_task_id(&mut card);
+        let frame = serde_json::json!({
+            "cmd": "aibot_respond_update_msg",
+            "headers": { "req_id": req_id },
+            "body": {
+                "response_type": "update_template_card",
+                "template_card": card,
+            },
+        });
+        self.ws_send_frame_and_wait_for_response(frame, req_id, "aibot_respond_update_msg")
+            .await?;
+        tracing::info!(req_id = %req_id, "WeCom template card updated");
         Ok(())
     }
 
@@ -3431,121 +3506,179 @@ fn parse_path_only_attachment_hint(message: &str) -> Option<OutboundAttachment> 
 /// Maximum buttons WeCom allows on a `button_interaction` template card.
 const WECOM_CARD_MAX_BUTTONS: usize = 6;
 
-/// Parse `[CARD ...]` markers emitted by the model into ready-to-send `template_card` objects,
-/// returning the message with those markers stripped. Mirrors `parse_attachment_markers`, so the
-/// card is delivered as a separate `aibot_send_msg` after the (streamed) text — WeCom does not
-/// allow combining a stream message with a template card.
-///
-/// Grammar: `[CARD title=... | desc=... | task_id=... | btn=<text>:<event_key> | btn=...]`
-/// Fields are `|`-separated `key=value`; `btn` repeats (1..=6). `btn` value splits on the FIRST
-/// `:` so an event key may itself contain `:` (e.g. `town:static`).
+/// Open/close fences for a model-emitted card block: `[[ZC_CARD]] {json} [[/ZC_CARD]]`.
+const CARD_MARKER_OPEN: &str = "[[ZC_CARD]]";
+const CARD_MARKER_CLOSE: &str = "[[/ZC_CARD]]";
+
+/// Parse `[[ZC_CARD]] {json} [[/ZC_CARD]]` blocks emitted by the model into ready-to-send
+/// `template_card` objects, returning the message with those blocks stripped. Cards are delivered
+/// as a separate `aibot_send_msg` after the (streamed) text — WeCom can't combine a stream message
+/// with a template card. See `parse_card_marker_body` for the JSON grammar.
 fn parse_card_markers(message: &str) -> (String, Vec<Value>) {
     let mut cleaned = String::with_capacity(message.len());
     let mut cards = Vec::new();
-    let mut cursor = 0usize;
+    let mut rest = message;
 
-    while cursor < message.len() {
-        let Some(open_rel) = message[cursor..].find('[') else {
-            cleaned.push_str(&message[cursor..]);
+    while let Some(open) = rest.find(CARD_MARKER_OPEN) {
+        let body_start = open + CARD_MARKER_OPEN.len();
+        let Some(close_rel) = rest[body_start..].find(CARD_MARKER_CLOSE) else {
+            // No closing fence (e.g. still streaming): keep the remainder verbatim and stop.
             break;
         };
-        let open = cursor + open_rel;
-        cleaned.push_str(&message[cursor..open]);
+        let inner = &rest[body_start..body_start + close_rel];
+        let after = body_start + close_rel + CARD_MARKER_CLOSE.len();
 
-        let Some(close_rel) = find_matching_close(&message[open + 1..]) else {
-            cleaned.push_str(&message[open..]);
-            break;
-        };
-        let close = open + 1 + close_rel;
-        let marker = &message[open + 1..close];
-
-        match parse_card_marker_body(marker) {
+        cleaned.push_str(&rest[..open]);
+        match parse_card_marker_body(inner) {
             Some(card) => cards.push(card),
-            None => cleaned.push_str(&message[open..=close]),
+            None => tracing::warn!("WeCom [[ZC_CARD]] block has invalid body; dropped"),
         }
-        cursor = close + 1;
+        rest = &rest[after..];
     }
+    cleaned.push_str(rest);
 
     (cleaned.trim().to_string(), cards)
 }
 
-fn parse_card_marker_body(marker: &str) -> Option<Value> {
-    let rest = marker.trim();
-    let rest = rest
-        .strip_prefix("CARD")
-        .or_else(|| rest.strip_prefix("card"))?;
-    let rest = rest.trim_start();
+/// Strip `[[ZC_CARD]]` blocks from streaming draft content, including a trailing *unclosed* block,
+/// so a partially-streamed card never surfaces raw JSON to the user. (Complete cards are sent
+/// separately at finalization.)
+fn strip_card_markers_for_draft(content: &str) -> String {
+    let (stripped, _) = parse_card_markers(content);
+    match stripped.find(CARD_MARKER_OPEN) {
+        Some(open) => stripped[..open].trim_end().to_string(),
+        None => stripped,
+    }
+}
 
-    let mut title: Option<String> = None;
-    let mut desc: Option<String> = None;
-    let mut task_id: Option<String> = None;
-    let mut buttons: Vec<(String, String)> = Vec::new();
+/// Build a `template_card` from a `[[ZC_CARD]]` JSON body. Two shapes:
+/// - Raw passthrough: any object with a `card_type` key is used as the template_card verbatim
+///   (enables news/vote/multiple cards); `task_id` is auto-filled at send time if absent.
+/// - Friendly: `{title, desc?, sub?, buttons:[{text,key,style?}], task_id?}` → button_interaction.
+///   `style` defaults to 1 (clamped 1..=4). A `task_id` is treated as a *label*: a unique suffix
+///   is appended so repeated sends never collide; the model recognizes it by prefix on the callback.
+fn parse_card_marker_body(inner: &str) -> Option<Value> {
+    let parsed: Value = serde_json::from_str(inner.trim()).ok()?;
+    if parsed.get("card_type").is_some() {
+        return Some(parsed); // raw passthrough — a full WeCom template_card
+    }
+    let obj = parsed.as_object()?;
 
-    for field in rest.split('|') {
-        let Some((key, value)) = field.split_once('=') else {
-            continue;
-        };
-        let value = value.trim();
-        if value.is_empty() {
-            continue;
-        }
-        match key.trim() {
-            "title" => title = Some(value.to_string()),
-            "desc" => desc = Some(value.to_string()),
-            "task_id" => task_id = Some(sanitize_card_task_id(value)),
-            "btn" | "button" => {
-                if let Some((text, event_key)) = value.split_once(':') {
-                    let text = text.trim();
-                    let event_key = event_key.trim();
-                    if !text.is_empty() && !event_key.is_empty() {
-                        buttons.push((text.to_string(), event_key.to_string()));
-                    }
-                }
+    let title = obj
+        .get("title")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let desc = obj
+        .get("desc")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let sub = obj
+        .get("sub")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+
+    let mut button_list = Vec::new();
+    if let Some(btns) = obj.get("buttons").and_then(Value::as_array) {
+        for b in btns {
+            let text = b
+                .get("text")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty());
+            let key = b
+                .get("key")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty());
+            if let (Some(text), Some(key)) = (text, key) {
+                let style = b
+                    .get("style")
+                    .and_then(Value::as_u64)
+                    .filter(|n| (1..=4).contains(n))
+                    .unwrap_or(1);
+                button_list.push(serde_json::json!({ "text": text, "style": style, "key": key }));
             }
-            _ => {}
         }
     }
 
-    // A button_interaction card needs at least one button and a title or desc.
-    if buttons.is_empty() || (title.is_none() && desc.is_none()) {
+    // A button_interaction needs >=1 button and a main title or sub-title.
+    if button_list.is_empty() || (title.is_none() && desc.is_none() && sub.is_none()) {
         return None;
     }
-    buttons.truncate(WECOM_CARD_MAX_BUTTONS);
+    button_list.truncate(WECOM_CARD_MAX_BUTTONS);
 
     let mut main_title = serde_json::Map::new();
     if let Some(t) = title {
-        main_title.insert("title".to_string(), Value::String(t));
+        main_title.insert("title".to_string(), Value::String(t.to_string()));
     }
     if let Some(d) = desc {
-        main_title.insert("desc".to_string(), Value::String(d));
+        main_title.insert("desc".to_string(), Value::String(d.to_string()));
     }
 
-    let button_list: Vec<Value> = buttons
-        .into_iter()
-        .map(|(text, key)| serde_json::json!({ "text": text, "style": 1, "key": key }))
-        .collect();
+    let mut card = serde_json::Map::new();
+    card.insert(
+        "card_type".to_string(),
+        Value::String("button_interaction".to_string()),
+    );
+    if !main_title.is_empty() {
+        card.insert("main_title".to_string(), Value::Object(main_title));
+    }
+    if let Some(s) = sub {
+        let s: String = s.chars().take(110).collect();
+        card.insert("sub_title_text".to_string(), Value::String(s));
+    }
+    if let Some(label) = obj
+        .get("task_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        card.insert(
+            "task_id".to_string(),
+            Value::String(card_task_id_from_label(label)),
+        );
+    }
+    card.insert("button_list".to_string(), Value::Array(button_list));
 
-    let task_id = task_id.unwrap_or_else(|| format!("llmcard-{}", random_ascii_token(12)));
-
-    Some(serde_json::json!({
-        "card_type": "button_interaction",
-        "main_title": Value::Object(main_title),
-        "task_id": task_id,
-        "button_list": button_list,
-    }))
+    Some(Value::Object(card))
 }
 
-/// Keep only WeCom-legal `task_id` characters (`[A-Za-z0-9_-@]`, <=128 bytes).
-fn sanitize_card_task_id(raw: &str) -> String {
-    let s: String = raw
+/// Turn a model-supplied `task_id` *label* into a unique, WeCom-legal id: sanitize to
+/// `[A-Za-z0-9_-@]` (<=100 chars) and append a random suffix, so repeated sends never collide
+/// (no errcode 42014). The model recognizes its label by prefix on the click callback.
+fn card_task_id_from_label(label: &str) -> String {
+    let safe: String = label
         .chars()
         .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '@'))
-        .take(128)
+        .take(100)
         .collect();
-    if s.is_empty() {
+    if safe.is_empty() {
         format!("llmcard-{}", random_ascii_token(12))
     } else {
-        s
+        format!("{}-{}", safe, random_ascii_token(8))
+    }
+}
+
+/// Ensure a `template_card` object carries a unique, WeCom-legal `task_id`. WeCom rejects sends
+/// with a missing or duplicate `task_id` (errcode 42014), so any caller that omits one gets an
+/// auto-generated unique value. A present non-empty `task_id` is left untouched (callers that need
+/// a specific id — e.g. scripts that guarantee their own uniqueness — keep control).
+fn ensure_card_task_id(card: &mut Value) {
+    if let Some(obj) = card.as_object_mut() {
+        let needs = obj
+            .get("task_id")
+            .and_then(Value::as_str)
+            .map(|s| s.trim().is_empty())
+            .unwrap_or(true);
+        if needs {
+            obj.insert(
+                "task_id".to_string(),
+                Value::String(format!("llmcard-{}", random_ascii_token(12))),
+            );
+        }
     }
 }
 
@@ -3580,9 +3713,12 @@ fn render_work_log(content: &str) -> String {
 }
 
 fn sanitize_outbound_draft_content(content: &str) -> String {
-    let (cleaned, attachments) = extract_outbound_attachments(content);
+    // Hide any (possibly still-streaming) `[[ZC_CARD]]` block so raw card JSON never shows in the
+    // draft; complete cards are sent as separate messages at finalization.
+    let content = strip_card_markers_for_draft(content);
+    let (cleaned, attachments) = extract_outbound_attachments(&content);
     if attachments.is_empty() {
-        content.to_string()
+        content
     } else if cleaned.trim().is_empty() {
         WECOM_STREAM_BOOTSTRAP_CONTENT.to_string()
     } else {
@@ -3614,10 +3750,37 @@ fn extract_template_card_event_key(payload: &Value) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
-/// Whether a template-card `event_key` may trigger the configured exec bridge.
-/// Empty allowlist denies all; a single `"*"` entry allows any key.
-fn card_event_key_allowed(allowed_keys: &[String], event_key: &str) -> bool {
-    allowed_keys.iter().any(|k| k == "*" || k == event_key)
+/// Reserved prefix marking a routed button key: `route:<name>:<payload>`. Keys without it route
+/// to the model. The LLM must not emit this prefix (documented); only scripts wire up routes.
+const CARD_ROUTE_PREFIX: &str = "route:";
+
+/// Parse a routed button key `route:<name>:<payload>` into `(name, payload)`. Returns `None` for
+/// keys lacking the reserved `route:` prefix (those route to the model). `route:<name>` with no
+/// payload yields `(name, "")`.
+fn parse_route_event_key(event_key: &str) -> Option<(&str, &str)> {
+    let rest = event_key.strip_prefix(CARD_ROUTE_PREFIX)?;
+    Some(match rest.split_once(':') {
+        Some((name, payload)) => (name.trim(), payload),
+        None => (rest.trim(), ""),
+    })
+}
+
+fn extract_template_card_event_card_type(payload: &Value) -> Option<String> {
+    payload
+        .get("event")
+        .and_then(|v| v.get("template_card_event"))
+        .and_then(|v| v.get("card_type").and_then(Value::as_str))
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn extract_template_card_event_selected_items(payload: &Value) -> Option<Value> {
+    payload
+        .get("event")
+        .and_then(|v| v.get("template_card_event"))
+        .and_then(|v| v.get("selected_items"))
+        .cloned()
 }
 
 fn extract_template_card_event_task_id(payload: &Value) -> Option<String> {

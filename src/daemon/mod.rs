@@ -1077,7 +1077,7 @@ mod tests {
             interrupt_on_new_message: false,
             stream_mode: crate::config::StreamMode::default(),
             draft_update_interval_ms: 300,
-            card_button_exec: None,
+            card_routes: None,
         });
 
         let target = resolve_heartbeat_delivery(&config).unwrap();
