@@ -5921,7 +5921,7 @@ pub enum CronScheduleDecl {
 /// Delivery configuration for declarative cron jobs.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct DeliveryConfigDecl {
-    /// Delivery mode: `"none"` or `"announce"`.
+    /// Delivery mode: `"none"`, `"announce"`, or `"notify"`.
     #[serde(default = "default_delivery_mode")]
     pub mode: String,
     /// Channel name (e.g. `"telegram"`, `"discord"`).

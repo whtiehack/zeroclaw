@@ -58,8 +58,10 @@ impl Tool for CronAddTool {
     fn description(&self) -> &str {
         "Create a scheduled cron job (shell or agent) with cron/at/every schedules. \
          Use job_type='agent' with a prompt to run the AI agent on schedule. \
-         To deliver output to a channel (Discord, Telegram, Slack, Mattermost, Matrix, QQ), set \
+         To deliver output to a channel (Telegram, Discord, Slack, Mattermost, Matrix, QQ, WeCom, Signal, WhatsApp), set \
          delivery={\"mode\":\"announce\",\"channel\":\"discord\",\"to\":\"<channel_id_or_chat_id>\"}. \
+         For agent jobs that should report only when there is something worth saying, use \
+         delivery.mode='notify' — nothing is sent automatically; the agent delivers by calling the notify_user tool. \
          This is the preferred tool for sending scheduled/delayed messages to users via channels."
     }
 
@@ -141,13 +143,13 @@ impl Tool for CronAddTool {
                     "properties": {
                         "mode": {
                             "type": "string",
-                            "enum": ["none", "announce"],
-                            "description": "'announce' sends output to the specified channel; 'none' disables delivery"
+                            "enum": ["none", "announce", "notify"],
+                            "description": "'announce' auto-sends the job output to the channel after each run; 'notify' (agent jobs only) sends nothing automatically — the agent delivers a message only by calling the notify_user tool, and stays silent if there is nothing worth reporting; 'none' disables delivery"
                         },
                         "channel": {
                             "type": "string",
-                            "enum": ["telegram", "discord", "slack", "mattermost", "matrix", "qq"],
-                            "description": "Channel type to deliver output to"
+                            "enum": ["telegram", "discord", "slack", "mattermost", "matrix", "qq", "signal", "wecom_ws", "whatsapp_web"],
+                            "description": "Channel type to deliver output to (e.g. 'wecom_ws' for the WeCom bot channel)"
                         },
                         "to": {
                             "type": "string",

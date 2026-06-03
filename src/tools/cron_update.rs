@@ -146,13 +146,13 @@ impl Tool for CronUpdateTool {
                             "properties": {
                                 "mode": {
                                     "type": "string",
-                                    "enum": ["none", "announce"],
-                                    "description": "'announce' sends output to the specified channel; 'none' disables delivery"
+                                    "enum": ["none", "announce", "notify"],
+                                    "description": "'announce' auto-sends the job output to the channel after each run; 'notify' (agent jobs only) sends nothing automatically — the agent delivers a message only by calling the notify_user tool, and stays silent if there is nothing worth reporting; 'none' disables delivery"
                                 },
                                 "channel": {
                                     "type": "string",
-                                    "enum": ["telegram", "discord", "slack", "mattermost", "matrix"],
-                                    "description": "Channel type to deliver output to"
+                                    "enum": ["telegram", "discord", "slack", "mattermost", "matrix", "qq", "signal", "wecom_ws", "whatsapp_web"],
+                                    "description": "Channel type to deliver output to (e.g. 'wecom_ws' for the WeCom bot channel)"
                                 },
                                 "to": {
                                     "type": "string",
