@@ -596,7 +596,7 @@ fn build_transcript(messages: &[ChatMessage], max_chars: usize) -> String {
 /// payloads. The placeholder preserves enough hint (last path segment, or a
 /// fixed "inline-base64-omitted" tag) for the summary to mention that an
 /// image was produced at this step.
-fn redact_image_markers(content: &str) -> String {
+pub(crate) fn redact_image_markers(content: &str) -> String {
     let (cleaned, refs) = multimodal::parse_image_markers(content);
     if refs.is_empty() {
         return content.to_string();

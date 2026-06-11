@@ -3222,10 +3222,15 @@ async fn process_channel_message(
             ));
             for turn in to_compress {
                 use std::fmt::Write;
-                let content = if turn.content.len() > 2000 {
-                    format!("{}...[truncated]", &turn.content[..turn.content.floor_char_boundary(2000)])
+                // Redact [IMAGE:] markers before truncating: the compaction
+                // prompt is sent as a user message, where providers would
+                // re-expand surviving markers into image parts; truncation
+                // after redaction also can't slice a marker in half.
+                let body = crate::agent::context_compressor::redact_image_markers(&turn.content);
+                let content = if body.len() > 2000 {
+                    format!("{}...[truncated]", &body[..body.floor_char_boundary(2000)])
                 } else {
-                    turn.content.clone()
+                    body
                 };
                 let _ = writeln!(transcript, "[{}]: {}", turn.role, content);
             }
