@@ -1,6 +1,6 @@
 # `master_wecom` 功能清单
 
-更新时间：`2026-04-17`（2nd）
+更新时间：`2026-09-09`
 
 维护规则：
 
@@ -55,6 +55,7 @@
 | 32 | 短 query 跳过自动召回 + cron recall 可关 + 阈值收紧 | bge-m3 对极短输入（如 `"1"`、`"ok"`）产出低质量向量，跟一堆短 core 条目 0.4-0.55 都能过阈值。三件套治理：(1) `[memory] min_query_chars = 8`（按 `chars().count()` 计，默认 8），recall_query 短于此值 channels 层直接 skip `build_memory_context`，不调 embedding 不做向量搜；(2) `[cron] auto_recall_memory = false`（默认关），`cron/scheduler.rs` 的前置 memory_context 块用此 flag gate，agent job 需要回忆可用 `memory_recall` 工具；(3) `min_relevance_score` 默认从 0.4 提到 0.55，基线更贴合 bge-m3 真实分布 | - |
 | 33 | strip_think_tags_inline 保留尾部 `\n` | 上游 `c70e86cc`（#5505）在 `strip_think_tags_inline` 末尾 `.trim()`，把 Progress 事件 `"⏳ tool\n"` 的尾 `\n` 吃掉。wecom_ws `note_progress_update` 直接 `push_str` 累积到 work_log，于是连续工具进度被拼成一行无换行。改法：末尾 `trim_start` + `trim_end` 后，如果原文尾部有 `\n` 就重新加回。其他 channel（Telegram/Slack 等）同样受益。抵消上游 `0d2b57ee`(#4394) "ensure newline" 被回归 | - |
 | 34 | agent::run `suppress_memory_recall` 参数 | 本 fork 第 32 条的 cron 门控只在 scheduler 层，下游 `agent::run::build_context` 仍会无条件 recall + 贴 `[Memory context]`，cron/heartbeat 任然中招。修法：`agent::run` 末位加 `suppress_memory_recall: bool`，scheduler / daemon heartbeat 两路传 `true`（build_context 短路返回空字符串），CLI 交互/channel 分发传 `false`。附带吸收上游 #5817 部分：`cron_config.memory.auto_save = false`，防 cron 模板 prompt 污染 memories 表 | - |
+| 35 | 会话级 provider header | `[extra_headers]` 值支持 `{session}` 占位符，替换为当前对话 key 的 sha256 前 16 位。channels / gateway 用 `tokio::task_local` 包住整轮 LLM 调用，`compatible.rs` 的 `http_client()` 做替换。解决上游按 session header 做 sticky routing / prompt cache 时整个实例共用一个 session 的问题 | [详细文档](./session-scoped-provider-headers-2026-09-09.md) |
 
 ## 运维参考
 
