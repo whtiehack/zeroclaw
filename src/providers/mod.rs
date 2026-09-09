@@ -31,6 +31,7 @@ pub mod openai_codex;
 pub mod openrouter;
 pub mod reliable;
 pub mod router;
+pub mod session_scope;
 pub mod telnyx;
 pub mod traits;
 

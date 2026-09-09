@@ -4233,7 +4233,15 @@ async fn dispatch_worker(
         }
     }
 
-    process_channel_message(ctx, msg, cancellation_token).await;
+    // Scope the whole turn to this conversation so OpenAI-compatible providers
+    // can stamp per-conversation session headers (see providers::session_scope).
+    // Must wrap the future itself — task-locals do not cross `tokio::spawn`.
+    let session_key = conversation_history_key(&msg);
+    Box::pin(crate::providers::session_scope::scope_session(
+        &session_key,
+        process_channel_message(ctx, msg, cancellation_token),
+    ))
+    .await;
 
     if register_in_flight {
         let mut active = in_flight.lock().await;

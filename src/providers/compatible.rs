@@ -387,6 +387,12 @@ impl OpenAiCompatibleProvider {
                 }
             }
             for (key, value) in &self.extra_headers {
+                // `{session}` resolves to the current conversation's session token
+                // so upstream sticky routing / prompt cache keys off the real
+                // conversation instead of the whole process. Static values are
+                // borrowed unchanged.
+                let resolved = super::session_scope::substitute_session_placeholder(value);
+                let value = resolved.as_deref().unwrap_or(value.as_str());
                 match (
                     reqwest::header::HeaderName::from_bytes(key.as_bytes()),
                     HeaderValue::from_str(value),
