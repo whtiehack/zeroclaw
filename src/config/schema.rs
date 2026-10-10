@@ -1152,6 +1152,49 @@ pub struct ReplyIntentPrecheckConfig {
     /// reasoning models that consume tokens before producing visible content).
     #[serde(default = "default_precheck_max_tokens")]
     pub max_tokens: u32,
+    /// Classifier backend for gray-zone messages: `"llm"` (chat model with
+    /// `prompt_file`, default) or `"decision"` (a typed decision model behind
+    /// a System One style endpoint, e.g. OpenRouter `/api/v1/systemone`).
+    #[serde(default = "default_precheck_backend")]
+    pub backend: String,
+    /// Decision endpoint URL. Default: OpenRouter System One endpoint.
+    #[serde(default = "default_precheck_decision_url")]
+    pub decision_url: String,
+    /// Bearer token for the decision endpoint.
+    #[serde(default)]
+    pub decision_api_key: String,
+    /// Decision model id, e.g. `typesafe/jev-1.13`.
+    #[serde(default)]
+    pub decision_model: String,
+    /// JSON question spec (relative to the workspace directory):
+    /// `{"instructions": "...", "criteria": {"<option>": "<description>"},
+    /// "reply_categories": ["<option>", ...]}`.
+    #[serde(default)]
+    pub decision_file: String,
+    /// Reply when the summed probability of `reply_categories` is at least
+    /// this value. Default: `0.5`.
+    #[serde(default = "default_precheck_decision_threshold")]
+    pub decision_threshold: f64,
+    /// Request timeout for the decision call; timeouts fall back to reply.
+    /// Default: `3000`.
+    #[serde(default = "default_precheck_decision_timeout_ms")]
+    pub decision_timeout_ms: u64,
+}
+
+fn default_precheck_backend() -> String {
+    "llm".into()
+}
+
+fn default_precheck_decision_url() -> String {
+    "https://openrouter.ai/api/v1/systemone".into()
+}
+
+fn default_precheck_decision_threshold() -> f64 {
+    0.5
+}
+
+fn default_precheck_decision_timeout_ms() -> u64 {
+    3000
 }
 
 fn default_precheck_temperature() -> f64 {
@@ -1181,6 +1224,13 @@ impl Default for ReplyIntentPrecheckConfig {
             min_content_chars: default_precheck_min_content_chars(),
             keyword_fast_path: Vec::new(),
             max_tokens: default_precheck_max_tokens(),
+            backend: default_precheck_backend(),
+            decision_url: default_precheck_decision_url(),
+            decision_api_key: String::new(),
+            decision_model: String::new(),
+            decision_file: String::new(),
+            decision_threshold: default_precheck_decision_threshold(),
+            decision_timeout_ms: default_precheck_decision_timeout_ms(),
         }
     }
 }

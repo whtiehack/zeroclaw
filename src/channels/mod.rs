@@ -4003,6 +4003,173 @@ async fn classify_channel_reply_intent(
     }
 }
 
+/// Question spec for the `decision` backend, loaded from `decision_file`.
+#[derive(Debug, Clone, Deserialize)]
+struct DecisionQuestionSpec {
+    instructions: String,
+    criteria: serde_json::Map<String, serde_json::Value>,
+    reply_categories: Vec<String>,
+}
+
+const DECISION_HISTORY_MAX_CHARS: usize = 4000;
+const DECISION_MESSAGE_MAX_CHARS: usize = 8000;
+
+fn truncate_chars(s: &str, max: usize) -> String {
+    match s.char_indices().nth(max) {
+        Some((idx, _)) => s[..idx].to_string(),
+        None => s.to_string(),
+    }
+}
+
+/// Build the System One request body: `state` carries the recent history
+/// (same selection as the LLM path) plus the latest message, and a single
+/// `choice` question named `intent`.
+fn build_decision_request(
+    model: &str,
+    spec: &DecisionQuestionSpec,
+    history_messages: usize,
+    prior_history: &[ChatMessage],
+    current_user_content: &str,
+) -> serde_json::Value {
+    let recent: Vec<&ChatMessage> = prior_history
+        .iter()
+        .filter(|m| m.role == "user" || m.role == "assistant")
+        .collect();
+    let start = recent.len().saturating_sub(history_messages.max(1));
+    let history: Vec<String> = recent[start..]
+        .iter()
+        .filter_map(|m| {
+            let rendered = if m.role == "assistant" {
+                render_assistant_for_precheck(&m.content)
+            } else {
+                m.content.clone()
+            };
+            if rendered.is_empty() {
+                return None;
+            }
+            Some(format!(
+                "[{}] {}",
+                m.role,
+                truncate_chars(&rendered, DECISION_HISTORY_MAX_CHARS)
+            ))
+        })
+        .collect();
+    serde_json::json!({
+        "model": model,
+        "state": {
+            "history": history,
+            "latest_user_message": truncate_chars(current_user_content, DECISION_MESSAGE_MAX_CHARS),
+        },
+        "questions": {
+            "intent": {
+                "type": "choice",
+                "instructions": spec.instructions,
+                "criteria": spec.criteria,
+            }
+        }
+    })
+}
+
+/// Map a System One response to an outcome. Returns `None` when the
+/// `intent` answer is missing or malformed (caller falls back to reply).
+fn parse_decision_response(
+    body: &serde_json::Value,
+    reply_categories: &[String],
+    threshold: f64,
+) -> Option<(AssistantChannelOutcome, String, f64)> {
+    let answer = body.get("answers")?.get("intent")?;
+    let choice = answer.get("choice")?.as_str()?.to_string();
+    let p_reply = match answer.get("probabilities").and_then(|p| p.as_object()) {
+        Some(probs) => probs
+            .iter()
+            .filter(|(k, _)| reply_categories.iter().any(|c| c == *k))
+            .filter_map(|(_, v)| v.as_f64())
+            .sum::<f64>(),
+        None => {
+            if reply_categories.iter().any(|c| *c == choice) {
+                1.0
+            } else {
+                0.0
+            }
+        }
+    };
+    let outcome = if p_reply >= threshold {
+        AssistantChannelOutcome::Reply
+    } else {
+        AssistantChannelOutcome::NoReply {
+            reason: Some(format!("{choice} p_reply={p_reply:.2}")),
+        }
+    };
+    Some((outcome, choice, p_reply))
+}
+
+async fn classify_reply_intent_decision(
+    cfg: &crate::config::ReplyIntentPrecheckConfig,
+    workspace_dir: &std::path::Path,
+    prior_history: &[ChatMessage],
+    current_user_content: &str,
+) -> AssistantChannelOutcome {
+    let path = workspace_dir.join(&cfg.decision_file);
+    let spec: DecisionQuestionSpec = match std::fs::read_to_string(&path)
+        .map_err(anyhow::Error::from)
+        .and_then(|s| serde_json::from_str(&s).map_err(anyhow::Error::from))
+    {
+        Ok(spec) => spec,
+        Err(err) => {
+            tracing::warn!(
+                "reply-intent decision spec {} unusable: {err}",
+                path.display()
+            );
+            return AssistantChannelOutcome::Reply;
+        }
+    };
+    let body = build_decision_request(
+        &cfg.decision_model,
+        &spec,
+        cfg.history_messages,
+        prior_history,
+        current_user_content,
+    );
+    let started = Instant::now();
+    let result = async {
+        let resp = crate::config::build_runtime_proxy_client("channel.reply_precheck")
+            .post(&cfg.decision_url)
+            .bearer_auth(&cfg.decision_api_key)
+            .timeout(Duration::from_millis(cfg.decision_timeout_ms))
+            .json(&body)
+            .send()
+            .await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let text = resp.text().await.unwrap_or_default();
+            anyhow::bail!("HTTP {status}: {}", truncate_chars(&text, 300));
+        }
+        Ok::<serde_json::Value, anyhow::Error>(resp.json().await?)
+    }
+    .await;
+    let elapsed_ms = started.elapsed().as_millis();
+    match result {
+        Ok(json) => {
+            match parse_decision_response(&json, &spec.reply_categories, cfg.decision_threshold) {
+                Some((outcome, choice, p_reply)) => {
+                    tracing::info!(
+                        "reply-intent decision: {choice} p_reply={p_reply:.2} ({elapsed_ms}ms)"
+                    );
+                    outcome
+                }
+                None => {
+                    tracing::warn!("reply-intent decision response malformed: {json}");
+                    AssistantChannelOutcome::Reply
+                }
+            }
+        }
+        Err(err) => {
+            tracing::warn!("reply-intent decision call failed ({elapsed_ms}ms): {err}");
+            AssistantChannelOutcome::Reply
+        }
+    }
+}
+
 async fn run_reply_intent_precheck(
     cfg: &crate::config::ReplyIntentPrecheckConfig,
     workspace_dir: &std::path::Path,
@@ -4040,15 +4207,19 @@ async fn run_reply_intent_precheck(
             PrecheckPath::ShortNoFollowup,
         );
     }
-    let outcome = classify_channel_reply_intent(
-        provider,
-        cfg,
-        workspace_dir,
-        route_model,
-        prior_history,
-        &msg.content,
-    )
-    .await;
+    let outcome = if cfg.backend == "decision" {
+        classify_reply_intent_decision(cfg, workspace_dir, prior_history, &msg.content).await
+    } else {
+        classify_channel_reply_intent(
+            provider,
+            cfg,
+            workspace_dir,
+            route_model,
+            prior_history,
+            &msg.content,
+        )
+        .await
+    };
     let path = match &outcome {
         AssistantChannelOutcome::Reply => PrecheckPath::LlmReply,
         AssistantChannelOutcome::NoReply { .. } => PrecheckPath::LlmNoReply,
@@ -6988,6 +7159,94 @@ mod tests {
                 mentions_others_only: false,
                 has_attachments: false,
             }
+        }
+
+        fn decision_spec() -> DecisionQuestionSpec {
+            serde_json::from_value(serde_json::json!({
+                "instructions": "Classify `latest_user_message`.",
+                "criteria": {"help": "asks for help", "chat": "small talk"},
+                "reply_categories": ["help"]
+            }))
+            .unwrap()
+        }
+
+        #[test]
+        fn decision_request_carries_recent_history_and_choice_question() {
+            let history = vec![
+                ChatMessage::user("old question"),
+                ChatMessage::assistant("old answer"),
+                ChatMessage::user("follow-up"),
+                ChatMessage::assistant("second answer"),
+            ];
+            let long = "字".repeat(DECISION_MESSAGE_MAX_CHARS + 10);
+            let body = build_decision_request("m1", &decision_spec(), 3, &history, &long);
+            assert_eq!(body["model"], "m1");
+            let h = body["state"]["history"].as_array().unwrap();
+            assert_eq!(h.len(), 3);
+            assert_eq!(h[0], "[assistant] old answer");
+            assert_eq!(h[2], "[assistant] second answer");
+            assert_eq!(
+                body["state"]["latest_user_message"]
+                    .as_str()
+                    .unwrap()
+                    .chars()
+                    .count(),
+                DECISION_MESSAGE_MAX_CHARS
+            );
+            let q = &body["questions"]["intent"];
+            assert_eq!(q["type"], "choice");
+            assert_eq!(q["criteria"]["chat"], "small talk");
+        }
+
+        #[test]
+        fn decision_response_sums_reply_categories_against_threshold() {
+            let cats = vec!["help".to_string(), "bug".to_string()];
+            let body = serde_json::json!({"answers": {"intent": {
+                "type": "choice", "choice": "chat",
+                "probabilities": {"help": 0.3, "bug": 0.25, "chat": 0.45}
+            }}});
+            let (outcome, choice, p) = parse_decision_response(&body, &cats, 0.5).unwrap();
+            assert_eq!(outcome, AssistantChannelOutcome::Reply);
+            assert_eq!(choice, "chat");
+            assert!((p - 0.55).abs() < 1e-9);
+
+            let (outcome, _, _) = parse_decision_response(&body, &cats, 0.6).unwrap();
+            assert_eq!(
+                outcome,
+                AssistantChannelOutcome::NoReply {
+                    reason: Some("chat p_reply=0.55".into())
+                }
+            );
+
+            let no_probs = serde_json::json!({"answers": {"intent": {"choice": "bug"}}});
+            let (outcome, _, _) = parse_decision_response(&no_probs, &cats, 0.5).unwrap();
+            assert_eq!(outcome, AssistantChannelOutcome::Reply);
+
+            let missing = serde_json::json!({"error": {"code": 404}});
+            assert!(parse_decision_response(&missing, &cats, 0.5).is_none());
+        }
+
+        #[tokio::test]
+        async fn decision_backend_without_spec_falls_back_to_reply() {
+            let provider = ScriptedPrecheckProvider::ok("NO_REPLY: should not be used");
+            let cfg = ReplyIntentPrecheckConfig {
+                enabled: true,
+                backend: "decision".into(),
+                decision_file: "missing-decision-spec.json".into(),
+                ..ReplyIntentPrecheckConfig::default()
+            };
+            let tmp = TempDir::new().unwrap();
+            let (outcome, path) = run_reply_intent_precheck(
+                &cfg,
+                tmp.path(),
+                &provider,
+                "model",
+                &make_msg("a long enough gray-zone message"),
+                &[],
+            )
+            .await;
+            assert_eq!(outcome, AssistantChannelOutcome::Reply);
+            assert_eq!(path, PrecheckPath::LlmReply);
         }
 
         #[test]
